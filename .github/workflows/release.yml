@@ -1,0 +1,76 @@
+# Tag-triggered release: push a tag like v0.2.0 and this builds every
+# platform, then creates a GitHub Release with the binaries attached.
+# Release assets are permanent and publicly downloadable, unlike CI
+# artifacts. Uses the repository's own GITHUB_TOKEN — no secrets to set up.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          # Intel macs: add { os: macos-13, target: x86_64-apple-darwin }
+          # here if anyone asks; runner availability keeps shrinking.
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          name="c-shell-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          bin="target/${{ matrix.target }}/release/c-shell"
+          [[ -f "$bin.exe" ]] && bin="$bin.exe"
+          cp "$bin" README.md "$name"/
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            7z a "$name.zip" "$name" >/dev/null
+            echo "ASSET=$name.zip" >> "$GITHUB_ENV"
+          else
+            tar czf "$name.tar.gz" "$name"
+            echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Create release with all binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

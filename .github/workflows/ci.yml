@@ -1,0 +1,78 @@
+# Continuous verification. Build artifacts here are throwaway (90-day
+# retention, login required to download); user-facing binaries come from
+# release.yml instead.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-gcc
+          - os: macos-latest
+            name: macos-clang
+          # Whatever GNU-flavoured compiler the runner has on PATH
+          # (MinGW gcc or LLVM clang) — the common case for Windows users.
+          - os: windows-latest
+            name: windows-gnu
+          # cl.exe via a Developer Command Prompt environment — the only
+          # place the MSVC flag dialect gets exercised at all.
+          - os: windows-latest
+            name: windows-msvc
+            msvc: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: matrix.msvc
+
+      # Detection honours $CC before probing PATH, so this pins the smoke
+      # tests to cl even though gcc/clang also exist on the runner.
+      - name: Force MSVC as the C compiler
+        if: matrix.msvc
+        shell: bash
+        run: echo "CC=cl" >> "$GITHUB_ENV"
+
+      - name: Show detected C compilers
+        shell: bash
+        run: |
+          for c in cc gcc clang cl; do
+            command -v "$c" >/dev/null 2>&1 && echo "$c -> $(command -v "$c")" || true
+          done
+
+      - run: cargo test --all-targets
+
+      - run: cargo build --release
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir stage
+          cp "target/release/c-shell${{ runner.os == 'Windows' && '.exe' || '' }}" stage/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: c-shell-dev-${{ matrix.name }}
+          path: stage/
