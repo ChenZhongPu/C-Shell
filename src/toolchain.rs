@@ -15,13 +15,32 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Successful capability probes remain valid until the compiler, relevant
 /// environment, requested standard, c-shell version, or this TTL changes.
 const CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-const CACHE_SCHEMA: &str = "toolchain-v2";
+const CACHE_SCHEMA: &str = "toolchain-v3";
 
 /// `.output()` with a deadline; `None` covers spawn failure and timeout
 /// alike — for a probe those are the same answer.
 fn probe_output(cmd: &mut Command) -> Option<proc::Captured> {
     let cap = proc::run_captured(cmd, PROBE_TIMEOUT, false).ok()?;
     cap.status.is_some().then_some(cap)
+}
+
+/// cl.exe reports an unknown command-line option as warning D9002 and still
+/// exits successfully. clang-cl can likewise warn that an option was unused.
+/// A capability probe must treat both as rejection; exit status alone would
+/// silently accept an unsupported `/std:` value.
+fn msvc_ignored_option(cap: &proc::Captured) -> bool {
+    ignored_msvc_option_text(&format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&cap.stdout),
+        String::from_utf8_lossy(&cap.stderr)
+    ))
+}
+
+fn ignored_msvc_option_text(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("d9002")
+        || text.contains("ignoring unknown option")
+        || text.contains("argument unused during compilation")
 }
 
 /// Which flag dialect a compiler speaks. Version numbers are deliberately
@@ -494,7 +513,9 @@ impl Toolchain {
             cmd.args(args);
             cmd.arg("-x").arg("c").arg(&src).arg("-o").arg(&exe);
         }
-        probe_output(&mut cmd).is_some_and(|c| c.status.is_some_and(|st| st.success()))
+        probe_output(&mut cmd).is_some_and(|c| {
+            c.status.is_some_and(|st| st.success()) && !(self.is_msvc() && msvc_ignored_option(&c))
+        })
     }
 
     /// Like `probe`, but also runs the produced executable and returns its
@@ -583,6 +604,19 @@ mod tests {
         }
         assert!(hex_decode("0").is_none());
         assert!(hex_decode("zz").is_none());
+    }
+
+    #[test]
+    fn recognizes_msvc_ignored_option_diagnostics() {
+        assert!(ignored_msvc_option_text(
+            "cl : Command line warning D9002 : ignoring unknown option '/std:bogus'"
+        ));
+        assert!(ignored_msvc_option_text(
+            "warning: argument unused during compilation: '/std:bogus'"
+        ));
+        assert!(!ignored_msvc_option_text(
+            "warning C4101: unreferenced local variable"
+        ));
     }
 
     #[test]

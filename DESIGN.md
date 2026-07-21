@@ -4,7 +4,7 @@ Settled architecture decisions, the one big open problem, and the traps buried
 in the code that you must know about before changing it. README is for users;
 this file is for whoever develops the tool next.
 
-Status: v0.1.2 working. ~4000 lines of Rust, 68 tests (44 unit + 24
+Status: v0.1.2 working. ~4000 lines of Rust, 69 tests (45 unit + 24
 end-to-end smoke), clippy/fmt clean, English UI. Verified on Linux with gcc
 16.1.1 and clang 22.1.6. CI exercises the default macOS compiler and two
 Windows driver dialects (a GNU-style driver and MSVC); see
@@ -284,6 +284,13 @@ the marker lands after all of the expression's own side effects. Emitting it
 at the call site instead files `puts("hi")`'s own output under its return
 value (`Out[1]: hi\n3`). This bug was introduced once, while removing the
 `_n` bindings.
+
+**An MSVC probe cannot trust exit status alone.** `cl.exe` reports an unknown
+option such as `/std:bogus` as warning D9002 and exits successfully; clang-cl
+can similarly report an unused argument. Capability probes treat these
+specific diagnostics as failure, or an invalid explicit `--std` can be
+silently accepted. Changing this rule also requires a cache-schema bump so a
+previous false-positive result cannot survive on disk.
 
 **gcc accepts nested functions under `-std=c17`** (GNU extension); clang
 rejects them. Function definitions must be routed to file scope by the
