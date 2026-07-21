@@ -1,0 +1,10 @@
+# Pin the toolchain so local checks and CI run the *same* clippy.
+#
+# Without this, CI uses whatever the runner image ships, which can be one
+# release ahead of developer machines — new clippy lints then fail CI on
+# code that passed every local gate (this happened with 1.97's
+# byte_char_slices). Bump the pin deliberately, fix new lints locally, and
+# only then push.
+[toolchain]
+channel = "1.96"
+components = ["rustfmt", "clippy"]

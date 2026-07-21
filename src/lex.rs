@@ -105,7 +105,7 @@ fn is_ident_byte(c: u8) -> bool {
 /// about is treated as impure.
 pub fn may_have_side_effects(src: &str) -> bool {
     // Operators that only *contain* `=` without assigning.
-    const COMPARISONS: [u8; 4] = [b'=', b'!', b'<', b'>'];
+    const COMPARISONS: [u8; 4] = *b"=!<>";
     // Call-like syntax that computes nothing at runtime.
     const PURE_CALLS: [&str; 3] = ["sizeof", "_Alignof", "alignof"];
 

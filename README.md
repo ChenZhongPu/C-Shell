@@ -129,6 +129,19 @@ pointing into generated scaffolding are never presented as your code.
 - MSVC must be started from a Developer Command Prompt, or `INCLUDE`/`LIB`
   are missing.
 
+## Development
+
+After cloning, enable the pre-commit gate (fmt + clippy + tests — the same
+checks CI runs):
+
+```sh
+git config core.hooksPath .githooks
+```
+
+The toolchain is pinned by `rust-toolchain.toml` so local clippy and CI
+clippy are the same version; new lints arrive when the pin is bumped, never
+by surprise on push.
+
 Before working on the code, read [DESIGN.md](DESIGN.md): it records the
 architecture decisions, the open state-model question, and several traps you
 need to know about before changing things.
