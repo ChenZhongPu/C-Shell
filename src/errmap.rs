@@ -12,8 +12,23 @@
 /// lines that text occupies. Anything outside `start..start+count` belongs to
 /// generated scaffolding or an earlier input and must not be presented as if
 /// the user had typed it.
-pub fn remap(raw: &str, src: &str, start: usize, count: usize) -> String {
-    let in_input = |n: usize| n >= start && n < start + count;
+pub fn remap(raw: &str, src: &str, start: usize, count: usize, wrapped: bool) -> String {
+    // Map a generated-file line to an input-relative one. With `wrapped`,
+    // the wrapper lines directly above and below the input hold nothing but
+    // `CS_PRINT((` and `));`, so a diagnostic anchored there — MSVC's
+    // traditional preprocessor does exactly that for macro arguments — can
+    // only be about the expression itself and is clamped to it.
+    let map_line = |n: usize| -> Option<usize> {
+        if n >= start && n < start + count {
+            Some(n - start + 1)
+        } else if wrapped && n + 1 == start {
+            Some(1)
+        } else if wrapped && n == start + count {
+            Some(count)
+        } else {
+            None
+        }
+    };
     // cl.exe prints the bare source filename to stdout on every compile; it
     // carries no information and would leak through every later filter.
     // Only compiler diagnostics pass through here, so a line that is
@@ -27,8 +42,9 @@ pub fn remap(raw: &str, src: &str, start: usize, count: usize) -> String {
             continue;
         }
         match split_location(line, src) {
-            Some((gen_line, rest)) if in_input(gen_line) => {
-                out.push_str(&format!("<input>:{}{rest}", gen_line - start + 1));
+            Some((gen_line, rest)) if map_line(gen_line).is_some() => {
+                let mapped = map_line(gen_line).expect("checked in guard");
+                out.push_str(&format!("<input>:{mapped}{rest}"));
             }
             // A complaint anchored in the prelude, in the generated `main`
             // wrapper, or in code from an earlier input. Kept, because it is
@@ -175,7 +191,7 @@ mod tests {
     fn maps_gnu_location_into_input_space() {
         let raw = "/tmp/x/in.c:42:5: error: 'y' undeclared";
         assert_eq!(
-            remap(raw, "/tmp/x/in.c", 40, 5).trim_end(),
+            remap(raw, "/tmp/x/in.c", 40, 5, false).trim_end(),
             "<input>:3:5: error: 'y' undeclared"
         );
     }
@@ -184,7 +200,7 @@ mod tests {
     fn maps_msvc_location() {
         let raw = "C:\\t\\in.c(42): error C2065: 'y': undeclared identifier";
         assert_eq!(
-            remap(raw, "C:\\t\\in.c", 42, 1).trim_end(),
+            remap(raw, "C:\\t\\in.c", 42, 1, false).trim_end(),
             "<input>:1: error C2065: 'y': undeclared identifier"
         );
     }
@@ -193,28 +209,49 @@ mod tests {
     fn labels_locations_outside_the_input() {
         let raw = "/tmp/x/in.c:10:1: note: previous definition";
         assert_eq!(
-            remap(raw, "/tmp/x/in.c", 40, 1).trim_end(),
+            remap(raw, "/tmp/x/in.c", 40, 1, false).trim_end(),
             "<session>:1: note: previous definition"
         );
         // Just past the end of a one-line input: the generated `return 0;`.
         let raw = "/tmp/x/in.c:41:5: error: expected ';' before 'return'";
-        assert!(remap(raw, "/tmp/x/in.c", 40, 1).starts_with("<session>"));
+        assert!(remap(raw, "/tmp/x/in.c", 40, 1, false).starts_with("<session>"));
     }
 
     #[test]
     fn renumbers_the_excerpt_gutter_to_match_the_header() {
         let raw = "   42 | int x = ;\n   43 |     return 0;";
-        let got = remap(raw, "/tmp/x/in.c", 42, 1);
+        let got = remap(raw, "/tmp/x/in.c", 42, 1, false);
         assert!(got.contains("    1 | int x = ;"), "{got}");
         // Scaffolding keeps its text but loses its misleading number.
         assert!(got.contains("      |     return 0;"), "{got}");
     }
 
     #[test]
+    fn wrapper_line_anchors_are_pulled_into_a_wrapped_input() {
+        // MSVC's traditional preprocessor pins diagnostics from a macro
+        // argument to the invocation's first line: `CS_PRINT((`, one line
+        // above the input. Nothing but the wrapper lives there, so the
+        // anchor is clamped to the expression.
+        let raw = "C:\\t\\in.c(41): warning C4018: '>': signed/unsigned mismatch";
+        assert_eq!(
+            remap(raw, "C:\\t\\in.c", 42, 1, true).trim_end(),
+            "<input>:1: warning C4018: '>': signed/unsigned mismatch"
+        );
+        // The closing `));` line clamps to the input's last line.
+        let raw2 = "C:\\t\\in.c(43): error C2143: syntax error";
+        assert_eq!(
+            remap(raw2, "C:\\t\\in.c", 42, 1, true).trim_end(),
+            "<input>:1: error C2143: syntax error"
+        );
+        // Unwrapped slots keep strict attribution.
+        assert!(remap(raw, "C:\\t\\in.c", 42, 1, false).starts_with("<session>"));
+    }
+
+    #[test]
     fn drops_msvc_bare_filename_lines() {
         // cl.exe echoes the source filename to stdout on every compile.
         let raw = "input.c\n/tmp/x/input.c:42:1: warning: something";
-        let got = remap(raw, "/tmp/x/input.c", 42, 1);
+        let got = remap(raw, "/tmp/x/input.c", 42, 1, false);
         assert!(!got.contains("input.c"), "{got}");
         assert!(got.contains("<input>:1:1: warning"), "{got}");
     }
@@ -223,7 +260,7 @@ mod tests {
     fn scrubs_temp_path_from_unlocated_lines() {
         let raw = "cc1: warning while reading /tmp/x/in.c";
         assert_eq!(
-            remap(raw, "/tmp/x/in.c", 1, 1).trim_end(),
+            remap(raw, "/tmp/x/in.c", 1, 1, false).trim_end(),
             "cc1: warning while reading <input>"
         );
     }

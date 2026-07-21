@@ -85,6 +85,12 @@ pub struct Program {
     /// How many lines that text occupies, so diagnostics landing just past it
     /// are not misattributed to the user.
     pub new_line_count: usize,
+    /// True when the input sits inside the `CS_PRINT((` … `));` wrapper.
+    /// MSVC's traditional preprocessor attributes diagnostics from a
+    /// multi-line macro invocation to the invocation's *first* line — the
+    /// wrapper line just above the input — so the remapper must know it may
+    /// pull those anchors back into the input.
+    pub wrapped: bool,
 }
 
 /// Build the program for evaluating `input` in `slot` against `session`.
@@ -137,6 +143,7 @@ pub fn build(session: &Session, input: &str, slot: Slot) -> Program {
         src,
         new_start_line,
         new_line_count,
+        wrapped: slot == Slot::Expr,
     }
 }
 

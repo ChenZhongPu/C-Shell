@@ -151,13 +151,19 @@ impl Evaluator {
             let (start, count) = (prog.new_start_line, prog.new_line_count);
             match self.compile_text(&prog.src) {
                 Ok((exe, warns)) => {
-                    let warnings = errmap::only_new(&errmap::remap(&warns, &src, start, count));
+                    let warnings =
+                        errmap::only_new(&errmap::remap(&warns, &src, start, count, prog.wrapped));
                     return Ok(Ok(self.run(&exe, slot, warnings)?));
                 }
                 Err(diag) => {
                     if slot == report_slot {
-                        reported =
-                            errmap::drop_stale_warnings(&errmap::remap(&diag, &src, start, count));
+                        reported = errmap::drop_stale_warnings(&errmap::remap(
+                            &diag,
+                            &src,
+                            start,
+                            count,
+                            prog.wrapped,
+                        ));
                     }
                 }
             }

@@ -259,6 +259,16 @@ under every later input. gcc's `file: In function 'f':` group banner carries
 no line number: hold it back until something under it survives, or it is
 left stranded above nothing.
 
+**MSVC pins macro-argument diagnostics to the invocation's first line**
+(`errmap::remap`, the `wrapped` flag). The traditional cl preprocessor
+attributes a diagnostic arising inside a multi-line macro invocation to the
+line of the macro *name* — for the Expr slot that is the `CS_PRINT((`
+wrapper line just above the input, which strict attribution labels
+`<session>` and the warning filter then silently drops. Symptom: values
+print but warnings vanish, only on MSVC, only for expressions. Wrapper-line
+anchors are clamped into the input; nothing but the wrapper lives on those
+lines, so the clamp cannot mislabel foreign diagnostics.
+
 **A crashing or timed-out input must never be committed** (`main.rs`).
 Every later evaluation replays the session; committing one crash makes the
 prompt permanently unusable.
