@@ -96,9 +96,14 @@ fn defining_things_without_using_them_warns_nothing() {
 #[test]
 fn real_warnings_still_show() {
     // Suppressing REPL noise must not take genuine diagnostics with it.
-    let out = run(&["-1 > 0u"]);
+    //
+    // The comparison must go through *variables*: on a constant expression
+    // like `-1 > 0u` clang folds and deliberately stays silent, and this
+    // test's job is to pass on every compiler family. gcc and clang warn
+    // via -Wsign-compare, MSVC via C4018 — all within default levels.
+    let out = run(&["int neg = -1;", "unsigned pos = 0;", "neg > pos"]);
     assert!(
-        out.contains("warning"),
+        out.contains("warning") || out.contains("C4018"),
         "sign-compare warning disappeared:\n{out}"
     );
 }

@@ -14,8 +14,18 @@
 /// the user had typed it.
 pub fn remap(raw: &str, src: &str, start: usize, count: usize) -> String {
     let in_input = |n: usize| n >= start && n < start + count;
+    // cl.exe prints the bare source filename to stdout on every compile; it
+    // carries no information and would leak through every later filter.
+    // Only compiler diagnostics pass through here, so a line that is
+    // exactly the filename can never be a real message.
+    let basename = std::path::Path::new(src)
+        .file_name()
+        .and_then(|s| s.to_str());
     let mut out = String::with_capacity(raw.len());
     for line in raw.lines() {
+        if basename.is_some_and(|b| line.trim() == b) {
+            continue;
+        }
         match split_location(line, src) {
             Some((gen_line, rest)) if in_input(gen_line) => {
                 out.push_str(&format!("<input>:{}{rest}", gen_line - start + 1));
@@ -79,7 +89,9 @@ pub fn only_new(text: &str) -> String {
 /// to do with the error being reported and only buries it.
 pub fn drop_stale_warnings(text: &str) -> String {
     filter_blocks(text, |header| {
-        header.starts_with("<input>:") || !header.contains("warning:")
+        // Both spellings: GNU/Clang `warning:` and MSVC `warning C4552:`.
+        let is_warning = header.contains("warning:") || header.contains("warning C");
+        header.starts_with("<input>:") || !is_warning
     })
 }
 
@@ -196,6 +208,15 @@ mod tests {
         assert!(got.contains("    1 | int x = ;"), "{got}");
         // Scaffolding keeps its text but loses its misleading number.
         assert!(got.contains("      |     return 0;"), "{got}");
+    }
+
+    #[test]
+    fn drops_msvc_bare_filename_lines() {
+        // cl.exe echoes the source filename to stdout on every compile.
+        let raw = "input.c\n/tmp/x/input.c:42:1: warning: something";
+        let got = remap(raw, "/tmp/x/input.c", 42, 1);
+        assert!(!got.contains("input.c"), "{got}");
+        assert!(got.contains("<input>:1:1: warning"), "{got}");
     }
 
     #[test]

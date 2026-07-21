@@ -191,13 +191,13 @@ References: [crepl](https://l-m.dev/cs/crepl/)
   multi-compiler comparison. These, not the REPL loop, are what would set the
   tool apart — comparison especially: when gcc and clang disagree on the same
   snippet, that is UB or implementation-defined behavior made visible.
-- **MSVC has never run on real hardware.** The flag dialect lives in
-  `toolchain.rs`; CI's windows-msvc job (`CC=cl` + smoke tests) exercises it
-  once the repo is pushed. Anticipated Windows papercuts: cl prints the
-  source filename to stdout (needs a per-family filter); antivirus briefly
-  locks freshly-exited executables (reusing one `input.exe` path may hit
-  access-denied — unique names per step would be robust); ANSI colors on
-  legacy conhost.
+- **MSVC status (first CI contact 2026-07):** detection, the C89 default →
+  `/std:c17` auto-raise, and `_Generic` value printing all worked on the
+  real cl 19.51. Two papercuts found and fixed: cl echoes the bare source
+  filename to stdout (now dropped in `errmap::remap`), and C4552/C4553
+  joined the suppressed unused-family list. Still anticipated but not yet
+  seen: antivirus briefly locking freshly-exited executables (unique exe
+  names per step would be the fix); ANSI colors on legacy conhost.
 - No tab completion (`Completer` in `editor.rs` is a stub).
 - No session save/load. `Session` is not serializable yet; adding serde is
   straightforward.

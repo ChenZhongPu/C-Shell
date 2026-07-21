@@ -250,9 +250,12 @@ impl Toolchain {
             }
             a.push("/W3".into());
             // The MSVC spellings of "defined but not used yet", normal at a
-            // REPL: C4101 unreferenced local, C4102 unreferenced label.
+            // REPL: C4101 unreferenced local, C4102 unreferenced label,
+            // C4552/C4553 expression result not used (a deliberate `expr;`).
             a.push("/wd4101".into());
             a.push("/wd4102".into());
+            a.push("/wd4552".into());
+            a.push("/wd4553".into());
             // /TC forces C even when the temp file has an odd extension.
             a.push("/TC".into());
             a.extend(self.extra.clone());
@@ -287,7 +290,15 @@ impl Toolchain {
             a.push(src.display().to_string());
             a.push("-o".into());
             a.push(exe.display().to_string());
-            a.push("-lm".into());
+            // Math lives in libm only on Unix. On Windows it is part of
+            // every C runtime, and worse: clang.exe defaults to the MSVC
+            // target there, where `-lm` becomes a link against a
+            // nonexistent m.lib. The probes never pass -lm, so that
+            // failure would surface not at detection but at the user's
+            // first evaluation.
+            if !cfg!(windows) {
+                a.push("-lm".into());
+            }
         }
         a
     }
@@ -438,5 +449,52 @@ mod tests {
     fn rejects_garbage() {
         assert_eq!(parse_std_probe("", Family::Gnu), None);
         assert_eq!(parse_std_probe("not numbers\n", Family::Gnu), None);
+    }
+
+    #[test]
+    fn family_detection_covers_windows_compilers() {
+        // clang-cl IS clang, but speaks the MSVC dialect: the name must win
+        // over the banner.
+        assert_eq!(
+            family_of(
+                Path::new("C:/LLVM/bin/clang-cl.exe"),
+                "clang version 22.1.6"
+            ),
+            Family::Msvc
+        );
+        assert_eq!(
+            family_of(Path::new("cl.exe"), "Microsoft (R) C/C++"),
+            Family::Msvc
+        );
+        assert_eq!(
+            family_of(Path::new("/usr/bin/clang"), "clang version 22.1.6"),
+            Family::Clang
+        );
+        assert_eq!(
+            family_of(Path::new("/mingw64/bin/gcc.exe"), "gcc (GCC) 14.2"),
+            Family::Gnu
+        );
+        // The macOS trap: a binary named gcc that is actually clang.
+        assert_eq!(
+            family_of(Path::new("/usr/bin/gcc"), "Apple clang version 21.0.0"),
+            Family::Clang
+        );
+    }
+
+    #[test]
+    fn libm_is_linked_only_on_unix() {
+        // On Windows, clang defaults to the MSVC target where `-lm` becomes
+        // a link against a nonexistent m.lib; MinGW keeps math in the CRT.
+        let tc = Toolchain {
+            path: "gcc".into(),
+            family: Family::Gnu,
+            version: String::new(),
+            std: "c17".into(),
+            default_std: None,
+            auto_std: false,
+            extra: vec![],
+        };
+        let args = tc.compile_args(Path::new("in.c"), Path::new("out"), Path::new("."));
+        assert_eq!(args.contains(&"-lm".to_string()), cfg!(unix));
     }
 }
