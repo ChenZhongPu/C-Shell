@@ -4,6 +4,9 @@
 //! rule to stay unambiguous.
 
 use anyhow::Result;
+use std::io::Write as _;
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use crate::codegen::{self, Slot};
 use crate::eval::Evaluator;
@@ -13,6 +16,42 @@ use crate::ui::Ui;
 pub enum Action {
     Continue,
     Quit,
+}
+
+/// Pretty-print C source through clang-format when it is available, or
+/// return it unchanged when it is not.
+///
+/// The assembled program is honest but ragged: it is built by string
+/// concatenation, and interactively-typed inputs carry the prompt-width
+/// padding the auto-indent inserted. Formatting is presentation only — the
+/// compiler always receives the raw text, so `%src` shows the same program,
+/// just readable.
+fn format_c(src: &str) -> String {
+    static CLANG_FORMAT: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    let Some(path) = CLANG_FORMAT.get_or_init(|| which::which("clang-format").ok()) else {
+        return src.to_string();
+    };
+    let run = || -> std::io::Result<String> {
+        let mut child = Command::new(path)
+            // Match the generated code's own 4-space style.
+            .arg("-style={BasedOnStyle: LLVM, IndentWidth: 4}")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .expect("stdin piped")
+            .write_all(src.as_bytes())?;
+        let out = child.wait_with_output()?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            Err(std::io::Error::other("clang-format failed"))
+        }
+    };
+    run().unwrap_or_else(|_| src.to_string())
 }
 
 const HELP: &str = "\
@@ -62,7 +101,7 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
 
         "src" => {
             let prog = codegen::build(session, "", Slot::Stmt);
-            println!("{}", prog.src);
+            println!("{}", format_c(&prog.src));
         }
 
         "undo" => match session.undo() {

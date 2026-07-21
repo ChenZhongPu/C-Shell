@@ -32,6 +32,13 @@ impl Ui {
         self.paint("1;32", &format!("In [{n}]: "))
     }
 
+    /// Printable width of that prompt, excluding color codes — the column
+    /// where the user's code starts, and the alignment base for
+    /// continuation-line auto-indent.
+    pub fn prompt_width(n: usize) -> usize {
+        format!("In [{n}]: ").len()
+    }
+
     pub fn out_label(&self, n: usize) -> String {
         self.paint("1;31", &format!("Out[{n}]: "))
     }

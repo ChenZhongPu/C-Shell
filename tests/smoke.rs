@@ -78,6 +78,32 @@ fn survives_a_crashing_input() {
 }
 
 #[test]
+fn defining_things_without_using_them_warns_nothing() {
+    // At a REPL everything is unused the moment it is defined; the -Wunused
+    // family must stay suppressed or every function definition and every
+    // deliberate `expr;` drowns the prompt in noise.
+    let out = run(&[
+        "int foo(int x) { return x; }",
+        "int unused_yet = 1;",
+        "unused_yet + 1;",
+    ]);
+    assert!(
+        !out.contains("warning"),
+        "unused-style warning leaked:\n{out}"
+    );
+}
+
+#[test]
+fn real_warnings_still_show() {
+    // Suppressing REPL noise must not take genuine diagnostics with it.
+    let out = run(&["-1 > 0u"]);
+    assert!(
+        out.contains("warning"),
+        "sign-compare warning disappeared:\n{out}"
+    );
+}
+
+#[test]
 fn program_output_is_shown_once() {
     // Replay must not re-show output from earlier inputs.
     let out = run(&["puts(\"marker-once\");", "1 + 1"]);

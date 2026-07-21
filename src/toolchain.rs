@@ -249,6 +249,10 @@ impl Toolchain {
                 a.push(format!("/std:{}", self.std));
             }
             a.push("/W3".into());
+            // The MSVC spellings of "defined but not used yet", normal at a
+            // REPL: C4101 unreferenced local, C4102 unreferenced label.
+            a.push("/wd4101".into());
+            a.push("/wd4102".into());
             // /TC forces C even when the temp file has an odd extension.
             a.push("/TC".into());
             a.extend(self.extra.clone());
@@ -270,8 +274,11 @@ impl Toolchain {
             // quiet prompt, so these are on by default.
             a.push("-Wall".into());
             a.push("-Wextra".into());
-            a.push("-Wno-unused-variable".into());
-            a.push("-Wno-unused-but-set-variable".into());
+            // ...except the -Wunused umbrella. At a REPL everything is
+            // unused the moment it is defined: a new function has no caller
+            // yet, and a deliberate `expr;` is an unused value by design.
+            a.push("-Wno-unused".into());
+            // Enabled by -Wextra and not part of the umbrella.
             a.push("-Wno-unused-parameter".into());
             a.push("-fno-diagnostics-color".into());
             a.extend(self.extra.clone());

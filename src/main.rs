@@ -17,6 +17,9 @@ mod ui;
 use anyhow::Result;
 use clap::Parser;
 use rustyline::error::ReadlineError;
+use rustyline::{EventHandler, KeyCode, KeyEvent, Modifiers};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::codegen::Slot;
@@ -72,11 +75,24 @@ fn main() -> Result<()> {
 
     let mut rl = rustyline::Editor::<editor::CHelper, _>::new()?;
     rl.set_helper(Some(editor::CHelper::new(color)));
+    // Enter auto-indents continuation lines: padded to the prompt width so
+    // code aligns under code, plus two spaces per open bracket. `}` on a
+    // blank indent steps one level back out.
+    let prompt_base = Arc::new(AtomicUsize::new(Ui::prompt_width(1)));
+    rl.bind_sequence(
+        KeyEvent(KeyCode::Enter, Modifiers::NONE),
+        EventHandler::Conditional(Box::new(editor::EnterIndents(prompt_base.clone()))),
+    );
+    rl.bind_sequence(
+        KeyEvent::from('}'),
+        EventHandler::Conditional(Box::new(editor::BraceDedents)),
+    );
 
     let mut session = Session::default();
 
     loop {
         let n = session.counter + 1;
+        prompt_base.store(Ui::prompt_width(n), Ordering::Relaxed);
         let line = match rl.readline(&ui.prompt_in(n)) {
             Ok(l) => l,
             Err(ReadlineError::Interrupted) => continue,
