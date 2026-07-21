@@ -8,8 +8,8 @@ use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Cmd, ConditionalEventHandler, Event, EventContext, Helper, Movement, RepeatCount};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
@@ -17,15 +17,98 @@ use syntect::util::as_24_bit_terminal_escaped;
 
 use crate::lex;
 
+/// The magic commands, for completion.
+const MAGICS: &[&str] = &[
+    "%help", "%quit", "%exit", "%reset", "%history", "%src", "%undo", "%cc", "%std",
+];
+
+/// C keywords, common types and stdlib staples worth offering at a C prompt.
+const C_WORDS: &[&str] = &[
+    "auto",
+    "bool",
+    "break",
+    "case",
+    "char",
+    "const",
+    "continue",
+    "default",
+    "do",
+    "double",
+    "else",
+    "enum",
+    "extern",
+    "false",
+    "float",
+    "for",
+    "goto",
+    "if",
+    "inline",
+    "int",
+    "long",
+    "register",
+    "restrict",
+    "return",
+    "short",
+    "signed",
+    "sizeof",
+    "static",
+    "struct",
+    "switch",
+    "typedef",
+    "union",
+    "unsigned",
+    "void",
+    "volatile",
+    "while",
+    "_Bool",
+    "_Generic",
+    "true",
+    "size_t",
+    "int8_t",
+    "int16_t",
+    "int32_t",
+    "int64_t",
+    "uint8_t",
+    "uint16_t",
+    "uint32_t",
+    "uint64_t",
+    "intptr_t",
+    "uintptr_t",
+    "ptrdiff_t",
+    "NULL",
+    "printf",
+    "scanf",
+    "puts",
+    "putchar",
+    "getchar",
+    "malloc",
+    "calloc",
+    "realloc",
+    "free",
+    "memcpy",
+    "memset",
+    "strlen",
+    "strcmp",
+    "strcpy",
+    "strncpy",
+    "fopen",
+    "fclose",
+    "fread",
+    "fwrite",
+    "fprintf",
+];
+
 pub struct CHelper {
     syntaxes: SyntaxSet,
     syntax: SyntaxReference,
     theme: Theme,
     pub color: bool,
+    /// Session vocabulary, refreshed by the REPL loop after each input.
+    idents: Arc<Mutex<Vec<String>>>,
 }
 
 impl CHelper {
-    pub fn new(color: bool) -> Self {
+    pub fn new(color: bool, idents: Arc<Mutex<Vec<String>>>) -> Self {
         // Loaded once: syntect's default sets are expensive enough that
         // rebuilding them per keystroke would be visible as input lag.
         let syntaxes = SyntaxSet::load_defaults_newlines();
@@ -39,8 +122,46 @@ impl CHelper {
             syntax,
             theme,
             color,
+            idents,
         }
     }
+}
+
+/// What Tab should offer at `pos`: `(replace_from, candidates)`.
+///
+/// A word starting the line with `%` completes against the magic commands;
+/// an identifier completes against C keywords, stdlib staples and every name
+/// the session has mentioned.
+fn completion_candidates(line: &str, pos: usize, idents: &[String]) -> (usize, Vec<String>) {
+    let b = line.as_bytes();
+    let mut start = pos;
+    while start > 0 && (b[start - 1].is_ascii_alphanumeric() || b[start - 1] == b'_') {
+        start -= 1;
+    }
+    // `%word` is a magic only at the start of the line; elsewhere `%` is the
+    // modulo operator and no part of the word.
+    if start > 0 && b[start - 1] == b'%' && line[..start - 1].trim_start().is_empty() {
+        let word = &line[start - 1..pos];
+        let m = MAGICS
+            .iter()
+            .filter(|c| c.starts_with(word))
+            .map(|s| s.to_string())
+            .collect();
+        return (start - 1, m);
+    }
+    let word = &line[start..pos];
+    if word.is_empty() || word.as_bytes()[0].is_ascii_digit() {
+        return (pos, Vec::new());
+    }
+    let mut out: Vec<String> = C_WORDS
+        .iter()
+        .filter(|k| k.starts_with(word))
+        .map(|s| s.to_string())
+        .chain(idents.iter().filter(|k| k.starts_with(word)).cloned())
+        .collect();
+    out.sort();
+    out.dedup();
+    (start, out)
 }
 
 impl Highlighter for CHelper {
@@ -73,7 +194,7 @@ impl Highlighter for CHelper {
 /// Single source of truth, shared by the validator and the Enter handler —
 /// if the two ever disagreed, Enter could refuse to submit an input the
 /// validator considers finished, or vice versa.
-fn is_incomplete(input: &str) -> bool {
+pub fn is_incomplete(input: &str) -> bool {
     let t = input.trim();
     if t.is_empty() || t.starts_with('%') {
         return false;
@@ -155,6 +276,16 @@ impl ConditionalEventHandler for BraceDedents {
 
 impl Completer for CHelper {
     type Candidate = String;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<String>)> {
+        let idents = self.idents.lock().expect("ident vocabulary");
+        Ok(completion_candidates(line, pos, &idents))
+    }
 }
 
 impl Hinter for CHelper {
@@ -166,6 +297,30 @@ impl Helper for CHelper {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completes_magic_commands_at_line_start_only() {
+        let (start, c) = completion_candidates("%h", 2, &[]);
+        assert_eq!(start, 0);
+        assert_eq!(c, vec!["%help", "%history"]);
+        // Mid-line `%` is the modulo operator.
+        let (_, c) = completion_candidates("a %h", 4, &[]);
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn completes_keywords_and_session_names_merged() {
+        let idents = vec!["siz_total".to_string()];
+        let (start, c) = completion_candidates("x = siz", 7, &idents);
+        assert_eq!(start, 4);
+        assert_eq!(c, vec!["siz_total", "size_t", "sizeof"]);
+    }
+
+    #[test]
+    fn no_candidates_inside_numbers_or_empty() {
+        assert!(completion_candidates("x = 0x1", 7, &[]).1.is_empty());
+        assert!(completion_candidates("", 0, &[]).1.is_empty());
+    }
 
     #[test]
     fn complete_input_falls_through_to_submit() {

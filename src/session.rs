@@ -3,14 +3,22 @@
 use crate::codegen::Slot;
 use crate::lex;
 
+/// One `%history` row. Evaluated inputs carry their `In [n]` number; magic
+/// commands sit in the history without consuming one, so the two kinds of
+/// sequence must not be conflated.
+pub struct HistoryEntry {
+    pub n: Option<usize>,
+    pub text: String,
+}
+
 #[derive(Default)]
 pub struct Session {
     /// `#include`s, `#define`s, function definitions, type definitions.
     pub file_items: Vec<String>,
     /// Statements and block-scope declarations, in order, inside `main`.
     pub stmts: Vec<String>,
-    /// Raw input lines as typed, for `%history`.
-    pub history: Vec<String>,
+    /// Raw inputs as typed, for `%history`.
+    pub history: Vec<HistoryEntry>,
     /// Input counter driving the `In [n]` prompt. Like IPython it advances on
     /// every input including failed ones, so `_n` always lines up with the
     /// `Out[n]` the user saw.
@@ -51,6 +59,21 @@ impl Session {
             Slot::FileScope => self.file_items.pop(),
             Slot::Stmt | Slot::Expr => self.stmts.pop().map(|s| s.trim().to_string()),
         }
+    }
+
+    /// Every identifier the session mentions, deduplicated and sorted —
+    /// the completion vocabulary. Single letters are omitted: offering `x`
+    /// as a completion of `x` helps nobody.
+    pub fn identifiers(&self) -> Vec<String> {
+        let mut seen = std::collections::BTreeSet::new();
+        for text in self.file_items.iter().chain(self.stmts.iter()) {
+            for w in lex::identifiers(text) {
+                if w.len() >= 2 {
+                    seen.insert(w);
+                }
+            }
+        }
+        seen.into_iter().collect()
     }
 
     pub fn reset(&mut self) {

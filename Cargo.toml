@@ -2,6 +2,17 @@
 name = "c-shell"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.96"
+description = "An interactive shell for C: type an expression, a statement or a function and see what your real compiler does with it"
+repository = "https://github.com/ChenZhongPu/C-Shell"
+license = "MIT"
+readme = "README.md"
+keywords = ["repl", "c", "shell", "compiler", "interactive"]
+categories = ["command-line-utilities", "development-tools"]
+# The toolchain pin is a development discipline (local clippy == CI clippy);
+# shipping it in the crate would force that exact toolchain onto everyone
+# running `cargo install`. CI configs are dev-only noise in a package.
+exclude = ["rust-toolchain.toml", ".github/", ".githooks/"]
 
 [dependencies]
 anyhow = "1"
@@ -11,6 +22,9 @@ syntect = { version = "5", default-features = false, features = ["default-fancy"
 tempfile = "3"
 which = "6"
 wait-timeout = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.release]
 strip = true

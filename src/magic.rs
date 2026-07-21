@@ -65,7 +65,6 @@ Commands:
   %cc [path]         show or switch the C compiler
   %std [std]         show or switch the language standard (c11/c17/c23);
                      %std default returns to the compiler's own default
-  %flags [flags...]  show or set extra compiler flags (no args clears them)
 
 Notes:
   A bare expression prints its value; a trailing ';' runs it silently.
@@ -94,8 +93,15 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
             if session.history.is_empty() {
                 println!("{}", ui.dim("(no input yet)"));
             }
-            for (i, h) in session.history.iter().enumerate() {
-                println!("{} {h}", ui.dim(&format!("{:>4}:", i + 1)));
+            // Two sequences, kept visibly distinct: evaluated inputs carry
+            // their In[n] number, magic commands a dash — they never
+            // consumed one.
+            for e in &session.history {
+                let tag = match e.n {
+                    Some(n) => format!("In[{n:>3}]"),
+                    None => "  --   ".to_string(),
+                };
+                println!("{} {}", ui.dim(&tag), e.text);
             }
         }
 
@@ -114,13 +120,12 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
                 println!("{}", ev.tc.describe());
             } else {
                 let std = ev.tc.std.clone();
-                let extra = ev.tc.extra.clone();
                 let std_opt = if std.is_empty() {
                     None
                 } else {
                     Some(std.as_str())
                 };
-                match crate::toolchain::Toolchain::detect(Some(rest[0]), std_opt, extra) {
+                match crate::toolchain::Toolchain::detect(Some(rest[0]), std_opt) {
                     Ok(tc) => {
                         ev.set_toolchain(tc);
                         println!("{}", ev.tc.describe());
@@ -139,7 +144,7 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
                 // re-detection re-runs the _Generic viability check too.
                 let req = if want == "default" { None } else { Some(want) };
                 let path = ev.tc.path.display().to_string();
-                match crate::toolchain::Toolchain::detect(Some(&path), req, ev.tc.extra.clone()) {
+                match crate::toolchain::Toolchain::detect(Some(&path), req) {
                     Ok(new) if req.is_none() || new.std == want => {
                         ev.set_toolchain(new);
                         println!("{}", ev.tc.describe());
@@ -149,17 +154,6 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
                         ui.err(&format!("this compiler does not support -std={want}"))
                     ),
                 }
-            }
-        }
-
-        "flags" => {
-            let mut tc = ev.tc.clone();
-            tc.extra = rest.iter().map(|s| s.to_string()).collect();
-            ev.set_toolchain(tc);
-            if ev.tc.extra.is_empty() {
-                println!("{}", ui.dim("(no extra flags)"));
-            } else {
-                println!("{}", ev.tc.extra.join(" "));
             }
         }
 

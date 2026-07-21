@@ -96,13 +96,50 @@ fn is_ident_byte(c: u8) -> bool {
     c == b'_' || c.is_ascii_alphanumeric()
 }
 
+/// Every identifier appearing as code (not in comments or literals), in
+/// order of first appearance. Fuel for completion: whatever the session has
+/// mentioned is worth offering again.
+pub fn identifiers(src: &str) -> Vec<String> {
+    let sc = scan(src);
+    let b = src.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if sc.code[i] && is_ident_byte(b[i]) {
+            let start = i;
+            while i < b.len() && sc.code[i] && is_ident_byte(b[i]) {
+                i += 1;
+            }
+            if !b[start].is_ascii_digit() {
+                out.push(src[start..i].to_string());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Nothing but whitespace and comments — legal to type, nothing to run.
+pub fn is_blank(src: &str) -> bool {
+    let sc = scan(src);
+    src.bytes()
+        .zip(sc.code)
+        .all(|(b, is_code)| !is_code || b.is_ascii_whitespace())
+}
+
 /// Could evaluating this expression change anything the session can observe?
 ///
 /// An expression typed at the prompt is usually a question — `x + 1`,
 /// `sizeof(int)` — and a question does not need to be replayed. Only what
-/// might mutate state has to be kept, so this errs towards `true`: it looks
-/// for assignment, increment, decrement and calls, and anything it is unsure
-/// about is treated as impure.
+/// might mutate state has to be kept, so this errs towards `true`: an extra
+/// replay is cheap; silently dropped state is not.
+///
+/// A call is a `(` whose left operand — the previous non-whitespace *code*
+/// byte, with comments and literal interiors invisible — ends in an
+/// identifier, `)` or `]`. That nets `f()`, `f/**/()`, `(f)()`, `(*fp)()`
+/// and `arr[0]()` alike. It also nets a cast like `(int)(x)`, which only a
+/// symbol table could tell apart from a call; per the rule above it is kept.
 pub fn may_have_side_effects(src: &str) -> bool {
     // Operators that only *contain* `=` without assigning.
     const COMPARISONS: [u8; 4] = *b"=!<>";
@@ -111,40 +148,55 @@ pub fn may_have_side_effects(src: &str) -> bool {
 
     let sc = scan(src);
     let b = src.as_bytes();
+    // Previous non-whitespace code byte, and the identifier ending there.
+    let mut prev: u8 = 0;
+    let mut prev_word: &str = "";
+
     let mut i = 0;
     while i < b.len() {
-        if !sc.code[i] {
+        if !sc.code[i] || b[i].is_ascii_whitespace() {
             i += 1;
             continue;
         }
-        match b[i] {
+        let c = b[i];
+        match c {
             b'=' => {
-                let prev = i.checked_sub(1).map(|p| b[p]);
-                let next = b.get(i + 1).copied();
-                let is_comparison =
-                    prev.is_some_and(|c| COMPARISONS.contains(&c)) || next == Some(b'=');
+                // Token pairing is *raw* adjacency — `==` cannot span a
+                // comment, and `f/**/()` is why the call check below must
+                // NOT be raw. `<<=`/`>>=` assign even though their middle
+                // byte looks like a comparison operator.
+                let prev_raw = i.checked_sub(1).map(|p| b[p]);
+                let prev2_raw = i.checked_sub(2).map(|p| b[p]);
+                let shift_assign =
+                    prev_raw.is_some_and(|p| p == b'<' || p == b'>') && prev2_raw == prev_raw;
+                let is_comparison = !shift_assign
+                    && (prev_raw.is_some_and(|p| COMPARISONS.contains(&p))
+                        || b.get(i + 1) == Some(&b'='));
                 if !is_comparison {
                     return true;
                 }
             }
-            b'+' | b'-' if b.get(i + 1) == Some(&b[i]) => return true,
-            _ if is_ident_byte(b[i]) => {
-                let start = i;
-                while i < b.len() && sc.code[i] && is_ident_byte(b[i]) {
-                    i += 1;
-                }
-                let word = &src[start..i];
-                let calls = src[i..]
-                    .bytes()
-                    .find(|c| !c.is_ascii_whitespace())
-                    .is_some_and(|c| c == b'(');
-                if calls && !PURE_CALLS.contains(&word) {
+            b'+' | b'-' if b.get(i + 1) == Some(&c) => return true,
+            b'(' => {
+                if prev == b')' || prev == b']' {
                     return true;
                 }
-                continue;
+                if is_ident_byte(prev) && !PURE_CALLS.contains(&prev_word) {
+                    return true;
+                }
             }
             _ => {}
         }
+        if is_ident_byte(c) {
+            let start = i;
+            while i < b.len() && sc.code[i] && is_ident_byte(b[i]) {
+                i += 1;
+            }
+            prev_word = &src[start..i];
+            prev = b[i - 1];
+            continue;
+        }
+        prev = c;
         i += 1;
     }
     false
@@ -233,6 +285,25 @@ mod tests {
     }
 
     #[test]
+    fn harvests_code_identifiers_only() {
+        assert_eq!(
+            identifiers("int x = f(y); // z"),
+            vec!["int", "x", "f", "y"]
+        );
+        assert_eq!(identifiers("puts(\"not_this\")"), vec!["puts"]);
+        assert!(identifiers("42 + 0x1F").is_empty());
+    }
+
+    #[test]
+    fn blank_means_comments_and_whitespace_only() {
+        assert!(is_blank("// just a note"));
+        assert!(is_blank("/* block */"));
+        assert!(is_blank("   "));
+        assert!(!is_blank("x // trailing"));
+        assert!(!is_blank("\"text\""));
+    }
+
+    #[test]
     fn treats_questions_as_pure() {
         assert!(!may_have_side_effects("x + 1"));
         assert!(!may_have_side_effects("3.0 / 2"));
@@ -249,9 +320,31 @@ mod tests {
     fn treats_mutation_and_calls_as_impure() {
         assert!(may_have_side_effects("x = 5"));
         assert!(may_have_side_effects("x += 5"));
+        assert!(may_have_side_effects("x <<= 1"));
+        assert!(may_have_side_effects("x >>= 1"));
         assert!(may_have_side_effects("x++"));
         assert!(may_have_side_effects("--x"));
         assert!(may_have_side_effects("puts(\"hi\")"));
         assert!(may_have_side_effects("fact(5)"));
+    }
+
+    #[test]
+    fn detects_calls_hidden_by_comments_or_parens() {
+        // Each of these once slipped past the heuristic and lost session
+        // state: the call ran, but its effects were never replayed.
+        assert!(may_have_side_effects("f/**/()"));
+        assert!(may_have_side_effects("f /* comment */ ()"));
+        assert!(may_have_side_effects("(f)()"));
+        assert!(may_have_side_effects("(*fp)()"));
+        assert!(may_have_side_effects("arr[0]()"));
+    }
+
+    #[test]
+    fn undecidable_forms_are_kept_not_dropped() {
+        // A cast is indistinguishable from a call without a symbol table;
+        // the conservative answer is to keep it.
+        assert!(may_have_side_effects("(int)(x)"));
+        // A comment splitting `+ +` is two unary pluses, not an increment.
+        assert!(!may_have_side_effects("x +/**/+ y"));
     }
 }

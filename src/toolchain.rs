@@ -3,6 +3,21 @@
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
+
+use crate::proc;
+
+/// Deadline for every probe: a compiler that needs longer than this to
+/// answer `--version` or build ten lines is effectively hung, and a hung
+/// probe would otherwise freeze startup before the prompt even appears.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `.output()` with a deadline; `None` covers spawn failure and timeout
+/// alike — for a probe those are the same answer.
+fn probe_output(cmd: &mut Command) -> Option<proc::Captured> {
+    let cap = proc::run_captured(cmd, PROBE_TIMEOUT, false).ok()?;
+    cap.status.is_some().then_some(cap)
+}
 
 /// Which flag dialect a compiler speaks. Version numbers are deliberately
 /// not part of this: capabilities are probed by trial compile, never derived
@@ -32,7 +47,6 @@ pub struct Toolchain {
     /// compiler's default mode cannot host the `_Generic` value printer
     /// (MSVC without `/std:` is C89).
     pub auto_std: bool,
-    pub extra: Vec<String>,
 }
 
 /// Compiled and *run* once per detection, with no `-std` flag: the compiler
@@ -109,9 +123,7 @@ fn family_of(path: &Path, banner: &str) -> Family {
 fn banner_of(path: &Path) -> Result<String> {
     // MSVC has no --version; invoked bare it prints its banner to stderr and
     // exits nonzero, so accept output from either stream and ignore status.
-    let out = Command::new(path)
-        .arg("--version")
-        .output()
+    let out = probe_output(Command::new(path).arg("--version"))
         .with_context(|| format!("failed to run {}", path.display()))?;
     let pick = |b: &[u8]| {
         String::from_utf8_lossy(b)
@@ -122,11 +134,10 @@ fn banner_of(path: &Path) -> Result<String> {
             .to_string()
     };
     let s = pick(&out.stdout);
-    if !s.is_empty() && out.status.success() {
+    if !s.is_empty() && out.status.is_some_and(|st| st.success()) {
         return Ok(s);
     }
-    let bare = Command::new(path).output();
-    if let Ok(bare) = bare {
+    if let Some(bare) = probe_output(&mut Command::new(path)) {
         let e = pick(&bare.stderr);
         if !e.is_empty() {
             return Ok(e);
@@ -141,7 +152,7 @@ fn banner_of(path: &Path) -> Result<String> {
 
 impl Toolchain {
     /// Resolve a compiler: explicit choice, then `$CC`, then PATH.
-    pub fn detect(explicit: Option<&str>, std: Option<&str>, extra: Vec<String>) -> Result<Self> {
+    pub fn detect(explicit: Option<&str>, std: Option<&str>) -> Result<Self> {
         let mut tried: Vec<String> = Vec::new();
         let mut names: Vec<String> = Vec::new();
         if let Some(e) = explicit {
@@ -176,7 +187,6 @@ impl Toolchain {
                 std: String::new(),
                 default_std: None,
                 auto_std: false,
-                extra: extra.clone(),
             };
             // One compile + run answers two questions at once: does this
             // toolchain produce working executables (MSVC outside a Developer
@@ -258,7 +268,6 @@ impl Toolchain {
             a.push("/wd4553".into());
             // /TC forces C even when the temp file has an odd extension.
             a.push("/TC".into());
-            a.extend(self.extra.clone());
             a.push(src.display().to_string());
             a.push(format!("/Fe:{}", exe.display()));
             // Keep the intermediate .obj out of the working directory. The
@@ -284,7 +293,6 @@ impl Toolchain {
             // Enabled by -Wextra and not part of the umbrella.
             a.push("-Wno-unused-parameter".into());
             a.push("-fno-diagnostics-color".into());
-            a.extend(self.extra.clone());
             a.push("-x".into());
             a.push("c".into());
             a.push(src.display().to_string());
@@ -329,7 +337,7 @@ impl Toolchain {
             cmd.args(args);
             cmd.arg("-x").arg("c").arg(&src).arg("-o").arg(&exe);
         }
-        matches!(cmd.output(), Ok(o) if o.status.success())
+        probe_output(&mut cmd).is_some_and(|c| c.status.is_some_and(|st| st.success()))
     }
 
     /// Like `probe`, but also runs the produced executable and returns its
@@ -355,12 +363,12 @@ impl Toolchain {
             cmd.args(args);
             cmd.arg("-x").arg("c").arg(&src).arg("-o").arg(&exe);
         }
-        let ok = matches!(cmd.output(), Ok(o) if o.status.success());
+        let ok = probe_output(&mut cmd).is_some_and(|c| c.status.is_some_and(|st| st.success()));
         if !ok {
             return None;
         }
-        let run = Command::new(&exe).output().ok()?;
-        if !run.status.success() {
+        let run = probe_output(&mut Command::new(&exe))?;
+        if !run.status.is_some_and(|st| st.success()) {
             return None;
         }
         Some(String::from_utf8_lossy(&run.stdout).into_owned())
@@ -492,7 +500,6 @@ mod tests {
             std: "c17".into(),
             default_std: None,
             auto_std: false,
-            extra: vec![],
         };
         let args = tc.compile_args(Path::new("in.c"), Path::new("out"), Path::new("."));
         assert_eq!(args.contains(&"-lm".to_string()), cfg!(unix));

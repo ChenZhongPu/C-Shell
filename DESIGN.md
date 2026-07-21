@@ -32,8 +32,11 @@ Implemented: expression evaluation with value printing, statements, automatic
 file-scope hoisting for functions/`#include`/`typedef`, multi-line input,
 syntax highlighting, compiler detection and mid-session switching, warning
 pass-through, diagnostic remapping, crash and infinite-loop isolation,
-missing-semicolon repair, `%help %quit %reset %history %src %undo %cc %std
-%flags`, CI for 4 platform configs, tag-triggered release workflow.
+missing-semicolon repair, tab completion (magics, C keywords, session
+names), persistent input history, `%help %quit %reset %history %src %undo
+%cc %std`,
+process-tree isolation with deadlines on every child (compiler, probes, user
+programs), CI for 4 platform configs, tag-triggered release workflow.
 
 ---
 
@@ -198,14 +201,29 @@ References: [crepl](https://l-m.dev/cs/crepl/)
   joined the suppressed unused-family list. Still anticipated but not yet
   seen: antivirus briefly locking freshly-exited executables (unique exe
   names per step would be the fix); ANSI colors on legacy conhost.
-- No tab completion (`Completer` in `editor.rs` is a stub).
 - No session save/load. `Session` is not serializable yet; adding serde is
   straightforward.
 - UI strings are English but scattered across `main.rs` / `magic.rs` /
   `eval.rs` / `toolchain.rs`; centralize before attempting i18n.
 - Highlight theme is hardcoded (`base16-ocean.dark`); poor on light terminals.
 - The purity heuristic keeps any expression containing a call, even calls to
-  pure functions.
+  pure functions. (Hardened 2026-07 after a P0: calls disguised as `f/**/()`,
+  `(f)()`, `(*fp)()` were misjudged pure and their side effects silently
+  dropped from the session. Call detection now runs on code bytes with
+  comments invisible; `(` after an identifier, `)` or `]` is a call. Casts
+  like `(int)(x)` are indistinguishable without a symbol table and are kept —
+  an extra replay is cheap, lost state is not. AST-level judgment arrives
+  with tree-sitter in §3's staging.)
+- **Type-ahead at a real terminal is dropped between prompts** (pre-existing,
+  verified identical before/after the process-isolation work): rustyline
+  flushes the tty queue when re-entering raw mode, so a line typed while a
+  program is still running is lost. Piped input is unaffected, which is why
+  the smoke tests never see it. Fix would mean patching or replacing the
+  raw-mode toggle; noted, not urgent.
+- **Windows tree-kill uses `taskkill /T`**, which walks the parent-child
+  tree and misses orphans whose parent already exited. Job Objects
+  (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) are the airtight upgrade if it
+  ever matters in practice.
 - Probe results are not cached. Startup now runs ~4 compiler invocations
   (banner, version+self-test run, `_Generic` gate, plus `supports_std` when
   needed); adding more probes without an on-disk cache will make cold start
@@ -226,7 +244,10 @@ value (`Out[1]: hi\n3`). This bug was introduced once, while removing the
 rejects them. Function definitions must be routed to file scope by the
 heuristic up front — trial-compile failure cannot be relied on to do it, or
 gcc silently buries the function inside `main` and the session breaks the
-moment you switch to clang.
+moment you switch to clang. The fallback (file-scope-looking input that only
+compiles inside `main`) still exists for the heuristic's false positives,
+but it is no longer silent: the outcome carries `demoted` and the prompt
+prints "(note: kept inside main — it did not compile at file scope)".
 
 **File scope must not be a fallback slot** (`eval.rs`, `attempt`). It is
 wider than `main`: `int dup = 2;` after `int dup = 1;` must be a
@@ -268,6 +289,21 @@ wrapper line just above the input, which strict attribution labels
 print but warnings vanish, only on MSVC, only for expressions. Wrapper-line
 anchors are clamped into the input; nothing but the wrapper lives on those
 lines, so the clamp cannot mislabel foreign diagnostics.
+
+**Every child goes through `proc::run_captured`** — compiler, probes, user
+programs. It owns three subtleties that must not be unbundled: (1) the child
+gets its own Unix process group, and on timeout the *group* is killed —
+killing only the child leaves forked descendants running and, worse, holding
+the output pipe so the reader threads block forever; (2) when stdin is a
+real terminal the child's group must be handed the foreground
+(`tcsetpgrp`, both from `pre_exec` and the parent — the double set closes a
+race) or any tty read gets the program stopped by SIGTTIN, and SIGTTOU must
+be ignored before the parent can take the terminal back; (3) readers drain
+into shared buffers and are *abandoned* after a grace period, never joined
+unconditionally — a `setsid` escapee can hold the pipe open forever, and
+that must cost one thread, not the REPL. The group is only killed on the
+timeout path, while the pid is still a zombie: after reaping, the pid can be
+recycled and `killpg` could hit an innocent process.
 
 **A crashing or timed-out input must never be committed** (`main.rs`).
 Every later evaluation replays the session; committing one crash makes the

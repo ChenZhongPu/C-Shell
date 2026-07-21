@@ -6,15 +6,14 @@
 //! compiler is the only oracle that agrees with the compiler.
 
 use anyhow::{Context, Result};
-use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
-use wait_timeout::ChildExt;
 
 use crate::codegen::{self, M_NEW, M_VAL, Slot};
 use crate::errmap;
 use crate::lex;
+use crate::proc;
 use crate::session::Session;
 
 pub struct Outcome {
@@ -32,6 +31,11 @@ pub struct Outcome {
     /// Set when the input had to be repaired to compile; this is what should
     /// be committed to the session instead of what was typed.
     pub rewritten: Option<String>,
+    /// The input looked file-scope but only compiled inside `main`. Usually
+    /// a function definition referencing session variables, which gcc
+    /// quietly accepts as a GNU nested function and clang rejects — worth a
+    /// visible note, or the session breaks the moment the compiler changes.
+    pub demoted: bool,
 }
 
 pub enum Eval {
@@ -69,6 +73,10 @@ impl Evaluator {
 
     /// Compile `text`. Either way the compiler's raw diagnostics come back —
     /// on success they are the warnings, which a beginner needs to see.
+    ///
+    /// The compiler runs under the same deadline as user programs: a hung
+    /// compiler (pathological macro expansion, compiler bug) must not freeze
+    /// the REPL any more than a hung program may.
     fn compile_text(&self, text: &str) -> std::result::Result<(PathBuf, String), String> {
         let src = self.src_path();
         let exe = self.exe_path();
@@ -76,16 +84,21 @@ impl Evaluator {
             return Err(format!("cannot write temporary source: {e}"));
         }
         let args = self.tc.compile_args(&src, &exe, self.dir.path());
-        let out = match Command::new(&self.tc.path).args(&args).output() {
-            Ok(o) => o,
+        let mut cmd = Command::new(&self.tc.path);
+        cmd.args(&args);
+        let cap = match proc::run_captured(&mut cmd, self.timeout, false) {
+            Ok(c) => c,
             Err(e) => return Err(format!("cannot run compiler: {e}")),
         };
-        let mut d = String::from_utf8_lossy(&out.stderr).into_owned();
-        d.push_str(&String::from_utf8_lossy(&out.stdout));
-        if out.status.success() {
-            Ok((exe, d))
-        } else {
-            Err(d)
+        let mut d = String::from_utf8_lossy(&cap.stderr).into_owned();
+        d.push_str(&String::from_utf8_lossy(&cap.stdout));
+        match cap.status {
+            Some(st) if st.success() => Ok((exe, d)),
+            Some(_) => Err(d),
+            None => Err(format!(
+                "compiler timed out after {}s and was killed",
+                self.timeout.as_secs()
+            )),
         }
     }
 
@@ -153,7 +166,9 @@ impl Evaluator {
                 Ok((exe, warns)) => {
                     let warnings =
                         errmap::only_new(&errmap::remap(&warns, &src, start, count, prog.wrapped));
-                    return Ok(Ok(self.run(&exe, slot, warnings)?));
+                    let mut o = self.run(&exe, slot, warnings)?;
+                    o.demoted = file_first && slot != Slot::FileScope;
+                    return Ok(Ok(o));
                 }
                 Err(diag) => {
                     if slot == report_slot {
@@ -172,48 +187,20 @@ impl Evaluator {
     }
 
     fn run(&self, exe: &PathBuf, slot: Slot, warnings: String) -> Result<Outcome> {
-        let mut child = Command::new(exe)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+        let mut cmd = Command::new(exe);
+        let cap = proc::run_captured(&mut cmd, self.timeout, true)
             .with_context(|| format!("failed to start {}", exe.display()))?;
 
-        // Drained on threads so a chatty program cannot fill a pipe buffer and
-        // deadlock against our own timeout wait.
-        let mut so = child.stdout.take().expect("stdout piped");
-        let mut se = child.stderr.take().expect("stderr piped");
-        let t_out = std::thread::spawn(move || {
-            let mut v = Vec::new();
-            let _ = so.read_to_end(&mut v);
-            v
-        });
-        let t_err = std::thread::spawn(move || {
-            let mut v = Vec::new();
-            let _ = se.read_to_end(&mut v);
-            v
-        });
+        let abnormal = match cap.status {
+            None => Some(format!(
+                "killed after {}s (possible infinite loop)",
+                self.timeout.as_secs()
+            )),
+            Some(st) => describe_abnormal(&st),
+        };
 
-        let status = child.wait_timeout(self.timeout)?;
-        let mut abnormal = None;
-        match status {
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                abnormal = Some(format!(
-                    "killed after {}s (possible infinite loop)",
-                    self.timeout.as_secs()
-                ));
-            }
-            Some(st) => {
-                if let Some(msg) = describe_abnormal(&st) {
-                    abnormal = Some(msg);
-                }
-            }
-        }
-
-        let out = String::from_utf8_lossy(&t_out.join().unwrap_or_default()).into_owned();
-        let err = String::from_utf8_lossy(&t_err.join().unwrap_or_default()).into_owned();
+        let out = String::from_utf8_lossy(&cap.stdout).into_owned();
+        let err = String::from_utf8_lossy(&cap.stderr).into_owned();
 
         let (output, value) = split_new(&out);
         let (errors, _) = split_new(&err);
@@ -226,6 +213,7 @@ impl Evaluator {
             warnings,
             abnormal,
             rewritten: None,
+            demoted: false,
         })
     }
 }

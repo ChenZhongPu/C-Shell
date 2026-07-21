@@ -47,9 +47,19 @@ features).
 ```sh
 c-shell                              # auto-detect a compiler
 c-shell --cc clang --std c23         # pin compiler and standard
-c-shell --flags -O2 -march=native    # extra flags, passed through untouched
 c-shell --timeout 30                 # seconds before a runaway program is killed
+c-shell -e 'sizeof(long)'            # evaluate and exit: bare value on stdout,
+                                     # diagnostics on stderr, exit code on failure
+c-shell --script demo.csh            # run inputs from a file, then exit
+c-shell --quiet                      # interactive, but skip the banner
+echo '1 + 1' | c-shell               # piped input: transcript output, no banner
 ```
+
+Terminal handling is automatic: when stdout is not a terminal (or
+`TERM=dumb`, or `NO_COLOR` is set) colors are off; when stdin is not a
+terminal the banner, prompts and farewell are suppressed and input is read
+in batch mode — which also accumulates multi-line definitions, so scripts
+and pipes can contain full function bodies.
 
 The language standard defaults to **whatever your compiler defaults to**
 (gnu23 for gcc 16, gnu17 for clang 22; the banner shows what was detected) —
@@ -81,11 +91,15 @@ default: the warning is often exactly the thing you came to check.
 
 ```
 %help      %quit      %reset     %history
-%src       %undo      %cc        %std       %flags
+%src       %undo      %cc        %std
 ```
 
 `%src` prints the complete C program the session assembles — when you want to
 know exactly what the tool is doing on your behalf, look there.
+
+Tab completes `%` commands, C keywords, stdlib staples and every name your
+session has mentioned. Input history persists across sessions in
+`~/.local/share/c-shell/history` (`%APPDATA%\c-shell\history` on Windows).
 
 ## How it works
 

@@ -11,10 +11,14 @@ use std::process::{Command, Stdio};
 
 /// Feed `lines` to c-shell on stdin, return everything it printed to stdout.
 fn run(lines: &[&str]) -> String {
+    run_with_timeout(15, lines)
+}
+
+fn run_with_timeout(secs: u32, lines: &[&str]) -> String {
     let mut child = Command::new(env!("CARGO_BIN_EXE_c-shell"))
         .arg("--no-color")
         .arg("--timeout")
-        .arg("15")
+        .arg(secs.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -106,6 +110,128 @@ fn real_warnings_still_show() {
         out.contains("warning") || out.contains("C4018"),
         "sign-compare warning disappeared:\n{out}"
     );
+}
+
+#[test]
+fn disguised_calls_commit_their_side_effects() {
+    // P0 regression: `f/**/()` evaluated correctly but was misjudged as a
+    // pure expression and never committed, silently losing session state.
+    // The counter lives inside f to keep the scenario portable: a
+    // file-scope function cannot see main's locals (gcc would quietly
+    // accept that as a nested function; clang rejects it outright).
+    let out = run(&[
+        "int f(void) { static int n; return ++n; }",
+        "int (*fp)(void) = f;",
+        "f/**/()",
+        "f /* comment */ ()",
+        "(f)()",
+        "(*fp)()",
+        "f()",
+    ]);
+    assert!(out.contains("Out[3]: 1"), "first call:\n{out}");
+    // The last call sees all four disguised calls replayed before it.
+    assert!(
+        out.contains("Out[7]: 5"),
+        "a disguised call was dropped:\n{out}"
+    );
+}
+
+#[test]
+fn eval_flag_prints_bare_value_and_exits_clean() {
+    let out = Command::new(env!("CARGO_BIN_EXE_c-shell"))
+        .args(["-e", "1 + 1"])
+        .output()
+        .expect("run c-shell -e");
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "2");
+}
+
+#[test]
+fn eval_flag_failure_sets_exit_code_and_uses_stderr() {
+    let out = Command::new(env!("CARGO_BIN_EXE_c-shell"))
+        .args(["-e", "no_such_variable"])
+        .output()
+        .expect("run c-shell -e");
+    assert!(!out.status.success(), "failure must be visible to scripts");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("error"),
+        "diagnostic missing from stderr"
+    );
+}
+
+#[test]
+fn script_mode_accumulates_multi_line_definitions() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("t.csh");
+    std::fs::write(
+        &path,
+        "// a comment-only line is skipped
+int mul(int a, int b)
+{
+    return a * b;
+}
+mul(6, 7)
+",
+    )
+    .expect("write script");
+    let out = Command::new(env!("CARGO_BIN_EXE_c-shell"))
+        .arg("--script")
+        .arg(&path)
+        .output()
+        .expect("run c-shell --script");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Out[2]: 42"),
+        "unexpected output:\n{stdout}"
+    );
+}
+
+#[test]
+fn piped_stdin_accumulates_multi_line_definitions() {
+    // The batch reader gives pipes the same multi-line handling the
+    // interactive validator provides at a terminal.
+    let out = run(&["int sq(int a)", "{", "    return a * a;", "}", "sq(9)"]);
+    assert!(out.contains("Out[2]: 81"), "unexpected output:\n{out}");
+}
+
+#[test]
+fn history_separates_input_numbers_from_magic_commands() {
+    let out = run(&["int h1 = 41;", "%src", "h1 + 1", "%history"]);
+    assert!(out.contains("In[  1] int h1 = 41;"), "numbered row:\n{out}");
+    assert!(out.contains("In[  2] h1 + 1"), "numbered row:\n{out}");
+    // Magic commands are in the history but never consumed an input number.
+    assert!(out.contains("--    %src"), "magic row:\n{out}");
+}
+
+#[test]
+fn piped_stdin_shows_no_banner_or_prompt_noise() {
+    let out = run(&["1 + 1"]);
+    assert!(
+        !out.contains("____"),
+        "ASCII banner leaked into pipe:\n{out}"
+    );
+    assert!(!out.contains("bye"), "interactive farewell leaked:\n{out}");
+    assert!(out.contains("Out[1]: 2"), "unexpected output:\n{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn timeout_kills_forked_descendants_too() {
+    // The program forks; parent and child both hang forever, and the child
+    // keeps the stdout pipe open. Killing only the direct child would leave
+    // the REPL blocked on its reader thread — the whole process group must
+    // die. The final input proves the prompt survived.
+    let out = run_with_timeout(
+        2,
+        &[
+            "#include <unistd.h>",
+            "if (fork() == 0) { for (;;) pause(); } for (;;) pause();",
+            "1 + 1",
+        ],
+    );
+    assert!(out.contains("killed after 2s"), "no timeout report:\n{out}");
+    assert!(out.contains("Out[3]: 2"), "REPL did not survive:\n{out}");
 }
 
 #[test]
