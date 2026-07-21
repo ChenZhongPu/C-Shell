@@ -242,6 +242,59 @@ fn piped_stdin_accumulates_multi_line_definitions() {
 }
 
 #[test]
+fn type_magic_reports_expression_types_without_evaluating_them() {
+    let out = run(&[
+        "int n = 0;",
+        "const char *message = \"hello\";",
+        "%type n",
+        "%type message",
+        "%type n + 0.5",
+        "%type n++",
+        "n",
+    ]);
+    let lines: Vec<_> = out.lines().collect();
+    assert!(lines.contains(&"int"), "integer type missing:\n{out}");
+    assert!(
+        lines.contains(&"const char *"),
+        "qualified pointer type missing:\n{out}"
+    );
+    assert!(lines.contains(&"double"), "expression type missing:\n{out}");
+    assert!(
+        out.contains("Out[3]: 0"),
+        "%type evaluated its controlling expression or consumed an input number:\n{out}"
+    );
+}
+
+#[test]
+fn type_magic_recognizes_named_and_typedef_aggregates() {
+    let out = run(&[
+        "struct Pair { int x, y; };",
+        "union Number { int i; double d; };",
+        "typedef struct { int code; } Result;",
+        "typedef union Number Numeric;",
+        "struct Pair pair = { 1, 2 };",
+        "Numeric number = { 3 };",
+        "Result result = { 0 };",
+        "%type pair",
+        "%type number",
+        "%type result",
+    ]);
+    let lines: Vec<_> = out.lines().collect();
+    assert!(
+        lines.contains(&"Struct Pair"),
+        "named struct type missing:\n{out}"
+    );
+    assert!(
+        lines.contains(&"Union Number"),
+        "named union type missing:\n{out}"
+    );
+    assert!(
+        lines.contains(&"Struct Result"),
+        "anonymous typedef name missing:\n{out}"
+    );
+}
+
+#[test]
 fn clear_erases_screen_without_resetting_session() {
     let out = run(&["int kept = 42;", "%clear", "kept"]);
     assert!(

@@ -19,7 +19,8 @@ use crate::lex;
 
 /// The magic commands, for completion.
 const MAGICS: &[&str] = &[
-    "%help", "%quit", "%exit", "%clear", "%reset", "%history", "%src", "%undo", "%cc", "%std",
+    "%help", "%quit", "%exit", "%clear", "%reset", "%history", "%src", "%type", "%undo", "%cc",
+    "%std",
 ];
 
 /// C keywords, common types and stdlib staples worth offering at a C prompt.
@@ -451,6 +452,7 @@ mod tests {
         assert_eq!(start, 0);
         assert_eq!(c, vec!["%help", "%history"]);
         assert_eq!(completion_candidates("%cl", 3, &[]).1, vec!["%clear"]);
+        assert_eq!(completion_candidates("%ty", 3, &[]).1, vec!["%type"]);
         // Mid-line `%` is the modulo operator.
         let (_, c) = completion_candidates("a %h", 4, &[]);
         assert!(c.is_empty());

@@ -121,7 +121,7 @@ often exactly the thing you came to check.
 
 ```
 %help      %quit      %clear     %reset     %history
-%src       %undo      %cc        %std
+%src       %type      %undo      %cc        %std
 ```
 
 `%clear` erases the terminal display and returns the cursor to the top without
@@ -131,6 +131,42 @@ changing variables, retained C code or the input counter.
 formatted with `clang-format` when available; formatting is presentation
 only, has a three-second deadline, and evaluation still compiles the
 unformatted generated source.
+
+`%type <expression>` reports the expression type without evaluating that
+expression, committing code or consuming an `In[n]` number:
+
+```text
+In [1]: const char *message = "hello";
+In [2]: %type message
+const char *
+In [2]: %type 1 + 0.5
+double
+```
+
+Aggregate categories retain an available name:
+
+```text
+In [2]: struct Point { int x, y; } point;
+(added at file scope)
+In [3]: %type point
+Struct Point
+In [3]: typedef union { int i; double d; } Value;
+(added at file scope)
+In [4]: Value value = { 1 };
+In [5]: %type value
+Union Value
+```
+
+The implementation uses C11 `_Generic`, not compiler-specific `typeof`. It
+names scalar types and pointers to scalar types. Generic matching sees
+compatible expression types rather than source spelling: scalar typedefs and
+aliases of named tags are canonicalized, top-level qualifiers are removed by
+lvalue conversion, and arrays/functions decay to pointers. Complete named
+aggregate definitions visible in the session, plus simple `typedef struct {
+... } Name` and `typedef union { ... } Name` forms, are added to each query
+dynamically. A typedef of a named tag uses the tag's canonical name; an
+anonymous aggregate typedef uses its typedef name. Truly anonymous aggregates
+and other types outside the table report `<unrecognized type>`.
 
 Tab completes `%` commands, C keywords, stdlib staples and retained session
 identifiers of at least two characters. The line editor's Up/Down history

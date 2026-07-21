@@ -4,7 +4,7 @@ Settled architecture decisions, the one big open problem, and the traps buried
 in the code that you must know about before changing it. README is for users;
 this file is for whoever develops the tool next.
 
-Status: v0.1.2 working. ~4000 lines of Rust, 69 tests (45 unit + 24
+Status: v0.1.2 working. ~4200 lines of Rust, 73 tests (47 unit + 26
 end-to-end smoke), clippy/fmt clean, English UI. Verified on Linux with gcc
 16.1.1 and clang 22.1.6. CI exercises the default macOS compiler and two
 Windows driver dialects (a GNU-style driver and MSVC); see
@@ -25,7 +25,7 @@ Windows driver dialects (a GNU-style driver and MSVC); see
 | `tests/smoke.rs` | end-to-end tests driving the real binary and compiler |
 | `proc.rs` | child deadlines, output capture and timeout-path process-tree cleanup |
 | `magic.rs` | `%` commands and optional `clang-format` presentation |
-| `codegen.rs` | program assembly, `_Generic` value-printing runtime |
+| `codegen.rs` | program assembly, `_Generic` value-printing and type-name runtime |
 | `session.rs` | session state, numbered history and completion vocabulary |
 | `ui.rs` | terminal styling, startup banner |
 
@@ -36,8 +36,9 @@ pass-through, diagnostic remapping, completion-marker validation, live
 terminal output with bounded capture, crash reporting and timeout handling,
 missing-semicolon repair, blank-line confirmation for a completed interactive
 `if`, `if`/`else` batch lookahead, control/do-while/preprocessor continuation,
-tab completion (magics, C keywords, session names), persistent input history, `-e`/script/piped-input batch modes,
-`%help %quit %clear %reset %history %src %undo %cc %std`, deadlines and
+tab completion (magics, C keywords, session names), persistent input history,
+`-e`/script/piped-input batch modes,
+`%help %quit %clear %reset %history %src %type %undo %cc %std`, deadlines and
 timeout-path tree cleanup for compiler/probe/user-program children, cached
 compiler capability probes, CI for 4 platform configs, and a tag-triggered release
 workflow.
@@ -87,6 +88,23 @@ and marks the selected mode as automatic. The final gate compiles a
 representative subset of the value-printer runtime (`inline`, `_Bool` and
 `_Generic`) under the selected mode rather than inferring support from a
 version string. An unsupported explicit standard is rejected.
+
+**`%type` is a portable `_Generic` query, not reflection.** C has no portable
+way to stringify an arbitrary type. The generated runtime therefore maps
+scalar types and pointers to scalar types to canonical names; the controlling
+expression is not evaluated. Compatible-type matching cannot recover typedef
+spelling, and normal lvalue/array/function conversions remove top-level
+qualifiers and decay arrays/functions to pointers. `_Generic` has no "any
+aggregate" wildcard, so `codegen.rs` lexically collects complete named
+`struct`/`union` definitions and simple anonymous aggregate typedefs from the
+session and adds those exact type spellings to each query. Labels retain the
+available canonical name (`Struct Point`, `Union Value`); anonymous aggregate
+typedefs use their typedef name, while aliases of named tags resolve to the
+tag name because compatible typedef and tag types cannot both appear in one
+`_Generic` association list. Truly anonymous aggregates and types outside the
+finite table deliberately return `<unrecognized type>` rather than relying on
+GCC `typeof`, compiler diagnostic wording or debug-info formats unavailable on
+other toolchains.
 
 **Diagnostics must be remapped.** The compiler sees a generated file with a
 prelude and all earlier inputs above the new text; its line numbers are
@@ -223,9 +241,11 @@ References: [crepl](https://l-m.dev/cs/crepl/)
 
 ## 4. Known gaps
 
-- **No introspection commands**: `%layout` (struct offsets/padding),
-  `%expand` (preprocessor-only view of a macro), `%asm`, `%type`,
-  multi-compiler comparison. These, not the REPL loop, are what would set the
+- **Limited introspection commands**: `%type` covers scalar expressions and
+  session-visible named aggregate categories, but `%layout` (struct
+  offsets/padding), `%expand` (preprocessor-only view of a macro), `%asm`,
+  exact anonymous-aggregate/type-alias reflection and multi-compiler
+  comparison remain open. These, not the REPL loop, are what would set the
   tool apart. A GCC/Clang disagreement can reveal implementation-defined or
   unspecified behavior, undefined behavior, differing extensions/ABIs, or a
   compiler bug; the comparison should report the environment rather than

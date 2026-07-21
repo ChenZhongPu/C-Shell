@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::codegen::{self, Slot};
-use crate::eval::Evaluator;
+use crate::eval::{Eval, Evaluator};
 use crate::proc;
 use crate::session::Session;
 use crate::ui::Ui;
@@ -55,6 +55,7 @@ Commands:
   %reset             clear the session and start fresh
   %history           show everything entered this session
   %src               show the full C program the session assembles
+  %type <expression> query an expression's type without evaluating it
   %undo              drop the most recently accepted input
   %cc [path]         show or switch the C compiler
   %std [std]         show or switch the language standard (c11/c17/c23);
@@ -65,6 +66,11 @@ Notes:
   A completed if waits for a blank continuation line; type else / else if
   there instead to continue it. Other closed blocks submit immediately.
   Function definitions, #include and typedef go to file scope automatically.
+  %type uses _Generic matching: scalar types and scalar pointers are named;
+  complete named structs/unions report e.g. Struct Point or Union Value;
+  simple anonymous typedefs use the typedef name. Other aliases and top-level
+  qualifiers are canonicalized, and arrays/functions undergo their normal
+  expression conversions.
   Pure bare expressions (x + 1, sizeof(int)) are evaluated and forgotten.
   Statements and bare expressions that may have effects are kept.
   Every evaluation re-runs the whole session, so input-reading statements
@@ -75,6 +81,9 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
     let mut parts = body.split_whitespace();
     let cmd = parts.next().unwrap_or("");
     let rest: Vec<&str> = parts.collect();
+    // Unlike compiler paths/standards, a type query may itself contain spaces;
+    // preserve its spelling rather than rebuilding it from split words.
+    let tail = body.get(cmd.len()..).unwrap_or("").trim();
 
     match cmd {
         "help" | "h" | "?" => println!("{HELP}"),
@@ -111,6 +120,40 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
         "src" => {
             let prog = codegen::build(session, "", Slot::Stmt);
             println!("{}", format_c(&prog.src));
+        }
+
+        "type" => {
+            if tail.is_empty() {
+                println!("{}", ui.err("usage: %type <expression>"));
+            } else {
+                match ev.type_of(session, tail)? {
+                    Eval::CompileError(diag) => println!("{}", ui.err(diag.trim_end())),
+                    Eval::Done(o) => {
+                        if o.streamed_output_needs_newline {
+                            println!();
+                        }
+                        if !o.warnings.trim().is_empty() {
+                            println!("{}", ui.warn(o.warnings.trim_end()));
+                        }
+                        if !o.output.is_empty() {
+                            print!("{}", o.output);
+                            if !o.output.ends_with('\n') {
+                                println!();
+                            }
+                        }
+                        if !o.errors.is_empty() {
+                            print!("{}", ui.err(&o.errors));
+                        }
+                        if let Some(msg) = o.abnormal {
+                            println!("{}", ui.err(&msg));
+                        } else if let Some(name) = o.value {
+                            println!("{name}");
+                        } else {
+                            println!("{}", ui.err("type query produced no result"));
+                        }
+                    }
+                }
+            }
         }
 
         "undo" => match session.undo() {

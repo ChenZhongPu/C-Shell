@@ -126,6 +126,25 @@ impl Evaluator {
         }
     }
 
+    /// Query an expression's type through the generated `_Generic` table.
+    /// The controlling expression is not evaluated, and the result is never
+    /// committed to the replay journal.
+    pub fn type_of(&self, session: &Session, input: &str) -> Result<Eval> {
+        let prog = codegen::build_type_probe(session, input);
+        let src = self.src_path().display().to_string();
+        let (start, count) = (prog.new_start_line, prog.new_line_count);
+        match self.compile_text(&prog.src) {
+            Ok((exe, warns)) => {
+                let warnings =
+                    errmap::only_new(&errmap::remap(&warns, &src, start, count, prog.wrapped));
+                Ok(Eval::Done(self.run(&exe, Slot::Expr, warnings)?))
+            }
+            Err(diag) => Ok(Eval::CompileError(errmap::drop_stale_warnings(
+                &errmap::remap(&diag, &src, start, count, prog.wrapped),
+            ))),
+        }
+    }
+
     pub fn eval(&self, session: &Session, input: &str) -> Result<Eval> {
         let diag = match self.attempt(session, input)? {
             Ok(o) => return Ok(Eval::Done(o)),
@@ -325,7 +344,11 @@ fn split_new(s: &str, has_value: bool) -> SplitOutput {
     if has_value && let Some(i) = body.rfind(M_VAL) {
         return SplitOutput {
             output: body[..i].to_string(),
-            value: Some(body[i + M_VAL.len()..].trim_end_matches('\n').to_string()),
+            value: Some(
+                body[i + M_VAL.len()..]
+                    .trim_end_matches(['\r', '\n'])
+                    .to_string(),
+            ),
             done,
         };
     }
