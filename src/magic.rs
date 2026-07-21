@@ -5,11 +5,13 @@
 
 use anyhow::Result;
 use std::io::Write as _;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use crate::codegen::{self, Slot};
 use crate::eval::Evaluator;
+use crate::proc;
 use crate::session::Session;
 use crate::ui::Ui;
 
@@ -32,23 +34,14 @@ fn format_c(src: &str) -> String {
         return src.to_string();
     };
     let run = || -> std::io::Result<String> {
-        let mut child = Command::new(path)
-            // Match the generated code's own 4-space style.
-            .arg("-style={BasedOnStyle: LLVM, IndentWidth: 4}")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
-        child
-            .stdin
-            .take()
-            .expect("stdin piped")
-            .write_all(src.as_bytes())?;
-        let out = child.wait_with_output()?;
-        if out.status.success() {
+        let mut cmd = Command::new(path);
+        // Match the generated code's own 4-space style.
+        cmd.arg("-style={BasedOnStyle: LLVM, IndentWidth: 4}");
+        let out = proc::run_with_input(&mut cmd, Duration::from_secs(3), src.as_bytes())?;
+        if out.status.is_some_and(|st| st.success()) && !out.stdout_truncated {
             Ok(String::from_utf8_lossy(&out.stdout).into_owned())
         } else {
-            Err(std::io::Error::other("clang-format failed"))
+            Err(std::io::Error::other("clang-format failed or timed out"))
         }
     };
     run().unwrap_or_else(|_| src.to_string())
@@ -58,6 +51,7 @@ const HELP: &str = "\
 Commands:
   %help              show this help
   %quit / %exit      quit (Ctrl-D works too)
+  %clear             clear the screen without changing the session
   %reset             clear the session and start fresh
   %history           show everything entered this session
   %src               show the full C program the session assembles
@@ -68,9 +62,11 @@ Commands:
 
 Notes:
   A bare expression prints its value; a trailing ';' runs it silently.
+  A completed if waits for a blank continuation line; type else / else if
+  there instead to continue it. Other closed blocks submit immediately.
   Function definitions, #include and typedef go to file scope automatically.
-  Pure expressions (x + 1, sizeof(int)) are evaluated and forgotten; only
-  inputs that may change state (assignment, ++/--, calls) are kept.
+  Pure bare expressions (x + 1, sizeof(int)) are evaluated and forgotten.
+  Statements and bare expressions that may have effects are kept.
   Every evaluation re-runs the whole session, so input-reading statements
   like scanf will execute again.";
 
@@ -83,6 +79,13 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
     match cmd {
         "help" | "h" | "?" => println!("{HELP}"),
         "quit" | "exit" | "q" => return Ok(Action::Quit),
+
+        "clear" => {
+            // ANSI erase-display + cursor-home. This is terminal control, not
+            // color styling, so --no-color deliberately does not disable it.
+            print!("\x1b[2J\x1b[H");
+            let _ = std::io::stdout().flush();
+        }
 
         "reset" => {
             session.reset();

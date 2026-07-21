@@ -59,7 +59,7 @@ struct Args {
     #[arg(short = 'q', long)]
     quiet: bool,
 
-    /// Seconds a program may run before it is killed
+    /// Seconds each compilation or program run may take
     #[arg(long, value_name = "SECS", default_value_t = 10)]
     timeout: u64,
 
@@ -90,6 +90,9 @@ fn main() -> Result<()> {
 
     let tc = toolchain::Toolchain::detect(args.cc.as_deref(), args.std.as_deref())?;
     let mut ev = Evaluator::new(tc, Duration::from_secs(args.timeout))?;
+    // At a real terminal, forward only the newest input's output as it arrives
+    // so prompts before scanf are visible. Batch transcripts remain buffered.
+    ev.set_stream_output(std::io::stdin().is_terminal());
     let mut session = Session::default();
 
     // ---- non-interactive modes -------------------------------------------
@@ -226,6 +229,21 @@ fn run_batch<R: BufRead>(
     let mut pending = String::new();
     for line in reader.lines() {
         let line = line?;
+
+        // A balanced `if` needs one physical line of lookahead: `else` and
+        // intervening comment-only lines still belong to it. Any other line
+        // confirms the if and starts a fresh REPL input.
+        if !pending.is_empty() && editor::can_accept_else(&pending) {
+            let comment = !line.trim().is_empty() && lex::is_blank(&line);
+            if !editor::starts_with_else(&line) && !comment {
+                let (ok, quit) = submit_batch_pending(&mut pending, session, ev, ui)?;
+                all_ok &= ok;
+                if quit {
+                    return Ok(all_ok);
+                }
+            }
+        }
+
         if pending.is_empty() && line.trim().is_empty() {
             continue;
         }
@@ -233,23 +251,32 @@ fn run_batch<R: BufRead>(
             pending.push('\n');
         }
         pending.push_str(&line);
-        if editor::is_incomplete(&pending) {
+        if editor::is_structurally_incomplete(&pending) || editor::can_accept_else(&pending) {
             continue;
         }
-        let input = std::mem::take(&mut pending);
-        let (ok, quit) = submit(input.trim(), session, ev, ui, Style::Repl)?;
+        let (ok, quit) = submit_batch_pending(&mut pending, session, ev, ui)?;
         all_ok &= ok;
         if quit {
             return Ok(all_ok);
         }
     }
-    // An unterminated tail still gets evaluated: the compile error it earns
-    // is the honest report of a truncated script.
+    // An unterminated or lookahead-delayed tail still gets evaluated: a
+    // truncated construct earns the compiler's honest diagnostic.
     if !pending.trim().is_empty() {
-        let (ok, _) = submit(pending.trim(), session, ev, ui, Style::Repl)?;
+        let (ok, _) = submit_batch_pending(&mut pending, session, ev, ui)?;
         all_ok &= ok;
     }
     Ok(all_ok)
+}
+
+fn submit_batch_pending(
+    pending: &mut String,
+    session: &mut Session,
+    ev: &mut Evaluator,
+    ui: &Ui,
+) -> Result<(bool, bool)> {
+    let input = std::mem::take(pending);
+    submit(input.trim(), session, ev, ui, Style::Repl)
 }
 
 /// Run one complete input: magic command or C code. Returns (succeeded,
@@ -295,6 +322,11 @@ fn submit(
             Ok((false, false))
         }
         Eval::Done(o) => {
+            // Live output has already been forwarded by Evaluator. Keep the
+            // following warning, Out label or next prompt off its last line.
+            if o.streamed_output_needs_newline {
+                println!();
+            }
             let note = |s: &str| {
                 if !bare {
                     println!("{}", ui.dim(s));
@@ -302,6 +334,14 @@ fn submit(
             };
             if o.rewritten.is_some() {
                 note("(missing semicolon added automatically)");
+            }
+            if o.unprintable {
+                let msg = "valid expression, but this value category has no printer; evaluated without Out[n]";
+                if bare {
+                    eprintln!("{msg}");
+                } else {
+                    note(msg);
+                }
             }
             if !o.warnings.trim().is_empty() {
                 let msg = ui.warn(o.warnings.trim_end());

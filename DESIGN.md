@@ -4,83 +4,105 @@ Settled architecture decisions, the one big open problem, and the traps buried
 in the code that you must know about before changing it. README is for users;
 this file is for whoever develops the tool next.
 
-Status: v0.1 working. ~2000 lines of Rust, 26 tests (19 unit + 7 end-to-end
-smoke), clippy/fmt clean, English UI. Verified on Linux with gcc 16.1.1 and
-clang 22.1.6; macOS and Windows (MinGW and MSVC) are covered by CI
-(`.github/workflows/ci.yml`) once the repo is on GitHub, but have not been
-exercised on real hardware.
+Status: v0.1.2 working. ~4000 lines of Rust, 68 tests (44 unit + 24
+end-to-end smoke), clippy/fmt clean, English UI. Verified on Linux with gcc
+16.1.1 and clang 22.1.6. CI exercises the default macOS compiler and two
+Windows driver dialects (a GNU-style driver and MSVC); see
+`.github/workflows/ci.yml` for the exact matrix.
 
 ---
 
 ## 1. Current state
 
-| Module | Lines | Responsibility |
-|---|---:|---|
-| `toolchain.rs` | 435 | compiler detection, capability probing, GNU/Clang/MSVC flag dialects, default-std detection, C11 floor |
-| `eval.rs` | 382 | trial-compile classification, compile, run with timeout, crash diagnosis |
-| `lex.rs` | 257 | byte-level scan: bracket balance, literal/comment tracking, purity heuristic, function-signature detection |
-| `errmap.rs` | 209 | diagnostic line remapping, stale-warning filtering |
-| `main.rs` | 146 | CLI and REPL loop |
-| `codegen.rs` | 145 | program assembly, `_Generic` value-printing runtime |
-| `magic.rs` | 133 | `%` commands |
-| `editor.rs` | 96 | syntect highlighting, multi-line input detection |
-| `tests/smoke.rs` | 86 | end-to-end tests driving the real binary and compiler |
-| `session.rs` | 69 | session state |
-| `ui.rs` | 54 | terminal styling, startup banner |
+| Module | Responsibility |
+|---|---|
+| `toolchain.rs` | compiler detection, cached capability probing, GNU/Clang/MSVC flag dialects, default-std detection, `_Generic` floor |
+| `eval.rs` | trial-compile classification, compile, run with timeout, crash diagnosis |
+| `editor.rs` | syntect highlighting, completion, multi-line input and indentation |
+| `main.rs` | CLI, REPL, `-e`, script and piped-input modes |
+| `lex.rs` | byte-level scan: bracket balance, literals/comments, purity and identifier heuristics |
+| `errmap.rs` | diagnostic line remapping, stale-warning filtering |
+| `tests/smoke.rs` | end-to-end tests driving the real binary and compiler |
+| `proc.rs` | child deadlines, output capture and timeout-path process-tree cleanup |
+| `magic.rs` | `%` commands and optional `clang-format` presentation |
+| `codegen.rs` | program assembly, `_Generic` value-printing runtime |
+| `session.rs` | session state, numbered history and completion vocabulary |
+| `ui.rs` | terminal styling, startup banner |
 
 Implemented: expression evaluation with value printing, statements, automatic
 file-scope hoisting for functions/`#include`/`typedef`, multi-line input,
 syntax highlighting, compiler detection and mid-session switching, warning
-pass-through, diagnostic remapping, crash and infinite-loop isolation,
-missing-semicolon repair, tab completion (magics, C keywords, session
-names), persistent input history, `%help %quit %reset %history %src %undo
-%cc %std`,
-process-tree isolation with deadlines on every child (compiler, probes, user
-programs), CI for 4 platform configs, tag-triggered release workflow.
+pass-through, diagnostic remapping, completion-marker validation, live
+terminal output with bounded capture, crash reporting and timeout handling,
+missing-semicolon repair, blank-line confirmation for a completed interactive
+`if`, `if`/`else` batch lookahead, control/do-while/preprocessor continuation,
+tab completion (magics, C keywords, session names), persistent input history, `-e`/script/piped-input batch modes,
+`%help %quit %clear %reset %history %src %undo %cc %std`, deadlines and
+timeout-path tree cleanup for compiler/probe/user-program children, cached
+compiler capability probes, CI for 4 platform configs, and a tag-triggered release
+workflow.
 
 ---
 
 ## 2. Settled decisions
 
 **Drive a real compiler; never interpret.** The tool exists to answer "what
-does *my* compiler do with this". Integer promotion, bit-field layout,
-evaluation order, UB — every answer worth trusting comes from the user's own
-toolchain. An interpreter would give confident answers about the wrong
-implementation.
+does *my* compiler do with this invocation". Integer promotions,
+implementation-defined layout, ABI choices and diagnostics must come from the
+user's own toolchain. Undefined or unspecified behavior remains undefined or
+unspecified: c-shell reports one observation, not a portable guarantee. An
+interpreter would still describe the interpreter rather than the selected C
+toolchain.
 
-**Classify by trial compilation, not by parsing C.** An input is wrapped as
-an expression, a statement, and a file-scope item; whichever compiles is what
-it was. The only judge that always agrees with the compiler is the compiler.
-Classics like `foo * bar;` (declaration or multiplication, depending on a
-typedef) disappear as a problem.
+**Use a lexical file-scope heuristic, then classify by trial compilation.**
+`eval::looks_file_scope` sends preprocessor directives, typedefs, tag
+definitions and function-shaped inputs to a file-scope attempt first. Other
+inputs never receive file scope as a fallback, because moving a declaration
+out of `main` can silently change shadowing and redeclaration semantics. The
+compiler validates the heuristic and arbitrates expression versus statement;
+classics like `foo * bar;` follow the compiler's current typedef context.
 
 **Accumulate and replay.** Every evaluation rebuilds and reruns the whole
-program. Session variables are ordinary locals in `main` — no symbol table,
-no separating declarations from initializers. The cost (side effects replay)
-is the subject of §3.
+program. Block-scope declarations are ordinary locals in `main`; inputs
+classified as file-scope items are emitted above it. There is no separate
+symbol table or declaration/initializer state store. The cost (side effects
+replay) is the subject of §3.
 
-**Keep only inputs that may change state.** A bare expression is a question;
-it is answered and forgotten. Assignments, `++`/`--` and function calls are
-kept. The heuristic (`lex::may_have_side_effects`) is deliberately
-conservative: anything it is unsure about is kept.
+**Forget only bare expressions judged pure.** A bare expression is normally a
+question and is forgotten after its value is printed. Bare assignments,
+`++`/`--` and calls are retained according to the deliberately conservative
+`lex::may_have_side_effects` heuristic. Every successfully evaluated
+statement/declaration and file-scope item is retained without purity analysis;
+notably, adding a trailing `;` turns an expression into a stored statement.
 
-**The language standard follows the compiler's default; C11 is the hard
-floor.** The original design forced `-std=c17` and was reversed: it bought no
-purity (gcc accepts GNU extensions under `-std=c17` anyway) and contradicted
-the tool's own thesis — a plain `gcc foo.c` gives you gnu23, and the tool must
-match it. The default mode is detected by compiling and running a probe that
-reports `__STDC_VERSION__` and `__STRICT_ANSI__` (that run doubles as the
-works-at-all self-test). When the default mode cannot compile `_Generic`
-(MSVC without `/std:` is C89), the std is auto-raised to c17/c11 and the
-banner says so; a compiler that cannot reach C11 in any mode is disqualified,
-and if no candidate qualifies, startup errors out — limping along with a
-compiler that can never print a value reads as "the tool is broken" with no
-hint why.
+**The language standard follows the compiler's default; `_Generic` is the
+capability floor.** The original design forced `-std=c17` and was reversed:
+it bought no purity (GCC accepts many GNU extensions without `-pedantic`) and
+contradicted the tool's thesis of matching a plain compiler invocation. The
+default mode is detected by compiling and running a probe that reports
+`__STDC_VERSION__` and `__STRICT_ANSI__`; that run doubles as the
+works-at-all self-test. When the default mode cannot compile `_Generic`
+(MSVC without `/std:` is the common case), detection tries c17 and then c11
+and marks the selected mode as automatic. The final gate compiles a
+representative subset of the value-printer runtime (`inline`, `_Bool` and
+`_Generic`) under the selected mode rather than inferring support from a
+version string. An unsupported explicit standard is rejected.
 
 **Diagnostics must be remapped.** The compiler sees a generated file with a
 prelude and all earlier inputs above the new text; its line numbers are
-meaningless at the prompt. Without remapping the tool is unusable for
-beginners — the error text is right but every location it cites is wrong.
+meaningless at the prompt. `errmap` rewrites locations attributable to the
+newest input and labels older/scaffolding locations as session context.
+Without that remapping, otherwise-correct diagnostics point at generated
+lines the user never typed.
+
+**Successful capability probes are cached, but never trusted indefinitely.**
+Cold detection needs several compiler invocations; repeating those on every
+launch adds latency without adding information. `toolchain.rs` caches a
+successful result for seven days. Its key includes the canonical compiler
+path and file metadata, requested standard, c-shell version, and environment
+variables that affect driver/header/library/SDK resolution. Any mismatch,
+expiry or malformed cache entry falls back to the real probes; cache I/O is
+best effort and can never prevent startup.
 
 ---
 
@@ -94,39 +116,44 @@ ledger rather than the current state. (`rand()` is fine: without `srand` it
 is deterministic in C.)
 
 Goal: closer to Python — the session holds *current state*, not input
-history, and any input executes exactly once.
+history, and during normal healthy-runner operation each input executes once.
+Crash recovery is necessarily weaker, as described below.
 
 ### Why it is hard — two findings
 
-**Every alternative to replay needs declaration parsing.** A resident-process
-design cannot dodge it: a variable declared in step 1 does not exist in step
-2's translation unit, so something must know its name and type. Snapshotting
-needs the same knowledge to dump variables. Conclusion: `tree-sitter-c` is on
-the critical path for anything beyond replay.
+**The chosen compiler-agnostic resident design needs declaration parsing.** A
+variable declared in step 1 does not automatically exist in step 2's
+translation unit, so the runner must recover its name and type (or depend on a
+compiler-specific incremental frontend that already did so). Snapshotting
+needs the same knowledge to dump variables. For the portable slot-runner
+proposed below, `tree-sitter-c` is therefore on the critical path.
 
-**C state cannot be fully serialized.** Scalars, arrays and structs can be
-dumped; `malloc`'d graphs and `FILE*` cannot (addresses are meaningless
-across processes; a `FILE*` has no serializable representation), and a
-snapshottable variable may have been computed through an unsnapshottable one,
-which forces either dependency analysis or full replay as a fallback. Python
+**Arbitrary C state cannot be serialized generically.** Plain scalars and
+resource-free arrays/structs can be dumped, but reconstructing `malloc`'d
+pointer graphs requires application-specific ownership/type knowledge, and a
+`FILE*` has no portable serialized representation. A serializable variable
+may also have been computed through an unserializable resource, which forces
+either dependency analysis or replay fallback. Python
 gets away with it because objects live in a process that never dies — the C
-equivalent of Python's model is a resident process, not a snapshot. Snapshot
-designs are strictly dominated and are ruled out.
+equivalent of Python's model is a resident process, not a snapshot. A
+snapshot-only design would therefore support only a restricted subset or
+need replay fallback; it is not the state model selected here.
 
 ### Survey of existing C REPLs (2026-07)
 
 | Project | Family | Takeaway |
 |---|---|---|
 | igcc | replay | gcc recompile, output prefix-trimming; same model as us |
-| crepl (l-m.dev) | replay | rule buckets + linear undo/redo; **picked tcc because "anything else is too slow"** — proving that making replay fast means giving up the real compiler |
+| crepl (l-m.dev) | replay | rule buckets + linear undo/redo; picked tcc because its author found the alternatives too slow, illustrating the compiler-fidelity/performance tradeoff |
 | c-repl (Evan Martin) | resident | one .so per line, dlopen'd into a child; state shared via the dynamic linker |
 | cling / clang-repl | resident (in-process) | incremental TU + ORC JIT, transactional rollback; welded to clang |
 | evcxr (Rust) | resident | variables in a `HashMap<String, Box<dyn Any>>`, **moved in and out by parameter passing, no linker involved**; crash loses variables |
 | picoc / Ch / CINT | interpreter | rejected (fidelity) |
 
-crepl marks the ceiling of the replay family: speed had to be bought by
-switching to tcc, i.e. by testing tcc. Our differentiator is "test your own
-compiler", so speed has to be bought with architecture instead.
+crepl illustrates the replay tradeoff: it chose tcc to keep repeated builds
+fast, which means its answers describe tcc. c-shell's differentiator is the
+user-selected compiler, so its long-term performance plan cannot require
+replacing that compiler.
 
 ### Chosen architecture: journaled resident runner
 
@@ -146,17 +173,24 @@ c-shell (Rust) ──pipe──> runner child (slot table + the user's heap/file
      └── journal (today's session.rs) = crash recovery + %undo + %save/%load
 ```
 
-- Each step library exports exactly one symbol (`cs_step` — trivial even on
-  MSVC) and imports nothing from the host: **zero cross-module linkage**,
-  which dissolves the Windows import-library problem that once made this the
-  expensive option.
-- `&x` is stable across inputs; `malloc`'d memory and `FILE*` survive
-  naturally (same runner process); `scanf` runs once; per-input compile cost
-  is constant instead of growing with the session.
-- **Replay is demoted, not deleted: it becomes the recovery layer.** When the
-  runner segfaults, the journal is replayed to rebuild state (stdin recording
-  makes `scanf` read the same bytes during recovery). evcxr loses variables
-  on crash; the journal does better.
+- Each step library exports exactly one c-shell entry symbol (`cs_step` —
+  trivial even on MSVC) and imports no symbols from the Rust runner. Normal C
+  runtime/system-library imports still exist. Avoiding runner imports removes
+  the Windows import-library problem that once made this option expensive.
+- `&x` is stable across inputs; heap allocations and `FILE*` can survive in
+  the runner process, and `scanf` runs once on the normal hot path. Per-input
+  compilation no longer includes the accumulated statement journal. On
+  Windows, every step DLL must use the same dynamic CRT (`/MD`); separate
+  static CRT instances would make allocation and `FILE*` ownership unsafe
+  across DLL boundaries. Compilation is still not strictly constant while
+  shared declarations and recompiled session function definitions continue
+  to grow.
+- **Replay is demoted, not deleted: it becomes a best-effort recovery layer.**
+  After a runner crash, the journal can reconstruct in-process state, and
+  recorded stdin can make prior reads repeatable. It cannot roll back or
+  safely reproduce arbitrary external effects such as file writes, network
+  operations, time or interactions with other processes; recovery must warn
+  about that limitation rather than promise exactly-once execution.
 - Redeclaration can become a Python-style rebind (`int x` then `double x` =
   new slot).
 - Cost: tree-sitter-c lands on the critical path; the hard 20% is
@@ -189,12 +223,14 @@ References: [crepl](https://l-m.dev/cs/crepl/)
 
 ## 4. Known gaps
 
-- **No introspection commands**: `:layout` (struct offsets/padding),
-  `:expand` (preprocessor-only view of a macro), `:asm`, `:type`,
+- **No introspection commands**: `%layout` (struct offsets/padding),
+  `%expand` (preprocessor-only view of a macro), `%asm`, `%type`,
   multi-compiler comparison. These, not the REPL loop, are what would set the
-  tool apart — comparison especially: when gcc and clang disagree on the same
-  snippet, that is UB or implementation-defined behavior made visible.
-- **MSVC status (first CI contact 2026-07):** detection, the C89 default →
+  tool apart. A GCC/Clang disagreement can reveal implementation-defined or
+  unspecified behavior, undefined behavior, differing extensions/ABIs, or a
+  compiler bug; the comparison should report the environment rather than
+  claim a single cause.
+- **MSVC status (first CI contact 2026-07):** detection, the legacy default →
   `/std:c17` auto-raise, and `_Generic` value printing all worked on the
   real cl 19.51. Two papercuts found and fixed: cl echoes the bare source
   filename to stdout (now dropped in `errmap::remap`), and C4552/C4553
@@ -206,6 +242,16 @@ References: [crepl](https://l-m.dev/cs/crepl/)
 - UI strings are English but scattered across `main.rs` / `magic.rs` /
   `eval.rs` / `toolchain.rs`; centralize before attempting i18n.
 - Highlight theme is hardcoded (`base16-ocean.dark`); poor on light terminals.
+- Arbitrary token-level line splitting is not inferred. Inputs such as
+  `value +` followed by the right operand, or a declaration split after its
+  type name, need an explicit trailing `\\`; recognizing every continuation
+  point without a C parser would also make intentionally incomplete snippets
+  impossible to submit.
+- The value printer handles the standard boolean/integer/real-floating types,
+  `char` strings and common object pointers. Struct/union, complex and `void`
+  expressions have no printer; a silent expression probe now keeps them from
+  being misclassified as statements and the UI explains the missing
+  `Out[n]`, but richer value formatting is still absent.
 - The purity heuristic keeps any expression containing a call, even calls to
   pure functions. (Hardened 2026-07 after a P0: calls disguised as `f/**/()`,
   `(f)()`, `(*fp)()` were misjudged pure and their side effects silently
@@ -220,14 +266,13 @@ References: [crepl](https://l-m.dev/cs/crepl/)
   program is still running is lost. Piped input is unaffected, which is why
   the smoke tests never see it. Fix would mean patching or replacing the
   raw-mode toggle; noted, not urgent.
-- **Windows tree-kill uses `taskkill /T`**, which walks the parent-child
-  tree and misses orphans whose parent already exited. Job Objects
-  (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) are the airtight upgrade if it
-  ever matters in practice.
-- Probe results are not cached. Startup now runs ~4 compiler invocations
-  (banner, version+self-test run, `_Generic` gate, plus `supports_std` when
-  needed); adding more probes without an on-disk cache will make cold start
-  noticeable.
+- **Process-tree cleanup is timeout-path cleanup, not a sandbox.** On Unix a
+  process group is killed only when the direct child is still running at the
+  deadline. A detached child, or a child left behind by a parent that exits
+  successfully, can survive. Windows uses `taskkill /T`, which likewise
+  misses some orphans. Job Objects (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) are
+  the airtight Windows upgrade; Unix would also need an explicit policy for
+  descendants after normal parent exit.
 
 ---
 
@@ -255,7 +300,18 @@ redefinition error, but a file-scope fallback would silently make it a
 global shadowed by the earlier local. The heuristic alone decides file-scope
 membership; trial compilation only arbitrates expression vs statement.
 
-**The validator must recognize a signature awaiting its body**
+**Interactive completeness and batch completeness are different policies**
+(`editor.rs`). Structural checks cover open brackets/literals, function and
+control headers awaiting a body, mandatory `do ... while`, backslash
+continuations and conditional preprocessor groups. Only a completed leading
+interactive `if` adds blank-line confirmation so it can still receive `else`;
+functions and other closed blocks submit immediately. Batch mode instead holds
+a complete leading `if` for one physical line of
+lookahead and submits it before an unrelated next line. Reusing the
+interactive blank-line policy in scripts would accidentally merge the next C
+statement into the same input.
+
+**The validator must recognize a function signature awaiting its body**
 (`lex::awaits_body`). `int fact(int n)` has balanced brackets; without the
 check it is submitted immediately, then "repaired" with a semicolon into a
 forward declaration — functions in Allman style become impossible to type.
@@ -290,8 +346,9 @@ print but warnings vanish, only on MSVC, only for expressions. Wrapper-line
 anchors are clamped into the input; nothing but the wrapper lives on those
 lines, so the clamp cannot mislabel foreign diagnostics.
 
-**Every child goes through `proc::run_captured`** — compiler, probes, user
-programs. It owns three subtleties that must not be unbundled: (1) the child
+**Every compiler, capability probe, generated user program and optional
+`clang-format` process goes through the deadline-aware helpers in `proc`.**
+The module owns three subtleties that must not be unbundled: (1) the child
 gets its own Unix process group, and on timeout the *group* is killed —
 killing only the child leaves forked descendants running and, worse, holding
 the output pipe so the reader threads block forever; (2) when stdin is a
@@ -300,11 +357,27 @@ real terminal the child's group must be handed the foreground
 race) or any tty read gets the program stopped by SIGTTIN, and SIGTTOU must
 be ignored before the parent can take the terminal back; (3) readers drain
 into shared buffers and are *abandoned* after a grace period, never joined
-unconditionally — a `setsid` escapee can hold the pipe open forever, and
-that must cost one thread, not the REPL. The group is only killed on the
-timeout path, while the pid is still a zombie: after reaping, the pid can be
-recycled and `killpg` could hit an innocent process.
+unconditionally — a `setsid` escapee can hold both pipes open forever, and
+that must cost at most two reader threads, not the REPL. The group is only killed on the
+timeout path while the group leader is still represented by the unreaped
+`Child`, so its PID cannot yet be recycled; killing after reaping could target
+an unrelated process group.
 
-**A crashing or timed-out input must never be committed** (`main.rs`).
-Every later evaluation replays the session; committing one crash makes the
-prompt permanently unusable.
+**Live output filtering must work across arbitrary pipe chunks** (`eval.rs`,
+`LiveFilter`). Replay output before `M_NEW`, value bytes after `M_VAL`, and
+protocol markers are suppressed; only the newest input's own stdout/stderr is
+forwarded. Retain only a trailing byte sequence that is an actual marker
+prefix. Retaining `marker.len() - 1` bytes unconditionally delays short prompts
+such as `"name: "` and defeats the purpose of streaming before `scanf`.
+Because streamed bytes are no longer present in `Outcome::output`, the filter
+also records whether the last visible byte was `\n`; the renderer must insert
+one before warnings, `Out[n]` or the next rustyline prompt. Otherwise a prompt
+can repaint a no-newline `printf` out of view, or the value appears as
+`textOut[n]`. Capture remains bounded at `proc::MAX_CAPTURE_BYTES`, but readers must keep
+draining and discard excess bytes or the child will deadlock on a full pipe.
+
+**An input must reach `M_DONE` before it is committed** (`codegen.rs`,
+`eval.rs`, `main.rs`). Exit status zero is insufficient: `exit(0)`, `_Exit`
+or a top-level `return` can terminate before the generated epilogue, and
+committing that input would silently prevent every later input from running.
+Crashes, timeouts and capture overflow likewise remain uncommitted.

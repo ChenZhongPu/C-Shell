@@ -1,9 +1,10 @@
 //! Finding a C compiler and speaking its flag dialect.
 
 use anyhow::{Context, Result, bail};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::proc;
 
@@ -11,6 +12,10 @@ use crate::proc;
 /// answer `--version` or build ten lines is effectively hung, and a hung
 /// probe would otherwise freeze startup before the prompt even appears.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Successful capability probes remain valid until the compiler, relevant
+/// environment, requested standard, c-shell version, or this TTL changes.
+const CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const CACHE_SCHEMA: &str = "toolchain-v2";
 
 /// `.output()` with a deadline; `None` covers spawn failure and timeout
 /// alike — for a probe those are the same answer.
@@ -67,10 +72,16 @@ int main(void) {
 }
 "#;
 
-/// The one hard requirement on the language mode: without `_Generic` the
-/// value printer cannot compile and expressions stop printing entirely.
-const GENERIC_PROBE: &str =
-    "int main(void){int v = _Generic(1, int: 1, default: 0); return v - 1;}";
+/// Exercise the C features used by the value-printer runtime rather than
+/// `_Generic` alone: some compilers accept `_Generic` as an extension in a
+/// mode that still rejects `inline` or `_Bool`.
+const VALUE_PRINTER_PROBE: &str = r#"
+static inline int cs_probe(_Bool v) { return v ? 1 : 0; }
+int main(void) {
+    int (*p)(_Bool) = _Generic(1, int: cs_probe, default: cs_probe);
+    return p(1) - 1;
+}
+"#;
 
 /// Turn the VERSION_PROBE's output into a human label like "gnu23".
 fn parse_std_probe(out: &str, family: Family) -> Option<String> {
@@ -111,13 +122,151 @@ fn family_of(path: &Path, banner: &str) -> Family {
     if stem == "cl" || stem.ends_with("clang-cl") {
         return Family::Msvc;
     }
-    // Never trust the executable's name for gcc-vs-clang. On macOS both `cc`
-    // and `gcc` are usually Apple clang, and the banner is the only honest
-    // signal.
+    // Never trust the executable's name for gcc-vs-clang. Apple's Command
+    // Line Tools may expose /usr/bin/gcc as an Apple Clang driver, while a
+    // separately installed GNU GCC is genuine GCC; the banner distinguishes
+    // them without making assumptions from the filename.
     if banner.to_ascii_lowercase().contains("clang") {
         return Family::Clang;
     }
     Family::Gnu
+}
+
+fn cache_dir() -> Option<PathBuf> {
+    let base = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    } else {
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+    }?;
+    Some(base.join("c-shell"))
+}
+
+/// Fingerprint everything that can reasonably change a probe's answer.
+/// Compiler metadata catches upgrades in place; the selected environment
+/// variables cover driver lookup, headers, libraries and platform SDKs.
+fn cache_key(path: &Path, requested_std: Option<&str>) -> Option<u64> {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let meta = std::fs::metadata(&path).ok()?;
+    let modified = meta
+        .modified()
+        .ok()?
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    CACHE_SCHEMA.hash(&mut h);
+    env!("CARGO_PKG_VERSION").hash(&mut h);
+    path.hash(&mut h);
+    meta.len().hash(&mut h);
+    modified.as_nanos().hash(&mut h);
+    requested_std.hash(&mut h);
+    for name in [
+        "PATH",
+        "INCLUDE",
+        "LIB",
+        "LIBPATH",
+        "CPATH",
+        "C_INCLUDE_PATH",
+        "LIBRARY_PATH",
+        "SDKROOT",
+        "DEVELOPER_DIR",
+        "GCC_EXEC_PREFIX",
+        "COMPILER_PATH",
+    ] {
+        name.hash(&mut h);
+        std::env::var_os(name).hash(&mut h);
+    }
+    Some(h.finish())
+}
+
+fn hex_encode(s: &str) -> String {
+    s.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_decode(s: &str) -> Option<String> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect::<Option<Vec<_>>>()?;
+    String::from_utf8(bytes).ok()
+}
+
+fn load_cached(path: &Path, requested_std: Option<&str>) -> Option<Toolchain> {
+    let key = cache_key(path, requested_std)?;
+    let file = cache_dir()?.join(format!("{key:016x}.cache"));
+    let age = std::fs::metadata(&file)
+        .ok()?
+        .modified()
+        .ok()?
+        .elapsed()
+        .ok()?;
+    if age > CACHE_TTL {
+        return None;
+    }
+    let text = std::fs::read_to_string(file).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != CACHE_SCHEMA || lines.next()? != format!("{key:016x}") {
+        return None;
+    }
+    let family = match lines.next()? {
+        "gnu" => Family::Gnu,
+        "clang" => Family::Clang,
+        "msvc" => Family::Msvc,
+        _ => return None,
+    };
+    let version = hex_decode(lines.next()?)?;
+    let std = hex_decode(lines.next()?)?;
+    let default_std = match lines.next()? {
+        "-" => None,
+        encoded => Some(hex_decode(encoded)?),
+    };
+    let auto_std = match lines.next()? {
+        "0" => false,
+        "1" => true,
+        _ => return None,
+    };
+    Some(Toolchain {
+        path: path.to_path_buf(),
+        family,
+        version,
+        std,
+        default_std,
+        auto_std,
+    })
+}
+
+fn store_cached(tc: &Toolchain, requested_std: Option<&str>) {
+    let Some(key) = cache_key(&tc.path, requested_std) else {
+        return;
+    };
+    let Some(dir) = cache_dir() else { return };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let family = match tc.family {
+        Family::Gnu => "gnu",
+        Family::Clang => "clang",
+        Family::Msvc => "msvc",
+    };
+    let default_std = tc
+        .default_std
+        .as_deref()
+        .map(hex_encode)
+        .unwrap_or_else(|| "-".to_string());
+    let text = format!(
+        "{CACHE_SCHEMA}\n{key:016x}\n{family}\n{}\n{}\n{default_std}\n{}\n",
+        hex_encode(&tc.version),
+        hex_encode(&tc.std),
+        u8::from(tc.auto_std)
+    );
+    // Cache corruption is harmless (the next launch probes again), so cache
+    // I/O remains best effort and never prevents the prompt from opening.
+    let _ = std::fs::write(dir.join(format!("{key:016x}.cache")), text);
 }
 
 fn banner_of(path: &Path) -> Result<String> {
@@ -172,6 +321,9 @@ impl Toolchain {
                     continue;
                 }
             };
+            if let Some(tc) = load_cached(&path, std) {
+                return Ok(tc);
+            }
             let banner = match banner_of(&path) {
                 Ok(b) => b,
                 Err(_) => {
@@ -202,13 +354,17 @@ impl Toolchain {
                 }
             }
             if let Some(s) = std {
-                // Explicitly requested. If unsupported, fall through with the
-                // compiler default; the banner makes the outcome visible.
                 if tc.supports_std(s) {
                     tc.std = s.to_string();
+                } else {
+                    tried.push(format!(
+                        "{} (does not support requested standard {s})",
+                        tc.path.display()
+                    ));
+                    continue;
                 }
             }
-            if tc.std.is_empty() && !tc.generic_ok() {
+            if tc.std.is_empty() && !tc.value_printer_ok() {
                 // The default mode cannot host the value printer. Force the
                 // oldest std that can, and own up to it via `auto_std`.
                 for cand in ["c17", "c11"] {
@@ -223,19 +379,20 @@ impl Toolchain {
             // expression ever prints a value, which reads as "the tool is
             // broken" with no hint why. A compiler that cannot reach it in
             // any mode is disqualified outright, not limped along with.
-            if !tc.generic_ok() {
+            if !tc.value_printer_ok() {
                 tried.push(format!(
-                    "{} (too old: no C11 _Generic in any mode)",
+                    "{} (selected mode cannot compile the value printer)",
                     tc.path.display()
                 ));
                 continue;
             }
+            store_cached(&tc, std);
             return Ok(tc);
         }
 
         bail!(
             "no usable C compiler found (tried: {}).\n\
-             c-shell requires C11: value printing depends on _Generic.\n\
+             c-shell requires a mode capable of its C11-style value printer.\n\
              Install gcc or clang, or point c-shell at one with --cc <path>.{}",
             tried.join(", "),
             if cfg!(windows) {
@@ -386,7 +543,7 @@ impl Toolchain {
     /// Can the value-printing runtime compile under the currently chosen
     /// mode? Probed with the actual flag that will be used, so a forced
     /// `--std` is judged as-is rather than assumed fine.
-    fn generic_ok(&self) -> bool {
+    fn value_printer_ok(&self) -> bool {
         let flag = if self.std.is_empty() {
             None
         } else if self.is_msvc() {
@@ -395,8 +552,8 @@ impl Toolchain {
             Some(format!("-std={}", self.std))
         };
         match &flag {
-            Some(f) => self.probe(&[f], GENERIC_PROBE),
-            None => self.probe(&[], GENERIC_PROBE),
+            Some(f) => self.probe(&[f], VALUE_PRINTER_PROBE),
+            None => self.probe(&[], VALUE_PRINTER_PROBE),
         }
     }
 
@@ -418,6 +575,22 @@ impl Toolchain {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_text_round_trips_utf8_and_empty_strings() {
+        for value in ["", "gcc (GCC) 16.1.1", "编译器"] {
+            assert_eq!(hex_decode(&hex_encode(value)).as_deref(), Some(value));
+        }
+        assert!(hex_decode("0").is_none());
+        assert!(hex_decode("zz").is_none());
+    }
+
+    #[test]
+    fn requested_standard_is_part_of_cache_identity() {
+        let exe = std::env::current_exe().expect("current test executable");
+        assert_ne!(cache_key(&exe, None), cache_key(&exe, Some("c17")));
+        assert_ne!(cache_key(&exe, Some("c17")), cache_key(&exe, Some("c23")));
+    }
 
     #[test]
     fn parses_modern_gcc_default() {
@@ -482,7 +655,7 @@ mod tests {
             family_of(Path::new("/mingw64/bin/gcc.exe"), "gcc (GCC) 14.2"),
             Family::Gnu
         );
-        // The macOS trap: a binary named gcc that is actually clang.
+        // Apple Command Line Tools may expose a gcc-named Clang driver.
         assert_eq!(
             family_of(Path::new("/usr/bin/gcc"), "Apple clang version 21.0.0"),
             Family::Clang

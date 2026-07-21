@@ -14,6 +14,8 @@ use crate::session::Session;
 pub const M_NEW: &str = "\x01\x02c-shell/new\x02\x01";
 /// Everything after this marker is the `Out[n]` value rather than program output.
 pub const M_VAL: &str = "\x01\x02c-shell/val\x02\x01";
+/// Reaching this marker proves that the newest input returned normally.
+pub const M_DONE: &str = "\x01\x02c-shell/done\x02\x01";
 
 const HEADERS: &str = "\
 #include <stdio.h>
@@ -95,6 +97,17 @@ pub struct Program {
 
 /// Build the program for evaluating `input` in `slot` against `session`.
 pub fn build(session: &Session, input: &str, slot: Slot) -> Program {
+    build_inner(session, input, slot, false)
+}
+
+/// Build a program that evaluates an expression without trying to print it.
+/// Used only after the normal value-printer trial failed, to distinguish an
+/// unsupported value category (struct/complex/void/etc.) from invalid C.
+pub fn build_expr_probe(session: &Session, input: &str) -> Program {
+    build_inner(session, input, Slot::Expr, true)
+}
+
+fn build_inner(session: &Session, input: &str, slot: Slot, silent_expr: bool) -> Program {
     let mut src = String::with_capacity(4096);
     let mut new_start_line = 1usize;
 
@@ -102,6 +115,7 @@ pub fn build(session: &Session, input: &str, slot: Slot) -> Program {
     // Ahead of the runtime, which expands them.
     src.push_str(&format!("#define CS_M_NEW \"{}\"\n", escape(M_NEW)));
     src.push_str(&format!("#define CS_M_VAL \"{}\"\n", escape(M_VAL)));
+    src.push_str(&format!("#define CS_M_DONE \"{}\"\n", escape(M_DONE)));
     src.push_str(RUNTIME);
 
     for item in &session.file_items {
@@ -133,17 +147,22 @@ pub fn build(session: &Session, input: &str, slot: Slot) -> Program {
             // The input sits on a line of its own so a diagnostic inside it
             // lands on text the user actually typed, at the column they see.
             new_start_line = src.lines().count() + 2;
-            src.push_str(&format!("    CS_PRINT((\n{input}\n    ));\n"));
+            if silent_expr {
+                src.push_str(&format!("    (void)(\n{input}\n    );\n"));
+            } else {
+                src.push_str(&format!("    CS_PRINT((\n{input}\n    ));\n"));
+            }
         }
     }
 
+    src.push_str("    CS_MARK(CS_M_DONE);\n");
     src.push_str("    return 0;\n}\n");
     let new_line_count = input.lines().count().max(1);
     Program {
         src,
         new_start_line,
         new_line_count,
-        wrapped: slot == Slot::Expr,
+        wrapped: slot == Slot::Expr && !silent_expr,
     }
 }
 

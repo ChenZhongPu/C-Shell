@@ -5,7 +5,7 @@ behaves, skip the new-file / write-`main` / compile / run loop — just type it
 at the prompt.
 
 ```
-c-shell 0.1.0  ·  cc (GCC) 16.1.1 (default std gnu23)
+c-shell 0.1.2  ·  cc (GCC) 16.1.1 (default std gnu23)
 In [1]: int x = 41;
 In [2]: x + 1
 Out[2]: 42
@@ -23,31 +23,46 @@ Out[5]: 1
 ## Not an interpreter
 
 c-shell assembles your input into a complete C program and hands it to the
-**real compiler on your machine**. That is deliberate: integer promotion,
-bit-field layout, evaluation order, undefined behavior — the things most worth
-testing interactively — only have trustworthy answers from the compiler you
-actually use. An interpreter's answer speaks only for the interpreter.
+**real compiler on your machine**. That is deliberate: integer promotions,
+implementation-defined details, ABI choices and compiler diagnostics are most
+useful when they come from the toolchain you actually use. An interpreter's
+answer speaks only for the interpreter.
+
+A result is still an observation of one compiler invocation, not a guarantee
+from the C standard. In particular, undefined or unspecified behavior may
+change with compiler version, flags, surrounding code or another execution.
 
 ## Installation
 
-Requires a Rust toolchain to build, and any C compiler (gcc / clang / MSVC)
-at runtime.
+Requires a Rust toolchain to build and, at runtime, a C compiler compatible
+with one of the supported GNU/Clang or MSVC command-line dialects. GCC, Clang,
+MSVC and tcc are the built-in detection candidates.
+
+Install the published crate from crates.io:
+
+```sh
+cargo install c-shell
+```
+
+Or install directly from a source checkout:
 
 ```sh
 cargo install --path .
 ```
 
-On startup the compiler is resolved in the order `--cc` flag → `$CC` → PATH
-(`cc`, `gcc`, `clang`, `tcc`; on Windows `gcc`, `clang`, `cc`, `clang-cl`,
-`cl`). The first candidate that passes every check wins. Capabilities are
-probed by trial compilation, never derived from version strings — version
-numbers lie (`gcc` on macOS is actually clang, and distros backport
-features).
+With `--cc`, only that compiler is tried. Otherwise startup checks `$CC`, then
+PATH (`cc`, `gcc`, `clang`, `tcc`; on Windows `gcc`, `clang`, `cc`,
+`clang-cl`, `cl`). `--cc` and `$CC` must name one executable or path, not a
+shell command containing flags. The first candidate that passes every check
+wins. Capabilities are probed by trial compilation, never derived from version
+strings — executable names can be aliases, and distros backport features. For
+example, Apple Command Line Tools may provide `/usr/bin/gcc` as an Apple Clang driver, while
+GNU GCC installed separately through Homebrew or MacPorts is genuine GCC.
 
 ```sh
 c-shell                              # auto-detect a compiler
-c-shell --cc clang --std c23         # pin compiler and standard
-c-shell --timeout 30                 # seconds before a runaway program is killed
+c-shell --cc clang --std c23         # request compiler and mode; verify the banner
+c-shell --timeout 30                 # deadline for each compilation and program run
 c-shell -e 'sizeof(long)'            # evaluate and exit: bare value on stdout,
                                      # diagnostics on stderr, exit code on failure
 c-shell --script demo.csh            # run inputs from a file, then exit
@@ -62,86 +77,143 @@ in batch mode — which also accumulates multi-line definitions, so scripts
 and pipes can contain full function bodies.
 
 The language standard defaults to **whatever your compiler defaults to**
-(gnu23 for gcc 16, gnu17 for clang 22; the banner shows what was detected) —
-the behavior you see here is the behavior a plain `gcc foo.c` would give you.
-Pin a standard with `--std c17`, or switch mid-session with `%std c17` /
-`%std default`. One exception: when the compiler's default mode is too old to
-compile `_Generic` (MSVC without `/std:` is C89), the standard is auto-raised
-to c17/c11 and the banner says so. **C11 is a hard floor**: a compiler that
-cannot reach it in any mode is skipped, and if no candidate qualifies,
-c-shell reports an error and exits.
+(gnu23 for gcc 16, gnu17 for clang 22; the banner shows what was detected).
+This matches the compiler's language mode, not its entire command line:
+c-shell also adds diagnostics, output and platform link flags plus generated
+REPL scaffolding.
+Select a supported mode with `--std c17`, or switch mid-session with `%std
+c17` / `%std default`. One exception: when the compiler's default mode cannot
+compile `_Generic` (MSVC without `/std:` is the common case), c-shell tries
+c17 and then c11, and the banner reports an automatic raise. `_Generic`
+support is the actual capability floor: a candidate that cannot compile a
+representative value-printer probe in the selected mode is skipped. An
+unsupported explicit `--std` is an error both at startup and in `%std`.
 
 ## Usage
 
-| Input | Behavior |
-|---|---|
-| `x + 1` | evaluated, value printed as `Out[n]` |
-| `x + 1;` | trailing `;` runs it silently (as in IPython) |
-| `int x = 41;` | declaration, visible to later inputs |
-| `int f(int a) { ... }` | function definition, hoisted to file scope |
-| `#include <time.h>` | likewise |
+| Input                  | Behavior                                      |
+| ---------------------- | --------------------------------------------- |
+| `x + 1`                | evaluated, value printed as `Out[n]`          |
+| `x + 1;`               | trailing `;` runs it silently (as in IPython) |
+| `int x = 41;`          | declaration, visible to later inputs          |
+| `int f(int a) { ... }` | function definition, hoisted to file scope    |
+| `#include <time.h>`    | likewise                                      |
 
-Common headers (stdio/stdlib/string/math/stdbool/stdint/limits/ctype) are
-pre-included and `-lm` is linked by default. `-Wall -Wextra` is on by
-default: the warning is often exactly the thing you came to check.
+A completed interactive `if` uses blank-line confirmation: press Enter on the
+empty continuation line to submit it, or type `else` / `else if` there to
+continue the same statement. Functions, loops, structs and initializers submit
+directly when their required closing syntax is entered. Control headers with
+their body on the next line, mandatory `do ... while`, and conditional
+preprocessor groups through `#endif` are accumulated automatically. In scripts
+and pipes, one-line lookahead attaches `else` without requiring a blank line.
+
+Common headers (`stdio`, `stdlib`, `string`, `math`, `stdbool`, `stdint`,
+`stddef`, `limits`, `ctype`) are pre-included. Unix builds link `-lm`; Windows
+math functions come from the C runtime. GNU-style GCC/Clang drivers use
+`-Wall -Wextra`; MSVC-style `cl`/`clang-cl` drivers use `/W3`. The warning is
+often exactly the thing you came to check.
+
+![demo](demo.gif)
 
 ### Commands
 
 `%`-prefixed, in the spirit of IPython:
 
 ```
-%help      %quit      %reset     %history
+%help      %quit      %clear     %reset     %history
 %src       %undo      %cc        %std
 ```
 
-`%src` prints the complete C program the session assembles — when you want to
-know exactly what the tool is doing on your behalf, look there.
+`%clear` erases the terminal display and returns the cursor to the top without
+changing variables, retained C code or the input counter.
 
-Tab completes `%` commands, C keywords, stdlib staples and every name your
-session has mentioned. Input history persists across sessions in
-`~/.local/share/c-shell/history` (`%APPDATA%\c-shell\history` on Windows).
+`%src` prints the complete C program assembled for the session. It is
+formatted with `clang-format` when available; formatting is presentation
+only, has a three-second deadline, and evaluation still compiles the
+unformatted generated source.
+
+Tab completes `%` commands, C keywords, stdlib staples and retained session
+identifiers of at least two characters. The line editor's Up/Down history
+persists across sessions under `$XDG_DATA_HOME/c-shell/history` (falling back to
+`~/.local/share/c-shell/history`) or `%APPDATA%\c-shell\history` on Windows.
+`%history` itself lists only inputs from the current process.
 
 ## How it works
 
 **Accumulate and replay.** Every evaluation reassembles and reruns the whole
-session. Session variables are therefore ordinary locals in `main` — no
-global symbol table, no splitting declarations from initializers.
+session. Block-scope declarations become ordinary locals in `main`; items
+recognized as file-scope code are emitted above it. There is no separate
+symbol table or declaration/initializer state store.
 
-**Classification by trial compilation.** Whether a line is an expression, a
-statement or a file-scope item is not decided by parsing C; it is wrapped
-each way and compiled, and whichever form the compiler accepts is the answer.
-The only judge that always agrees with the compiler is the compiler.
+**Classification uses a small heuristic plus trial compilation.** A lexical
+heuristic routes function definitions, preprocessor directives, typedefs and
+tag definitions toward file scope; this avoids GCC accepting a function as a
+nested extension. The compiler then validates that choice and arbitrates the
+ambiguous expression-versus-statement cases. File scope is deliberately not a
+general fallback because it could change shadowing and redeclaration
+semantics.
 
-**Value printing.** `_Generic` selects a print *function*, which is then
+**Value printing.** `_Generic` selects a print _function_, which is then
 called — selecting a call expression instead would type-check every
 unselected branch against the wrong argument type and fail to compile.
 
-**Only state-changing inputs are kept.** An expression at the prompt is
-usually a question (`x + 1`, `sizeof(int)`); questions are answered and
-forgotten, or the session would grow slower with every one. Only inputs that
-may change state — assignment, `++`/`--`, function calls — are replayed.
-`%src` shows what was actually kept.
+**Bare expressions judged pure are forgotten.** A bare expression at the
+prompt is usually a question (`x + 1`, `sizeof(int)`), so it is answered and
+forgotten. Bare expressions that may have effects — assignments, `++`/`--`
+or calls — are retained. Successfully evaluated statements/declarations
+(including an expression with a trailing `;`) and file-scope items are
+retained without purity analysis. `%src` shows
+what will actually be replayed.
 
 **Diagnostics are remapped.** The compiler sees a generated file with a
 prelude and all earlier statements above your input, so its line numbers are
-meaningless at the prompt. Every location — including the line-number gutter
-of gcc's source excerpts — is rewritten to input-relative lines. Locations
-pointing into generated scaffolding are never presented as your code.
+meaningless at the prompt. Locations attributable to the newest input —
+including GCC source-excerpt gutters — are rewritten to input-relative lines.
+Locations in generated scaffolding or older session code are not presented as
+the newest input.
+
+**Compiler capabilities are cached.** Successful startup probes are cached
+for seven days under the platform cache directory
+(`$XDG_CACHE_HOME/c-shell`, falling back to `~/.cache/c-shell`, on Unix;
+`%LOCALAPPDATA%\c-shell` on Windows). The cache key changes with compiler file
+metadata, requested standard, relevant toolchain environment, or c-shell
+version. Expired or malformed entries simply cause fresh probes.
 
 ## Known limitations
 
+- **Execution is not sandboxed.** Compilers and generated programs run with
+  c-shell's user permissions and working directory. Do not evaluate untrusted
+  code.
 - **Side effects replay.** Every evaluation reruns the session, so `scanf`,
   file writes and `time()` execute again each time. Pure syntax exploration
   never notices; be aware of it otherwise.
 - **No redeclaration in the same scope.** Declaring `int x` twice is an
-  error, because it is one in C. Use `%undo` to drop the previous one.
+  error, because it is one in C. If the previous declaration is the latest
+  retained input, `%undo` can drop it.
 - **The purity heuristic is conservative.** Any expression containing a
   function call is kept, even if the function happens to be pure.
-- **Crashing or timed-out inputs are not committed** — otherwise every later
-  replay would crash again.
+- **Not every C value is printable.** The `_Generic` runtime covers the
+  standard boolean/integer/real-floating types, `char` strings and common
+  object pointers. An otherwise
+  valid expression with an unsupported value category (for example a
+  struct/union, complex or `void` value) is evaluated without `Out[n]` and an
+  explanatory note is shown.
+- **Program output is bounded.** When stdin is a real terminal, output from
+  the newest input is streamed immediately, so a prompt before `scanf` is
+  visible. With non-terminal stdin it remains buffered for deterministic
+  transcripts. Capture is limited to 8 MiB per stream; an overflow is
+  reported and the input is not committed.
+- **Timeout cleanup follows the launched process tree.** On Unix the process
+  group is killed when the direct child times out, but a child that detaches
+  or outlives a parent that exits successfully can escape cleanup. Windows
+  `taskkill /T` has similar orphan limitations.
+- **Incomplete inputs are not committed.** Besides crashes and timeouts, a
+  successful early `exit(0)`, `_Exit` or top-level `return` is detected by a
+  missing completion marker; committing it would terminate every later
+  replay before the new input runs.
 - No session save/load.
-- MSVC must be started from a Developer Command Prompt, or `INCLUDE`/`LIB`
-  are missing.
+- `cl.exe` needs an MSVC build environment with `INCLUDE`/`LIB` configured;
+  a Developer Command Prompt is the usual way to obtain one.
 
 ## Development
 

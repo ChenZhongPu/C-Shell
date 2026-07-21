@@ -19,7 +19,7 @@ use crate::lex;
 
 /// The magic commands, for completion.
 const MAGICS: &[&str] = &[
-    "%help", "%quit", "%exit", "%reset", "%history", "%src", "%undo", "%cc", "%std",
+    "%help", "%quit", "%exit", "%clear", "%reset", "%history", "%src", "%undo", "%cc", "%std",
 ];
 
 /// C keywords, common types and stdlib staples worth offering at a C prompt.
@@ -189,18 +189,165 @@ impl Highlighter for CHelper {
     }
 }
 
-/// Is this input still waiting for more lines?
-///
-/// Single source of truth, shared by the validator and the Enter handler —
-/// if the two ever disagreed, Enter could refuse to submit an input the
-/// validator considers finished, or vice versa.
-pub fn is_incomplete(input: &str) -> bool {
+/// Is this input grammatically forced to continue? Unlike `is_incomplete`,
+/// this has no interactive blank-line policy and is suitable for scripts.
+pub fn is_structurally_incomplete(input: &str) -> bool {
     let t = input.trim();
     if t.is_empty() || t.starts_with('%') {
         return false;
     }
     let sc = lex::scan(input);
-    sc.depth > 0 || sc.unterminated || input.trim_end().ends_with('\\') || lex::awaits_body(input)
+    // Conditional-preprocessor groups are complete at their matching #endif;
+    // braces in an inactive branch must not drive the C bracket heuristic.
+    if t.starts_with('#') {
+        return sc.unterminated
+            || input.trim_end().ends_with('\\')
+            || preprocessor_depth(input) > 0;
+    }
+    sc.depth > 0
+        || sc.unterminated
+        || input.trim_end().ends_with('\\')
+        || lex::awaits_body(input)
+        || control_header_awaits_body(input)
+        || do_awaits_while(input)
+}
+
+/// Is this interactive input still waiting for more lines?
+///
+/// C cannot tell whether a complete `if` will be followed by `else`. A
+/// completed leading `if` therefore needs a blank continuation line to confirm
+/// submission. Other constructs (functions, loops, structs, initializers)
+/// submit as soon as their required syntax closes.
+///
+/// Single source of truth, shared by the validator and Enter handler.
+pub fn is_incomplete(input: &str) -> bool {
+    if is_structurally_incomplete(input) {
+        return true;
+    }
+    needs_blank_confirmation(input) && !ends_in_blank_line(input)
+}
+
+/// A complete batch input beginning with `if` is held for one-line lookahead,
+/// because an `else` on the next physical line belongs to the same C statement.
+pub fn can_accept_else(input: &str) -> bool {
+    !input.trim_start().starts_with('#')
+        && !is_structurally_incomplete(input)
+        && first_code_word(input).as_deref() == Some("if")
+}
+
+pub fn starts_with_else(input: &str) -> bool {
+    !input.trim_start().starts_with('#') && first_code_word(input).as_deref() == Some("else")
+}
+
+fn needs_blank_confirmation(input: &str) -> bool {
+    !input.trim_start().starts_with('#') && first_code_word(input).as_deref() == Some("if")
+}
+
+fn ends_in_blank_line(input: &str) -> bool {
+    input
+        .rfind('\n')
+        .is_some_and(|i| input[i + 1..].trim().is_empty())
+}
+
+fn preprocessor_depth(input: &str) -> i32 {
+    let mut depth = 0i32;
+    for line in input.lines() {
+        let Some(directive) = line.trim_start().strip_prefix('#') else {
+            continue;
+        };
+        let word = directive
+            .trim_start()
+            .split(|c: char| c.is_whitespace() || c == '(')
+            .next()
+            .unwrap_or("");
+        match word {
+            "if" | "ifdef" | "ifndef" => depth += 1,
+            "endif" => depth -= 1,
+            _ => {}
+        }
+    }
+    depth
+}
+
+fn first_code_word(input: &str) -> Option<String> {
+    lex::identifiers(input).into_iter().next()
+}
+
+/// `if (x)` / `for (...)` / `while (...)` / `switch (...)` need a body even
+/// though their parentheses are balanced. Without this check missing-semicolon
+/// repair can silently turn `if (x)` into the empty statement `if (x);`.
+fn control_header_awaits_body(input: &str) -> bool {
+    let Some(first) = first_code_word(input) else {
+        return false;
+    };
+    if !matches!(first.as_str(), "if" | "for" | "while" | "switch") {
+        return false;
+    }
+    let sc = lex::scan(input);
+    let b = input.as_bytes();
+    let Some(open) = (0..b.len()).find(|&i| sc.code[i] && b[i] == b'(') else {
+        return true;
+    };
+    let mut depth = 0i32;
+    let mut close = None;
+    for (i, &byte) in b.iter().enumerate().skip(open) {
+        if !sc.code[i] {
+            continue;
+        }
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(close) = close else { return true };
+    !(close + 1..b.len()).any(|i| sc.code[i] && !b[i].is_ascii_whitespace())
+}
+
+/// A `do` statement is not complete at its closing body brace; its trailing
+/// `while (condition);` is mandatory.
+fn do_awaits_while(input: &str) -> bool {
+    if first_code_word(input).as_deref() != Some("do") {
+        return false;
+    }
+    let sc = lex::scan(input);
+    let b = input.as_bytes();
+    let mut depth = 0i32;
+    let mut saw_while = false;
+    let mut i = 0;
+    while i < b.len() {
+        if !sc.code[i] {
+            i += 1;
+            continue;
+        }
+        match b[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            _ if depth == 0 && (b[i] == b'_' || b[i].is_ascii_alphabetic()) => {
+                let start = i;
+                while i < b.len() && sc.code[i] && (b[i] == b'_' || b[i].is_ascii_alphanumeric()) {
+                    i += 1;
+                }
+                if start > 0 && &input[start..i] == "while" {
+                    saw_while = true;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let ends_with_semicolon = (0..b.len())
+        .rev()
+        .find(|&i| sc.code[i] && !b[i].is_ascii_whitespace())
+        .is_some_and(|i| b[i] == b';');
+    !saw_while || !ends_with_semicolon
 }
 
 impl Validator for CHelper {
@@ -303,6 +450,7 @@ mod tests {
         let (start, c) = completion_candidates("%h", 2, &[]);
         assert_eq!(start, 0);
         assert_eq!(c, vec!["%help", "%history"]);
+        assert_eq!(completion_candidates("%cl", 3, &[]).1, vec!["%clear"]);
         // Mid-line `%` is the modulo operator.
         let (_, c) = completion_candidates("a %h", 4, &[]);
         assert!(c.is_empty());
@@ -327,6 +475,47 @@ mod tests {
         assert_eq!(continuation_insert("int x = 1;", 10, 8), None);
         assert_eq!(continuation_insert("x + 1", 5, 8), None);
         assert_eq!(continuation_insert("%help", 5, 8), None);
+    }
+
+    #[test]
+    fn if_waits_for_else_or_blank_confirmation() {
+        let closed = "if (x) {\n  puts(\"yes\");\n}";
+        assert!(!is_structurally_incomplete(closed));
+        assert!(is_incomplete(closed));
+        assert!(!is_incomplete(&format!("{closed}\n        ")));
+
+        let with_else = format!("{closed}\nelse {{\n  puts(\"no\");\n}}");
+        assert!(is_incomplete(&with_else));
+        assert!(!is_incomplete(&format!("{with_else}\n        ")));
+    }
+
+    #[test]
+    fn control_header_and_do_while_are_structurally_incomplete() {
+        assert!(is_structurally_incomplete("if (x)"));
+        assert!(is_structurally_incomplete("for (int i = 0; i < 2; ++i)"));
+        assert!(is_structurally_incomplete("do { puts(\"x\"); }"));
+        assert!(!is_structurally_incomplete(
+            "do { puts(\"x\"); } while (0);"
+        ));
+    }
+
+    #[test]
+    fn conditional_preprocessor_group_waits_for_endif() {
+        assert!(is_structurally_incomplete("#if FEATURE"));
+        assert!(is_structurally_incomplete("#if FEATURE\n#if INNER\n#endif"));
+        // An unmatched C brace in an inactive branch does not keep the editor
+        // waiting once the preprocessor group itself is closed.
+        assert!(!is_structurally_incomplete("#if 0\n{\n#endif"));
+        assert!(!is_structurally_incomplete("#if FEATURE\n#endif"));
+    }
+
+    #[test]
+    fn function_submits_at_its_closing_brace() {
+        let function = "int f(void)\n{\n  return 1;\n}";
+        assert!(!is_structurally_incomplete(function));
+        assert!(!is_incomplete(function));
+        assert!(!is_incomplete("while (0) {\n}"));
+        assert!(!is_incomplete("do {\n} while (0);"));
     }
 
     #[test]

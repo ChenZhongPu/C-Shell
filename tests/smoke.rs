@@ -188,11 +188,70 @@ mul(6, 7)
 }
 
 #[test]
+fn piped_stdin_keeps_else_with_preceding_if() {
+    let out = run(&[
+        "int x = 0;",
+        "if (x) {",
+        "    puts(\"wrong\");",
+        "}",
+        "else {",
+        "    puts(\"else-ok\");",
+        "}",
+        "1 + 1",
+    ]);
+    assert!(out.contains("else-ok"), "else was detached from if:\n{out}");
+    assert!(
+        out.contains("Out[3]: 2"),
+        "unexpected input numbering:\n{out}"
+    );
+}
+
+#[test]
+fn piped_stdin_accumulates_conditional_preprocessor_group() {
+    let out = run(&[
+        "#if 1",
+        "#define CS_TEST_ANSWER 42",
+        "#else",
+        "#define CS_TEST_ANSWER 0",
+        "#endif",
+        "CS_TEST_ANSWER",
+    ]);
+    assert!(out.contains("Out[2]: 42"), "unexpected output:\n{out}");
+}
+
+#[test]
+fn piped_stdin_accumulates_control_body_and_do_while() {
+    let out = run(&[
+        "int n = 0;",
+        "if (1)",
+        "    n++;",
+        "do {",
+        "    n++;",
+        "} while (0);",
+        "n",
+    ]);
+    assert!(out.contains("Out[4]: 2"), "unexpected output:\n{out}");
+}
+
+#[test]
 fn piped_stdin_accumulates_multi_line_definitions() {
     // The batch reader gives pipes the same multi-line handling the
     // interactive validator provides at a terminal.
     let out = run(&["int sq(int a)", "{", "    return a * a;", "}", "sq(9)"]);
     assert!(out.contains("Out[2]: 81"), "unexpected output:\n{out}");
+}
+
+#[test]
+fn clear_erases_screen_without_resetting_session() {
+    let out = run(&["int kept = 42;", "%clear", "kept"]);
+    assert!(
+        out.contains("\x1b[2J\x1b[H"),
+        "clear sequence missing:\n{out:?}"
+    );
+    assert!(
+        out.contains("Out[2]: 42"),
+        "clear changed session state or input numbering:\n{out:?}"
+    );
 }
 
 #[test]
@@ -232,6 +291,45 @@ fn timeout_kills_forked_descendants_too() {
     );
     assert!(out.contains("killed after 2s"), "no timeout report:\n{out}");
     assert!(out.contains("Out[3]: 2"), "REPL did not survive:\n{out}");
+}
+
+#[test]
+fn successful_early_exit_is_not_committed() {
+    // Exit status 0 is not enough: the generated completion marker must be
+    // reached, or replaying this statement would wedge every later input.
+    let out = run(&["exit(0);", "1 + 1"]);
+    assert!(
+        out.contains("exited before the input completed"),
+        "missing protocol failure:\n{out}"
+    );
+    assert!(out.contains("Out[2]: 2"), "session stayed wedged:\n{out}");
+}
+
+#[test]
+fn unsupported_value_category_is_explained_and_not_misclassified() {
+    let out = run(&["((struct { int x; }){ 1 })", "1 + 1"]);
+    assert!(
+        out.contains("value category has no printer"),
+        "missing printer explanation:\n{out}"
+    );
+    assert!(
+        out.contains("Out[2]: 2"),
+        "session did not continue:\n{out}"
+    );
+}
+
+#[test]
+fn unsupported_explicit_standard_is_an_error() {
+    let out = Command::new(env!("CARGO_BIN_EXE_c-shell"))
+        .args(["--std", "definitely-not-a-c-standard", "-e", "1"])
+        .output()
+        .expect("run c-shell with invalid standard");
+    assert!(!out.status.success(), "invalid --std was silently ignored");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("does not support requested standard"),
+        "unexpected diagnostic:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
