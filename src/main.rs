@@ -92,7 +92,11 @@ fn main() -> Result<()> {
     let mut ev = Evaluator::new(tc, Duration::from_secs(args.timeout))?;
     // At a real terminal, forward only the newest input's output as it arrives
     // so prompts before scanf are visible. Batch transcripts remain buffered.
-    ev.set_stream_output(std::io::stdin().is_terminal());
+    let stdin_is_terminal = std::io::stdin().is_terminal();
+    ev.set_stream_output(stdin_is_terminal);
+    // Piped REPL mode consumes stdin as C source. A TTY, `-e`, or a script
+    // leaves stdin available as the evaluated program's input.
+    ev.set_program_stdin(stdin_is_terminal || !args.eval.is_empty() || args.script.is_some());
     let mut session = Session::default();
 
     // ---- non-interactive modes -------------------------------------------
@@ -100,7 +104,7 @@ fn main() -> Result<()> {
     if !args.eval.is_empty() {
         let mut ok = true;
         for code in &args.eval {
-            let (input_ok, quit) = submit(code, &mut session, &mut ev, &ui, Style::Bare)?;
+            let (input_ok, quit, _) = submit(code, &mut session, &mut ev, &ui, Style::Bare, false)?;
             ok &= input_ok;
             if quit {
                 break;
@@ -163,10 +167,16 @@ fn main() -> Result<()> {
         EventHandler::Conditional(Box::new(editor::BraceDedents)),
     );
 
+    let mut edit_buffer: Option<String> = None;
     loop {
         let n = session.counter + 1;
         prompt_base.store(Ui::prompt_width(n), Ordering::Relaxed);
-        let line = match rl.readline(&ui.prompt_in(n)) {
+        let prompt = ui.prompt_in(n);
+        let line = match edit_buffer.take() {
+            Some(initial) => rl.readline_with_initial(&prompt, (&initial, "")),
+            None => rl.readline(&prompt),
+        };
+        let line = match line {
             Ok(l) => l,
             Err(ReadlineError::Interrupted) => continue,
             Err(ReadlineError::Eof) => break,
@@ -176,18 +186,11 @@ fn main() -> Result<()> {
         if raw.is_empty() {
             continue;
         }
-        let before_edit = session.counter;
-        let editing = raw.split_ascii_whitespace().next() == Some("%edit");
         let _ = rl.add_history_entry(raw);
-        let (_, quit) = submit(raw, &mut session, &mut ev, &ui, Style::Repl)?;
-        // The `%edit [n]` command is useful history, but the changed multi-line
-        // C is what Up should retrieve first after the editor closes.
-        if editing
-            && session.counter > before_edit
-            && let Some(edited) = session.last_input()
-        {
-            let _ = rl.add_history_entry(edited);
-        }
+        let (_, quit, next_edit) = submit(raw, &mut session, &mut ev, &ui, Style::Repl, true)?;
+        // `%edit` itself consumes no input number. Its selected text becomes
+        // the editable buffer at the same prompt on the next readline call.
+        edit_buffer = next_edit;
         *idents.lock().expect("ident vocabulary") = session.identifiers();
         if quit {
             break;
@@ -218,7 +221,7 @@ fn run_batch<R: BufRead>(
         if !pending.is_empty() && editor::can_accept_else(&pending) {
             let comment = !line.trim().is_empty() && lex::is_blank(&line);
             if !editor::starts_with_else(&line) && !comment {
-                let (ok, quit) = submit_batch_pending(&mut pending, session, ev, ui)?;
+                let (ok, quit, _) = submit_batch_pending(&mut pending, session, ev, ui)?;
                 all_ok &= ok;
                 if quit {
                     return Ok(all_ok);
@@ -236,7 +239,7 @@ fn run_batch<R: BufRead>(
         if editor::is_structurally_incomplete(&pending) || editor::can_accept_else(&pending) {
             continue;
         }
-        let (ok, quit) = submit_batch_pending(&mut pending, session, ev, ui)?;
+        let (ok, quit, _) = submit_batch_pending(&mut pending, session, ev, ui)?;
         all_ok &= ok;
         if quit {
             return Ok(all_ok);
@@ -245,7 +248,7 @@ fn run_batch<R: BufRead>(
     // An unterminated or lookahead-delayed tail still gets evaluated: a
     // truncated construct earns the compiler's honest diagnostic.
     if !pending.trim().is_empty() {
-        let (ok, _) = submit_batch_pending(&mut pending, session, ev, ui)?;
+        let (ok, _, _) = submit_batch_pending(&mut pending, session, ev, ui)?;
         all_ok &= ok;
     }
     Ok(all_ok)
@@ -256,30 +259,40 @@ fn submit_batch_pending(
     session: &mut Session,
     ev: &mut Evaluator,
     ui: &Ui,
-) -> Result<(bool, bool)> {
+) -> Result<(bool, bool, Option<String>)> {
     let input = std::mem::take(pending);
-    submit(input.trim(), session, ev, ui, Style::Repl)
+    submit(input.trim(), session, ev, ui, Style::Repl, false)
 }
 
 /// Run one complete input: magic command or C code. Returns (succeeded,
-/// quit-requested).
+/// quit-requested, next interactive edit buffer).
 fn submit(
     raw: &str,
     session: &mut Session,
     ev: &mut Evaluator,
     ui: &Ui,
     style: Style,
-) -> Result<(bool, bool)> {
+    interactive_edit: bool,
+) -> Result<(bool, bool, Option<String>)> {
     let raw = raw.trim();
     // Comment-only input is legal to type but has nothing to evaluate.
     if raw.is_empty() || lex::is_blank(raw) {
-        return Ok((true, false));
+        return Ok((true, false, None));
     }
     if raw.starts_with('%') {
         return match magic::handle(raw, session, ev, ui)? {
-            magic::Action::Quit => Ok((true, true)),
-            magic::Action::Continue => Ok((true, false)),
-            magic::Action::Submit(edited) => submit(&edited, session, ev, ui, style),
+            magic::Action::Quit => Ok((true, true, None)),
+            magic::Action::Continue => Ok((true, false, None)),
+            magic::Action::Prefill(input) if interactive_edit => Ok((true, false, Some(input))),
+            magic::Action::Prefill(_) => {
+                let message = ui.err("%edit is available only in interactive REPL mode");
+                if style == Style::Bare {
+                    eprintln!("{message}");
+                } else {
+                    println!("{message}");
+                }
+                Ok((false, false, None))
+            }
         };
     }
 
@@ -288,7 +301,10 @@ fn submit(
     session.counter = n;
     session.remember_input(n, raw);
 
-    let external_calls = lex::external_replay_calls(raw);
+    let external_calls = lex::external_replay_calls(raw)
+        .into_iter()
+        .filter(|name| name != "scanf")
+        .collect::<Vec<_>>();
     let external_warning = !external_calls.is_empty() && !session.external_replay_warning_shown();
     if external_warning {
         let calls = external_calls
@@ -314,13 +330,14 @@ fn submit(
             } else {
                 println!("{msg}");
             }
-            Ok((false, false))
+            Ok((false, false, None))
         }
         Eval::Done(o) => {
-            // Live output has already been forwarded by Evaluator. Keep the
-            // following warning, Out label or next prompt off its last line.
+            // Live output has already been forwarded by Evaluator. If the C
+            // program left a partial line, visibly mark the newline c-shell
+            // inserts to protect the following warning, value or prompt.
             if o.streamed_output_needs_newline {
-                println!();
+                println!("{}", ui.inserted_newline_marker());
             }
             let note = |s: &str| {
                 if !bare {
@@ -390,6 +407,7 @@ fn submit(
                     if external_warning {
                         session.mark_external_replay_warning_shown();
                     }
+                    session.attach_stdin_events(o.stdin_events.clone());
                 }
             }
             if o.abnormal.is_none() {
@@ -401,8 +419,14 @@ fn submit(
                 if o.scoped_rebind {
                     note("(opened a nested scope to shadow an earlier declaration)");
                 }
+                if !o.stdin_events.is_empty() {
+                    note(&format!(
+                        "(captured {} stdin request(s) for replay; contents hidden)",
+                        o.stdin_events.len()
+                    ));
+                }
             }
-            Ok((o.abnormal.is_none(), false))
+            Ok((o.abnormal.is_none(), false, None))
         }
     }
 }

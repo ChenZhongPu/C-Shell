@@ -2,12 +2,22 @@
 
 use crate::codegen::Slot;
 use crate::lex;
+use crate::proc::StdinEvent;
 
 #[derive(Clone)]
 enum LogEntry {
-    AddedFile,
-    AddedStmt { opened_scope: bool },
-    ReplacedFile { index: usize, previous: String },
+    AddedFile {
+        stdin_events: usize,
+    },
+    AddedStmt {
+        opened_scope: bool,
+        stdin_events: usize,
+    },
+    ReplacedFile {
+        index: usize,
+        previous: String,
+        stdin_events: usize,
+    },
 }
 
 #[derive(Default, Clone)]
@@ -18,6 +28,12 @@ pub struct Session {
     /// A literal `{` entry begins each compiler-approved shadowing epoch;
     /// codegen closes all such scopes after the newest input.
     pub stmts: Vec<String>,
+    /// Number of captured stdin events associated with each `stmts` entry.
+    /// The generated replay uses the flattened tape; `%src` uses these counts
+    /// only to add redacted annotations at the right input boundary.
+    stmt_stdin_events: Vec<usize>,
+    /// Captured program-input lines, never persisted or exposed by `%src`.
+    stdin_tape: Vec<StdinEvent>,
     /// Number of shadowing scopes currently open in `stmts`.
     pub(crate) scope_depth: usize,
     /// Input counter driving the `In [n]` prompt. Like IPython it advances on
@@ -46,7 +62,7 @@ impl Session {
         let stored = match slot {
             Slot::FileScope => {
                 self.file_items.push(text.to_string());
-                self.log.push(LogEntry::AddedFile);
+                self.log.push(LogEntry::AddedFile { stdin_events: 0 });
                 return;
             }
             Slot::Stmt => text.to_string(),
@@ -58,8 +74,10 @@ impl Session {
             Slot::Expr => return,
         };
         self.stmts.push(indent(&stored));
+        self.stmt_stdin_events.push(0);
         self.log.push(LogEntry::AddedStmt {
             opened_scope: false,
+            stdin_events: 0,
         });
     }
 
@@ -68,37 +86,89 @@ impl Session {
     /// the end of `main`, giving C shadowing the shape of REPL rebinding.
     pub fn commit_scoped(&mut self, text: &str) {
         self.stmts.push(indent("{"));
+        self.stmt_stdin_events.push(0);
         self.stmts.push(indent(text));
+        self.stmt_stdin_events.push(0);
         self.scope_depth += 1;
-        self.log.push(LogEntry::AddedStmt { opened_scope: true });
+        self.log.push(LogEntry::AddedStmt {
+            opened_scope: true,
+            stdin_events: 0,
+        });
     }
 
     /// Replace a compiler-selected file-scope item in place. Keeping its index
     /// preserves declaration order for older functions/types that refer to it.
     pub fn replace_file(&mut self, index: usize, text: &str) {
         let previous = std::mem::replace(&mut self.file_items[index], text.to_string());
-        self.log.push(LogEntry::ReplacedFile { index, previous });
+        self.log.push(LogEntry::ReplacedFile {
+            index,
+            previous,
+            stdin_events: 0,
+        });
+    }
+
+    /// Attach fresh program-input lines to the state-changing input that was
+    /// just committed. scanf-bearing expressions are retained as statements,
+    /// so successful reads always have a journal entry here.
+    pub fn attach_stdin_events(&mut self, events: Vec<StdinEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        let count = events.len();
+        match self.log.last_mut().expect("stdin input must change state") {
+            LogEntry::AddedStmt { stdin_events, .. } => {
+                *stdin_events += count;
+                *self
+                    .stmt_stdin_events
+                    .last_mut()
+                    .expect("statement stdin annotation") += count;
+            }
+            LogEntry::AddedFile { stdin_events } | LogEntry::ReplacedFile { stdin_events, .. } => {
+                *stdin_events += count;
+            }
+        }
+        self.stdin_tape.extend(events);
+    }
+
+    pub fn stdin_tape(&self) -> &[StdinEvent] {
+        &self.stdin_tape
+    }
+
+    pub fn stmt_stdin_event_count(&self, index: usize) -> usize {
+        self.stmt_stdin_events.get(index).copied().unwrap_or(0)
     }
 
     /// Drop the most recently accepted state-changing input, returning what
     /// was removed. Pure queries and magic commands never enter this log.
     pub fn undo(&mut self) -> Option<String> {
-        match self.log.pop()? {
-            LogEntry::AddedFile => self.file_items.pop(),
-            LogEntry::AddedStmt { opened_scope } => {
+        let (removed, stdin_events) = match self.log.pop()? {
+            LogEntry::AddedFile { stdin_events } => (self.file_items.pop(), stdin_events),
+            LogEntry::AddedStmt {
+                opened_scope,
+                stdin_events,
+            } => {
                 let removed = self.stmts.pop().map(|s| s.trim().to_string());
+                self.stmt_stdin_events.pop();
                 if opened_scope {
                     let brace = self.stmts.pop();
+                    self.stmt_stdin_events.pop();
                     debug_assert_eq!(brace.as_deref().map(str::trim), Some("{"));
                     self.scope_depth = self.scope_depth.saturating_sub(1);
                 }
-                removed
+                (removed, stdin_events)
             }
-            LogEntry::ReplacedFile { index, previous } => {
+            LogEntry::ReplacedFile {
+                index,
+                previous,
+                stdin_events,
+            } => {
                 let removed = std::mem::replace(&mut self.file_items[index], previous);
-                Some(removed)
+                (Some(removed), stdin_events)
             }
-        }
+        };
+        self.stdin_tape
+            .truncate(self.stdin_tape.len().saturating_sub(stdin_events));
+        removed
     }
 
     pub fn remember_input(&mut self, number: usize, text: &str) {
@@ -142,6 +212,8 @@ impl Session {
     pub fn reset(&mut self) {
         self.file_items.clear();
         self.stmts.clear();
+        self.stmt_stdin_events.clear();
+        self.stdin_tape.clear();
         self.scope_depth = 0;
         self.log.clear();
         self.counter = 0;
@@ -180,10 +252,17 @@ mod tests {
         let mut session = Session::default();
         session.commit("int x = 1;", Slot::Stmt);
         session.commit_scoped("int x = 2;");
+        session.attach_stdin_events(vec![StdinEvent {
+            bytes: b"2\n".to_vec(),
+            eof: false,
+        }]);
+        assert_eq!(session.stdin_tape().len(), 1);
+        assert_eq!(session.stmt_stdin_event_count(2), 1);
         assert_eq!(session.scope_depth, 1);
         assert_eq!(session.undo().as_deref(), Some("int x = 2;"));
         assert_eq!(session.scope_depth, 0);
         assert_eq!(session.stmts.len(), 1);
+        assert!(session.stdin_tape().is_empty());
     }
 
     #[test]

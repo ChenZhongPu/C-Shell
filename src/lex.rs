@@ -96,6 +96,28 @@ fn is_ident_byte(c: u8) -> bool {
     c == b'_' || c.is_ascii_alphanumeric()
 }
 
+/// Whether an exact identifier appears in code rather than a comment/literal.
+pub fn contains_code_identifier(src: &str, wanted: &str) -> bool {
+    let sc = scan(src);
+    let bytes = src.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if sc.code[i] && (bytes[i] == b'_' || bytes[i].is_ascii_alphabetic()) {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && sc.code[i] && is_ident_byte(bytes[i]) {
+                i += 1;
+            }
+            if &src[start..i] == wanted {
+                return true;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 /// Every identifier appearing as code (not in comments or literals), in
 /// order of first appearance. Fuel for completion: whatever the session has
 /// mentioned is worth offering again.
@@ -379,6 +401,13 @@ mod tests {
         assert!(scan("\"abc").unterminated);
         assert!(scan("/* open").unterminated);
         assert!(!scan("\"a\\\"b\"").unterminated);
+    }
+
+    #[test]
+    fn exact_code_identifier_search_ignores_comments_and_literals() {
+        assert!(contains_code_identifier("scanf(\"%d\", &x)", "scanf"));
+        assert!(!contains_code_identifier("my_scanf()", "scanf"));
+        assert!(!contains_code_identifier("// scanf()\n\"scanf\"", "scanf"));
     }
 
     #[test]

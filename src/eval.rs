@@ -7,10 +7,10 @@ use anyhow::{Context, Result};
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-use crate::codegen::{self, M_DONE, M_NEW, M_VAL, Slot};
+use crate::codegen::{self, M_DONE, M_NEW, M_STDIN, M_VAL, Slot};
 use crate::errmap;
 use crate::lex;
 use crate::proc;
@@ -27,6 +27,8 @@ pub struct Outcome {
     /// Live program output already reached the terminal but did not end in
     /// `\n`; the renderer must separate subsequent diagnostics/value/prompt.
     pub streamed_output_needs_newline: bool,
+    /// Fresh stdin request lines captured while executing the newest input.
+    pub stdin_events: Vec<proc::StdinEvent>,
     /// Compiler warnings, already remapped to input-relative lines.
     pub warnings: String,
     /// Set when the program died abnormally or ran too long.
@@ -56,6 +58,7 @@ pub struct Evaluator {
     dir: tempfile::TempDir,
     pub timeout: Duration,
     stream_output: bool,
+    allow_program_stdin: bool,
 }
 
 impl Evaluator {
@@ -66,6 +69,7 @@ impl Evaluator {
             dir,
             timeout,
             stream_output: false,
+            allow_program_stdin: false,
         })
     }
 
@@ -83,6 +87,12 @@ impl Evaluator {
     /// mode leaves this off so transcript ordering remains deterministic.
     pub fn set_stream_output(&mut self, enabled: bool) {
         self.stream_output = enabled;
+    }
+
+    /// Whether the newest input may request real stdin. Disabled when stdin is
+    /// itself carrying piped C source; enabled for a TTY, `-e`, and scripts.
+    pub fn set_program_stdin(&mut self, enabled: bool) {
+        self.allow_program_stdin = enabled;
     }
 
     /// Swap in a different compiler, re-probing what it supports.
@@ -145,7 +155,13 @@ impl Evaluator {
                     &prog.session_line_ranges,
                     prog.wrapped,
                 ));
-                Ok(Eval::Done(self.run(&exe, Slot::Expr, warnings)?))
+                Ok(Eval::Done(self.run(
+                    &exe,
+                    Slot::Expr,
+                    warnings,
+                    prog.uses_stdin_tape,
+                    session.stdin_tape(),
+                )?))
             }
             Err(diag) => Ok(Eval::CompileError(errmap::drop_stale_warnings(
                 &errmap::remap(
@@ -201,7 +217,7 @@ impl Evaluator {
     ) -> Result<std::result::Result<Outcome, String>> {
         if looks_file_scope(input) {
             let normal = codegen::build(session, input, Slot::FileScope);
-            let reported = match self.try_program(normal, Slot::FileScope)? {
+            let reported = match self.try_program(normal, Slot::FileScope, session.stdin_tape())? {
                 Ok(o) => return Ok(Ok(o)),
                 Err(diag) => diag,
             };
@@ -224,7 +240,7 @@ impl Evaluator {
                     continue;
                 }
                 let prog = codegen::build_file_replacement(session, input, index);
-                if let Ok(mut o) = self.try_program(prog, Slot::FileScope)? {
+                if let Ok(mut o) = self.try_program(prog, Slot::FileScope, session.stdin_tape())? {
                     o.file_replacement = Some(index);
                     return Ok(Ok(o));
                 }
@@ -242,14 +258,16 @@ impl Evaluator {
         };
         for &slot in slots {
             let normal = codegen::build(session, input, slot);
-            match self.try_program(normal, slot)? {
+            match self.try_program(normal, slot, session.stdin_tape())? {
                 Ok(o) => return Ok(Ok(o)),
                 Err(diag) if slot == Slot::Stmt => {
                     let retry_scoped = is_rebinding_diagnostic(&diag);
                     reported = diag;
                     if retry_scoped {
                         let scoped = codegen::build_scoped_stmt(session, input);
-                        if let Ok(mut o) = self.try_program(scoped, Slot::Stmt)? {
+                        if let Ok(mut o) =
+                            self.try_program(scoped, Slot::Stmt, session.stdin_tape())?
+                        {
                             o.scoped_rebind = true;
                             return Ok(Ok(o));
                         }
@@ -265,7 +283,7 @@ impl Evaluator {
         // as a silent expression so the UI can explain why there is no value.
         if try_expr {
             let prog = codegen::build_expr_probe(session, input);
-            if let Ok(mut o) = self.try_program(prog, Slot::Expr)? {
+            if let Ok(mut o) = self.try_program(prog, Slot::Expr, session.stdin_tape())? {
                 o.value = None;
                 o.unprintable = true;
                 return Ok(Ok(o));
@@ -286,6 +304,7 @@ impl Evaluator {
         &self,
         prog: codegen::Program,
         slot: Slot,
+        stdin_tape: &[proc::StdinEvent],
     ) -> Result<std::result::Result<Outcome, String>> {
         let src = self.src_path().display().to_string();
         let (start, count) = (prog.new_start_line, prog.new_line_count);
@@ -300,7 +319,13 @@ impl Evaluator {
                     &prog.session_line_ranges,
                     prog.wrapped,
                 ));
-                Ok(Ok(self.run(&exe, slot, warnings)?))
+                Ok(Ok(self.run(
+                    &exe,
+                    slot,
+                    warnings,
+                    prog.uses_stdin_tape,
+                    stdin_tape,
+                )?))
             }
             Err(diag) => Ok(Err(errmap::drop_stale_warnings(&errmap::remap(
                 &diag,
@@ -314,12 +339,37 @@ impl Evaluator {
         }
     }
 
-    fn run(&self, exe: &PathBuf, slot: Slot, warnings: String) -> Result<Outcome> {
+    fn run(
+        &self,
+        exe: &PathBuf,
+        slot: Slot,
+        warnings: String,
+        uses_stdin_tape: bool,
+        stdin_tape: &[proc::StdinEvent],
+    ) -> Result<Outcome> {
         let mut cmd = Command::new(exe);
-        let live = self.stream_output.then(LiveStreams::new);
-        let cap = match &live {
-            Some(live) => proc::run_observed(&mut cmd, self.timeout, true, live.observers()),
-            None => proc::run_captured(&mut cmd, self.timeout, true),
+        let taped = uses_stdin_tape || !stdin_tape.is_empty();
+        let (request_tx, request_rx) = mpsc::channel();
+        let live =
+            (self.stream_output || taped).then(|| LiveStreams::new(self.stream_output, request_tx));
+        let cap = if taped {
+            proc::run_observed_with_stdin_tape(
+                &mut cmd,
+                self.timeout,
+                stdin_tape,
+                self.allow_program_stdin,
+                request_rx,
+                live.as_ref().expect("taped observer").observers(),
+            )
+        } else if let Some(live) = &live {
+            proc::run_observed(
+                &mut cmd,
+                self.timeout,
+                self.allow_program_stdin,
+                live.observers(),
+            )
+        } else {
+            proc::run_captured(&mut cmd, self.timeout, self.allow_program_stdin)
         }
         .with_context(|| format!("failed to start {}", exe.display()))?;
         if let Some(live) = &live {
@@ -344,6 +394,12 @@ impl Evaluator {
                     "program output exceeded {} MiB per stream and was truncated",
                     proc::MAX_CAPTURE_BYTES / (1024 * 1024)
                 )
+            })
+        })
+        .or_else(|| {
+            cap.stdin_diverged.then(|| {
+                "stdin tape diverged while replaying retained input; use %undo or %reset"
+                    .to_string()
             })
         })
         .or_else(|| {
@@ -375,6 +431,7 @@ impl Evaluator {
                 err_parts.output
             },
             streamed_output_needs_newline,
+            stdin_events: cap.stdin_recorded,
             warnings,
             abnormal,
             rewritten: None,
@@ -407,6 +464,7 @@ fn split_new(s: &str, has_value: bool) -> SplitOutput {
         Some(i) => (&tail[..i], true),
         None => (tail, false),
     };
+    let body = body.replace(M_STDIN, "");
     if has_value && let Some(i) = body.rfind(M_VAL) {
         return SplitOutput {
             output: body[..i].to_string(),
@@ -419,7 +477,7 @@ fn split_new(s: &str, has_value: bool) -> SplitOutput {
         };
     }
     SplitOutput {
-        output: body.to_string(),
+        output: body,
         value: None,
         done,
     }
@@ -441,6 +499,7 @@ struct LiveFilter {
     pending: Vec<u8>,
     visible_any: bool,
     visible_ends_in_newline: bool,
+    stdin_requests: Vec<proc::StdinRequest>,
 }
 
 impl LiveFilter {
@@ -451,6 +510,7 @@ impl LiveFilter {
             pending: Vec::new(),
             visible_any: false,
             visible_ends_in_newline: false,
+            stdin_requests: Vec::new(),
         }
     }
 
@@ -460,11 +520,24 @@ impl LiveFilter {
         loop {
             match self.state {
                 LiveState::BeforeInput => {
-                    if let Some(i) = find_bytes(&self.pending, M_NEW.as_bytes()) {
+                    let new = find_bytes(&self.pending, M_NEW.as_bytes());
+                    let request = (!self.stdout)
+                        .then(|| find_bytes(&self.pending, M_STDIN.as_bytes()))
+                        .flatten();
+                    if request.is_some_and(|r| new.is_none_or(|n| r < n)) {
+                        let i = request.expect("checked request");
+                        self.pending.drain(..i + M_STDIN.len());
+                        self.stdin_requests.push(proc::StdinRequest::Replay);
+                    } else if let Some(i) = new {
                         self.pending.drain(..i + M_NEW.len());
                         self.state = LiveState::Output;
                     } else {
-                        retain_marker_prefix(&mut self.pending, &[M_NEW.as_bytes()]);
+                        let markers: &[&[u8]] = if self.stdout {
+                            &[M_NEW.as_bytes()]
+                        } else {
+                            &[M_NEW.as_bytes(), M_STDIN.as_bytes()]
+                        };
+                        retain_marker_prefix(&mut self.pending, markers);
                         break;
                     }
                 }
@@ -474,21 +547,34 @@ impl LiveFilter {
                         .then(|| find_bytes(&self.pending, M_VAL.as_bytes()))
                         .flatten();
                     let done = find_bytes(&self.pending, M_DONE.as_bytes());
-                    let next = match (value, done) {
-                        (Some(v), Some(d)) if v < d => Some((v, M_VAL.len(), LiveState::Value)),
-                        (_, Some(d)) => Some((d, M_DONE.len(), LiveState::Done)),
-                        (Some(v), None) => Some((v, M_VAL.len(), LiveState::Value)),
-                        (None, None) => None,
-                    };
-                    if let Some((i, marker_len, state)) = next {
+                    let request = (!self.stdout)
+                        .then(|| find_bytes(&self.pending, M_STDIN.as_bytes()))
+                        .flatten();
+                    let mut next = Vec::new();
+                    if let Some(i) = value {
+                        next.push((i, M_VAL.len(), Some(LiveState::Value)));
+                    }
+                    if let Some(i) = done {
+                        next.push((i, M_DONE.len(), Some(LiveState::Done)));
+                    }
+                    if let Some(i) = request {
+                        next.push((i, M_STDIN.len(), None));
+                    }
+                    if let Some((i, marker_len, state)) =
+                        next.into_iter().min_by_key(|(i, _, _)| *i)
+                    {
                         visible.extend_from_slice(&self.pending[..i]);
                         self.pending.drain(..i + marker_len);
-                        self.state = state;
+                        if let Some(state) = state {
+                            self.state = state;
+                        } else {
+                            self.stdin_requests.push(proc::StdinRequest::Current);
+                        }
                     } else {
                         let markers: &[&[u8]] = if self.stdout {
                             &[M_VAL.as_bytes(), M_DONE.as_bytes()]
                         } else {
-                            &[M_DONE.as_bytes()]
+                            &[M_DONE.as_bytes(), M_STDIN.as_bytes()]
                         };
                         let keep = trailing_marker_prefix(&self.pending, markers);
                         let safe = self.pending.len() - keep;
@@ -516,6 +602,10 @@ impl LiveFilter {
         visible
     }
 
+    fn take_stdin_requests(&mut self) -> Vec<proc::StdinRequest> {
+        std::mem::take(&mut self.stdin_requests)
+    }
+
     fn finish(&mut self) -> Vec<u8> {
         let visible = if self.state == LiveState::Output {
             std::mem::take(&mut self.pending)
@@ -532,10 +622,6 @@ impl LiveFilter {
             self.visible_any = true;
             self.visible_ends_in_newline = *last == b'\n';
         }
-    }
-
-    fn needs_newline(&self) -> bool {
-        self.visible_any && !self.visible_ends_in_newline
     }
 }
 
@@ -562,37 +648,88 @@ fn retain_marker_prefix(bytes: &mut Vec<u8>, markers: &[&[u8]]) {
     bytes.drain(..bytes.len() - keep);
 }
 
+#[derive(Default)]
+struct TerminalVisibility {
+    visible_any: bool,
+    visible_ends_in_newline: bool,
+}
+
+impl TerminalVisibility {
+    fn record(&mut self, visible: &[u8]) {
+        if let Some(last) = visible.last() {
+            self.visible_any = true;
+            self.visible_ends_in_newline = *last == b'\n';
+        }
+    }
+
+    fn needs_newline(&self) -> bool {
+        self.visible_any && !self.visible_ends_in_newline
+    }
+}
+
 struct LiveStreams {
     stdout: Arc<Mutex<LiveFilter>>,
     stderr: Arc<Mutex<LiveFilter>>,
+    terminal: Arc<Mutex<TerminalVisibility>>,
+    stream_visible: bool,
+    stdin_requests: mpsc::Sender<proc::StdinRequest>,
 }
 
 impl LiveStreams {
-    fn new() -> Self {
+    fn new(stream_visible: bool, stdin_requests: mpsc::Sender<proc::StdinRequest>) -> Self {
         Self {
             stdout: Arc::new(Mutex::new(LiveFilter::new(true))),
             stderr: Arc::new(Mutex::new(LiveFilter::new(false))),
+            terminal: Arc::new(Mutex::new(TerminalVisibility::default())),
+            stream_visible,
+            stdin_requests,
         }
     }
 
     fn observers(&self) -> proc::Observers {
         let stdout = Arc::clone(&self.stdout);
         let stderr = Arc::clone(&self.stderr);
+        let stdout_terminal = Arc::clone(&self.terminal);
+        let stderr_terminal = Arc::clone(&self.terminal);
+        let stdout_requests = self.stdin_requests.clone();
+        let stderr_requests = self.stdin_requests.clone();
+        let stream_stdout = self.stream_visible;
+        let stream_stderr = self.stream_visible;
         proc::Observers {
             stdout: Arc::new(move |chunk| {
-                let visible = stdout.lock().expect("stdout filter").feed(chunk);
-                if !visible.is_empty() {
+                let (visible, requests) = {
+                    let mut filter = stdout.lock().expect("stdout filter");
+                    let visible = filter.feed(chunk);
+                    (visible, filter.take_stdin_requests())
+                };
+                for request in requests {
+                    let _ = stdout_requests.send(request);
+                }
+                if stream_stdout && !visible.is_empty() {
+                    // Serialize the two stream writers so this state records
+                    // the actual last byte placed on the shared terminal.
+                    let mut terminal = stdout_terminal.lock().expect("terminal visibility");
                     let mut out = std::io::stdout().lock();
                     let _ = out.write_all(&visible);
                     let _ = out.flush();
+                    terminal.record(&visible);
                 }
             }),
             stderr: Arc::new(move |chunk| {
-                let visible = stderr.lock().expect("stderr filter").feed(chunk);
-                if !visible.is_empty() {
+                let (visible, requests) = {
+                    let mut filter = stderr.lock().expect("stderr filter");
+                    let visible = filter.feed(chunk);
+                    (visible, filter.take_stdin_requests())
+                };
+                for request in requests {
+                    let _ = stderr_requests.send(request);
+                }
+                if stream_stderr && !visible.is_empty() {
+                    let mut terminal = stderr_terminal.lock().expect("terminal visibility");
                     let mut err = std::io::stderr().lock();
                     let _ = err.write_all(&visible);
                     let _ = err.flush();
+                    terminal.record(&visible);
                 }
             }),
         }
@@ -600,22 +737,28 @@ impl LiveStreams {
 
     fn finish(&self) {
         let out_tail = self.stdout.lock().expect("stdout filter").finish();
-        if !out_tail.is_empty() {
+        if self.stream_visible && !out_tail.is_empty() {
+            let mut terminal = self.terminal.lock().expect("terminal visibility");
             let mut out = std::io::stdout().lock();
             let _ = out.write_all(&out_tail);
             let _ = out.flush();
+            terminal.record(&out_tail);
         }
         let err_tail = self.stderr.lock().expect("stderr filter").finish();
-        if !err_tail.is_empty() {
+        if self.stream_visible && !err_tail.is_empty() {
+            let mut terminal = self.terminal.lock().expect("terminal visibility");
             let mut err = std::io::stderr().lock();
             let _ = err.write_all(&err_tail);
             let _ = err.flush();
+            terminal.record(&err_tail);
         }
     }
 
     fn terminal_needs_newline(&self) -> bool {
-        self.stdout.lock().expect("stdout filter").needs_newline()
-            || self.stderr.lock().expect("stderr filter").needs_newline()
+        self.terminal
+            .lock()
+            .expect("terminal visibility")
+            .needs_newline()
     }
 }
 
@@ -1011,7 +1154,35 @@ mod tests {
         visible.extend(f.finish());
         assert_eq!(visible, b"hello");
         assert_eq!(f.state, LiveState::Done);
-        assert!(f.needs_newline());
+        assert!(f.visible_any && !f.visible_ends_in_newline);
+    }
+
+    #[test]
+    fn live_filter_reports_historical_and_current_stdin_requests() {
+        let mut filter = LiveFilter::new(false);
+        let wire = format!("old{M_STDIN}{M_NEW}prompt: {M_STDIN}{M_DONE}");
+        let mut visible = Vec::new();
+        let mut requests = Vec::new();
+        for chunk in wire.as_bytes().chunks(3) {
+            visible.extend(filter.feed(chunk));
+            requests.extend(filter.take_stdin_requests());
+        }
+        assert_eq!(visible, b"prompt: ");
+        assert_eq!(
+            requests,
+            [proc::StdinRequest::Replay, proc::StdinRequest::Current]
+        );
+    }
+
+    #[test]
+    fn terminal_newline_state_follows_the_last_interleaved_stream_write() {
+        let mut terminal = TerminalVisibility::default();
+        terminal.record(b"stdout without newline");
+        assert!(terminal.needs_newline());
+        terminal.record(b"stderr finishes the terminal line\n");
+        assert!(!terminal.needs_newline());
+        terminal.record(b"partial again");
+        assert!(terminal.needs_newline());
     }
 
     #[test]
@@ -1020,6 +1191,6 @@ mod tests {
         let wire = format!("old{M_NEW}warning text\n{M_DONE}");
         assert_eq!(f.feed(wire.as_bytes()), b"warning text\n");
         assert_eq!(f.state, LiveState::Done);
-        assert!(!f.needs_newline());
+        assert!(f.visible_any && f.visible_ends_in_newline);
     }
 }

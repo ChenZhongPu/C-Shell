@@ -15,10 +15,15 @@
 //!    into shared buffers and are given a grace period rather than joined
 //!    unconditionally — worst case costs two abandoned reader threads, never
 //!    a hang.
+//!
+//! Taped stdin is request-driven rather than copied eagerly: generated scanf
+//! wrappers signal over stderr, this module supplies either the next retained
+//! line or one fresh parent-stdin line, and historical requests can never fall
+//! through to the real terminal.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
@@ -34,6 +39,18 @@ pub struct Observers {
     pub stderr: ChunkSink,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StdinEvent {
+    pub bytes: Vec<u8>,
+    pub eof: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StdinRequest {
+    Replay,
+    Current,
+}
+
 pub struct Captured {
     /// `None` when the deadline expired and the process tree was killed.
     pub status: Option<ExitStatus>,
@@ -41,6 +58,10 @@ pub struct Captured {
     pub stderr: Vec<u8>,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    /// Fresh lines supplied to wrapped stdin calls in the newest input.
+    pub stdin_recorded: Vec<StdinEvent>,
+    /// Historical request count differed from the retained tape.
+    pub stdin_diverged: bool,
 }
 
 #[derive(Default)]
@@ -53,6 +74,11 @@ enum ChildInput {
     Null,
     Inherit,
     Bytes(Vec<u8>),
+    Tape {
+        requests: mpsc::Receiver<StdinRequest>,
+        replay: Vec<StdinEvent>,
+        allow_current: bool,
+    },
 }
 
 /// Run `cmd` to completion or `timeout`, capturing both output streams.
@@ -89,6 +115,30 @@ pub fn run_observed(
     run_inner(cmd, timeout, input, Some(observers))
 }
 
+/// Run with request-driven stdin. Generated wrappers emit `StdinRequest`s
+/// through the output observer; replay requests consume retained lines while
+/// current requests synchronously read and record one fresh line. The child
+/// never inherits the real terminal, so historical code cannot prompt again.
+pub fn run_observed_with_stdin_tape(
+    cmd: &mut Command,
+    timeout: Duration,
+    replay: &[StdinEvent],
+    allow_current: bool,
+    requests: mpsc::Receiver<StdinRequest>,
+    observers: Observers,
+) -> std::io::Result<Captured> {
+    run_inner(
+        cmd,
+        timeout,
+        ChildInput::Tape {
+            requests,
+            replay: replay.to_vec(),
+            allow_current,
+        },
+        Some(observers),
+    )
+}
+
 /// Run a child with a byte buffer on stdin. Used by presentation filters such
 /// as clang-format; writing happens concurrently with output draining so a
 /// large input/output pair cannot deadlock on full pipes.
@@ -110,7 +160,7 @@ fn run_inner(
     match &input {
         ChildInput::Null => cmd.stdin(Stdio::null()),
         ChildInput::Inherit => cmd.stdin(Stdio::inherit()),
-        ChildInput::Bytes(_) => cmd.stdin(Stdio::piped()),
+        ChildInput::Bytes(_) | ChildInput::Tape { .. } => cmd.stdin(Stdio::piped()),
     };
 
     #[cfg(unix)]
@@ -125,24 +175,30 @@ fn run_inner(
     let err_observer = observers.as_ref().map(|o| Arc::clone(&o.stderr));
     let (out_buf, out_thread) = drain(child.stdout.take().expect("stdout piped"), out_observer);
     let (err_buf, err_thread) = drain(child.stderr.take().expect("stderr piped"), err_observer);
-    let _input_thread = match input {
-        ChildInput::Bytes(bytes) => child.stdin.take().map(|mut stdin| {
-            std::thread::spawn(move || {
-                let _ = stdin.write_all(&bytes);
-            })
-        }),
-        ChildInput::Null | ChildInput::Inherit => None,
-    };
-
-    let status = match child.wait_timeout(timeout)? {
-        Some(st) => Some(st),
-        None => {
-            // The group leader is still represented by this unreaped Child,
-            // so its pid/group id cannot have been recycled — killing the
-            // group is safe.
-            kill_tree(&child);
-            let _ = child.wait();
-            None
+    let child_stdin = child.stdin.take();
+    let (status, stdin_recorded, stdin_diverged) = match input {
+        ChildInput::Tape {
+            requests,
+            replay,
+            allow_current,
+        } => wait_with_stdin_tape(
+            &mut child,
+            child_stdin.expect("taped stdin piped"),
+            timeout,
+            requests,
+            &replay,
+            allow_current,
+        )?,
+        ChildInput::Bytes(bytes) => {
+            let _input_thread = child_stdin.map(|mut stdin| {
+                std::thread::spawn(move || {
+                    let _ = stdin.write_all(&bytes);
+                })
+            });
+            (wait_or_kill(&mut child, timeout)?, Vec::new(), false)
+        }
+        ChildInput::Null | ChildInput::Inherit => {
+            (wait_or_kill(&mut child, timeout)?, Vec::new(), false)
         }
     };
 
@@ -169,7 +225,100 @@ fn run_inner(
         stderr: stderr.bytes.clone(),
         stdout_truncated: stdout.truncated,
         stderr_truncated: stderr.truncated,
+        stdin_recorded,
+        stdin_diverged,
     })
+}
+
+fn wait_or_kill(child: &mut Child, timeout: Duration) -> std::io::Result<Option<ExitStatus>> {
+    match child.wait_timeout(timeout)? {
+        Some(status) => Ok(Some(status)),
+        None => {
+            // The group leader is still represented by this unreaped Child,
+            // so its pid/group id cannot have been recycled.
+            kill_tree(child);
+            let _ = child.wait();
+            Ok(None)
+        }
+    }
+}
+
+fn wait_with_stdin_tape(
+    child: &mut Child,
+    stdin: std::process::ChildStdin,
+    timeout: Duration,
+    requests: mpsc::Receiver<StdinRequest>,
+    replay: &[StdinEvent],
+    allow_current: bool,
+) -> std::io::Result<(Option<ExitStatus>, Vec<StdinEvent>, bool)> {
+    let mut replay_index = 0usize;
+    let mut recorded = Vec::new();
+    let mut diverged = false;
+    let mut child_stdin = Some(stdin);
+    let mut deadline = Instant::now() + timeout;
+
+    loop {
+        while let Ok(request) = requests.try_recv() {
+            let event = match request {
+                StdinRequest::Replay => match replay.get(replay_index) {
+                    Some(event) => {
+                        replay_index += 1;
+                        event.clone()
+                    }
+                    None => {
+                        diverged = true;
+                        StdinEvent {
+                            bytes: Vec::new(),
+                            eof: true,
+                        }
+                    }
+                },
+                StdinRequest::Current if allow_current && child_stdin.is_some() => {
+                    let mut bytes = Vec::new();
+                    let read = std::io::stdin().lock().read_until(b'\n', &mut bytes)?;
+                    // Waiting for a human is not execution time. Give the C
+                    // code a fresh deadline after every supplied line.
+                    deadline = Instant::now() + timeout;
+                    let event = StdinEvent {
+                        bytes,
+                        eof: read == 0,
+                    };
+                    recorded.push(event.clone());
+                    event
+                }
+                StdinRequest::Current => {
+                    let event = StdinEvent {
+                        bytes: Vec::new(),
+                        eof: true,
+                    };
+                    recorded.push(event.clone());
+                    event
+                }
+            };
+
+            let write_failed = !event.eof
+                && child_stdin.as_mut().is_none_or(|stdin| {
+                    stdin.write_all(&event.bytes).is_err() || stdin.flush().is_err()
+                });
+            if write_failed {
+                diverged = true;
+            }
+            if event.eof || write_failed {
+                // Dropping the last write handle is how scanf observes EOF.
+                child_stdin.take();
+            }
+        }
+        if let Some(status) = child.try_wait()? {
+            diverged |= replay_index != replay.len();
+            return Ok((Some(status), recorded, diverged));
+        }
+        if Instant::now() >= deadline {
+            kill_tree(child);
+            let _ = child.wait();
+            return Ok((None, recorded, diverged));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// Read `r` to exhaustion on a thread, into a bounded buffer the caller can

@@ -43,6 +43,12 @@ impl Ui {
         self.paint("1;31", &format!("Out[{n}]: "))
     }
 
+    /// Marker shown only when c-shell, rather than the C program, has to end
+    /// a partial terminal line before printing diagnostics, a value or prompt.
+    pub fn inserted_newline_marker(&self) -> String {
+        self.dim("↵")
+    }
+
     pub fn err(&self, s: &str) -> String {
         self.paint("31", s)
     }

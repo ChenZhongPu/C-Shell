@@ -20,6 +20,8 @@ pub const M_NEW: &str = "\x01\x02c-shell/new\x02\x01";
 pub const M_VAL: &str = "\x01\x02c-shell/val\x02\x01";
 /// Reaching this marker proves that the newest input returned normally.
 pub const M_DONE: &str = "\x01\x02c-shell/done\x02\x01";
+/// A wrapped stdin call requests one recorded or live line from the parent.
+pub const M_STDIN: &str = "\x01\x02c-shell/stdin\x02\x01";
 
 const HEADERS: &str = "\
 #include <stdio.h>
@@ -32,6 +34,7 @@ const HEADERS: &str = "\
 #include <stddef.h>
 #include <limits.h>
 #include <ctype.h>
+#include <stdarg.h>
 ";
 
 /// Value printing dispatches through `_Generic` on the *function*, not on the
@@ -157,6 +160,25 @@ static inline void cs_m_unknown(const volatile void *v)          { (void)v; fput
     fputs(m, stdout); fflush(stdout); \
     fputs(m, stderr); fflush(stderr); \
 } while (0)
+
+/* scanf is routed through a line-request marker. The parent supplies recorded
+   bytes while replaying and reads one fresh terminal line only for the newest
+   input. vscanf keeps format conversion and destination writes in libc. */
+static int cs_taped_scanf(const char *format, ...)
+{
+    int result;
+    va_list args;
+    fputs(CS_M_STDIN, stderr);
+    fflush(stderr);
+    va_start(args, format);
+    result = vscanf(format, args);
+    va_end(args);
+    return result;
+}
+#ifdef scanf
+#undef scanf
+#endif
+#define scanf cs_taped_scanf
 "##;
 
 /// Where a new input is spliced into the generated program.
@@ -182,6 +204,9 @@ pub struct Program {
     /// source excerpts outside these ranges and the new-input range are
     /// generated scaffolding and must not leak into the UI.
     pub session_line_ranges: Vec<(usize, usize)>,
+    /// Whether retained/current source contains a direct `scanf` token and
+    /// therefore needs the request-driven stdin tape transport.
+    pub uses_stdin_tape: bool,
     /// True when the input sits inside a `CS_PRINT((` or `CS_TYPE_NAME((`
     /// wrapper. MSVC's traditional preprocessor attributes diagnostics from a
     /// multi-line macro invocation to the invocation's *first* line — the
@@ -223,7 +248,13 @@ pub fn build_user_view(session: &Session) -> String {
         src.push('\n');
     }
     src.push_str("int main(void)\n{\n");
-    for stmt in &session.stmts {
+    for (index, stmt) in session.stmts.iter().enumerate() {
+        let events = session.stmt_stdin_event_count(index);
+        if events > 0 {
+            src.push_str(&format!(
+                "    /* stdin tape: {events} captured request(s); contents hidden */\n"
+            ));
+        }
         src.push_str(stmt);
         src.push('\n');
     }
@@ -276,6 +307,13 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor) -> Program {
         BuildFlavor::ReplaceFile(index) => Some(index),
         _ => None,
     };
+    let uses_stdin_tape = session
+        .file_items
+        .iter()
+        .chain(session.stmts.iter())
+        .map(String::as_str)
+        .chain(std::iter::once(input))
+        .any(|source| lex::contains_code_identifier(source, "scanf"));
     let mut src = String::with_capacity(4096);
     let mut new_start_line = 1usize;
     let mut session_line_ranges = Vec::new();
@@ -285,6 +323,7 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor) -> Program {
     src.push_str(&format!("#define CS_M_NEW \"{}\"\n", escape(M_NEW)));
     src.push_str(&format!("#define CS_M_VAL \"{}\"\n", escape(M_VAL)));
     src.push_str(&format!("#define CS_M_DONE \"{}\"\n", escape(M_DONE)));
+    src.push_str(&format!("#define CS_M_STDIN \"{}\"\n", escape(M_STDIN)));
     src.push_str(RUNTIME);
 
     for (index, item) in session.file_items.iter().enumerate() {
@@ -366,6 +405,7 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor) -> Program {
         new_start_line,
         new_line_count,
         session_line_ranges,
+        uses_stdin_tape,
         wrapped: slot == Slot::Expr && !silent_expr,
     }
 }
@@ -1133,10 +1173,16 @@ mod tests {
         let mut session = Session::default();
         session.commit("int twice(int x) { return x * 2; }", Slot::FileScope);
         session.commit("int value = 21;", Slot::Stmt);
+        session.attach_stdin_events(vec![crate::proc::StdinEvent {
+            bytes: b"secret input\n".to_vec(),
+            eof: false,
+        }]);
         let src = build_user_view(&session);
         assert!(src.contains("int twice(int x)"));
         assert!(src.contains("int main(void)"));
         assert!(src.contains("int value = 21;"));
+        assert!(src.contains("stdin tape: 1 captured request(s); contents hidden"));
+        assert!(!src.contains("secret input"));
         assert!(!src.contains("CS_PRINT"));
         assert!(!src.contains("CS_MARK"));
     }

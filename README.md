@@ -5,7 +5,7 @@ behaves, skip the new-file / write-`main` / compile / run loop — just type it
 at the prompt.
 
 ```
-c-shell 0.1.2  ·  cc (GCC) 16.1.1 (default std gnu23)
+c-shell 0.2.0  ·  cc (GCC) 16.1.1 (default std gnu23)
 In [1]: int x = 41;
 In [2]: x + 1
 Out[2]: 42
@@ -187,15 +187,17 @@ formatted with `clang-format` when available; formatting is presentation only,
 has a three-second deadline, and evaluation still compiles the unformatted
 generated source.
 
-`%edit` edits the most recent C input; `%edit 12` retrieves `In[12]`. Numbered
-C inputs—including failed compilations and forgotten pure queries—remain
-addressable until `%reset`. The selected text is written to a temporary `.c`
-file and opened with `$VISUAL` or `$EDITOR` (falling back to `vi` on Unix and
-`notepad` on Windows), then submitted as a fresh `In[n]`; the original numbered
-input is unchanged. The edited block is also placed at the top of process-local
-Up/Down recall. An unchanged or empty file cancels. Editing is interactive-only;
-a previously accepted declaration follows the normal shadowing or file-scope
-replacement rules when resubmitted.
+`%edit` copies the most recent C input into the terminal prompt; `%edit 12`
+retrieves `In[12]`. Numbered C inputs—including failed compilations and
+forgotten pure queries—remain addressable until `%reset`. The command itself
+does not compile, submit or consume an input number: it returns to the same
+`In[n]` prompt with the selected text pre-filled and the cursor at its end.
+Modify it with the normal line-editor keys and press Enter when ready; even
+unchanged text is submitted only at that point as a fresh `In[n]`, while the
+original numbered input remains unchanged. Ctrl-C or clearing the buffer
+cancels naturally. The eventual submitted block enters process-local Up/Down
+recall and follows the normal shadowing or file-scope replacement rules.
+`%edit` is available only in the interactive REPL.
 
 `%type <expression>` reports the expression type without evaluating that
 expression, committing code or consuming an `In[n]` number:
@@ -248,6 +250,17 @@ compiler-approved redeclaration starts a nested shadowing scope that encloses
 later statements. Items recognized as file-scope code are emitted above
 `main`, and approved redefinitions replace an older item in place. There is
 no separate symbol table or declaration/initializer state store.
+
+**`scanf` uses a session-local stdin tape.** Direct calls are routed through a
+small `vscanf` wrapper. Each dynamic call in the newest input requests one
+fresh line, which is retained only in memory; historical calls receive those
+recorded lines and never reconnect to the terminal. Calls inside functions,
+recursion and loops therefore replay in their original order. `%src` annotates
+the associated statement with only a request count—the bytes remain hidden.
+`%undo` and `%reset` remove the matching tape, and no tape is written to a
+history file. If function replacement or changed control flow consumes a
+different number of requests, evaluation stops with an explicit stdin-tape
+divergence instead of silently prompting or waiting for the normal timeout.
 
 **Classification uses a small heuristic plus trial compilation.** A lexical
 heuristic routes function definitions, preprocessor directives, typedefs and
@@ -319,11 +332,18 @@ version. Expired or malformed entries simply cause fresh probes.
 - **Execution is not sandboxed.** Compilers and generated programs run with
   c-shell's user permissions and working directory. Do not evaluate untrusted
   code.
-- **Side effects replay.** Every evaluation reruns retained statements, so
-  input, file and process changes can repeat silently. Calls to known APIs such
-  as `fopen`, `fprintf`, `remove`, `rename` and `system` produce a one-time
-  English warning before execution. Detection is lexical and finite: wrappers
-  and application-defined side effects can still escape it.
+- **Most external side effects still replay.** Direct standard `scanf` calls
+  use the stdin tape above, but file and process changes still repeat. Calls to
+  known APIs such as `fopen`, `fprintf`, `remove`, `rename` and `system`
+  produce a one-time English warning before execution. Detection is lexical
+  and finite: wrappers and application-defined effects can still escape it.
+- **The stdin tape currently wraps `scanf`, not every input API.** `fscanf`,
+  `fgets`, `getchar`, raw `read(0, ...)`, an explicit `#undef scanf`, and code
+  inside a precompiled library are not captured yet. One line is supplied per
+  dynamic `scanf` request; programs that require multiple interactive lines in
+  a single call should put the values on one line. In piped-REPL mode stdin is
+  carrying C source, so a current `scanf` receives EOF; use `-e`, `--script`,
+  or an interactive terminal when the evaluated program needs stdin.
 - **Rebinding is C shadowing, not assignment.** A redeclared local lives in a
   nested block. Its declarator is already in scope during its initializer, so
   `int x = x + 1;` does not read the outer `x`. File-scope replacement also
@@ -344,9 +364,11 @@ version. Expired or malformed entries simply cause fresh probes.
   aggregate table is shown as `<unprintable>` rather than being coerced.
 - **Program output is bounded.** When stdin is a real terminal, output from
   the newest input is streamed immediately, so a prompt before `scanf` is
-  visible. With non-terminal stdin it remains buffered for deterministic
-  transcripts. Capture is limited to 8 MiB per stream; an overflow is
-  reported and the input is not committed.
+  visible. If the program leaves a partial line, c-shell appends a dim `↵`
+  marker and the protective newline it inserted; a real `\n` needs no marker.
+  With non-terminal stdin output remains buffered for deterministic transcripts
+  and receives no marker. Capture is limited to 8 MiB per stream; an overflow
+  is reported and the input is not committed.
 - **Timeout cleanup follows the launched process tree.** On Unix the process
   group is killed when the direct child times out, but a child that detaches
   or outlives a parent that exits successfully can escape cleanup. Windows

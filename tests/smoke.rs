@@ -41,6 +41,72 @@ fn run_with_timeout(secs: u32, lines: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+fn run_evals_with_stdin(codes: &[&str], input: &str) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_c-shell"));
+    command.arg("--no-color");
+    for code in codes {
+        command.args(["-e", code]);
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start c-shell -e with program stdin");
+    child
+        .stdin
+        .take()
+        .expect("program stdin")
+        .write_all(input.as_bytes())
+        .expect("write program stdin");
+    child.wait_with_output().expect("wait for c-shell -e")
+}
+
+#[test]
+fn scanf_stdin_tape_replays_functions_and_loops_without_reading_again() {
+    let output = run_evals_with_stdin(
+        &[
+            "int read_number(void) { int value; scanf(\"%d\", &value); return value; }",
+            "int first = read_number();",
+            "int second = 0; for (int k = 0; k < 2; ++k) { second += read_number(); }",
+            "first + second",
+        ],
+        "3\n4\n5\n",
+    );
+    assert!(
+        output.status.success(),
+        "stdin tape session failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "12");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("external side-effect"),
+        "supported scanf still used the generic replay warning"
+    );
+
+    let divergent = run_evals_with_stdin(
+        &[
+            "int read_once(void) { int value; scanf(\"%d\", &value); return value; }",
+            "int kept = read_once();",
+            "int read_once(void) { return 99; }",
+            "kept",
+        ],
+        "3\n",
+    );
+    assert!(!divergent.status.success(), "divergent tape was accepted");
+    assert!(
+        String::from_utf8_lossy(&divergent.stderr).contains("stdin tape diverged"),
+        "missing divergence diagnostic:\n{}",
+        String::from_utf8_lossy(&divergent.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&divergent.stdout).trim(),
+        "3",
+        "rejected replacement corrupted the retained tape/session"
+    );
+}
+
 #[test]
 fn evaluates_expressions_against_session_state() {
     let out = run(&["int x = 41;", "x + 1"]);
@@ -532,6 +598,16 @@ fn edit_without_previous_or_matching_c_input_is_safe() {
         missing.contains("no C input In[7]"),
         "missing numbered input was not diagnosed:\n{missing}"
     );
+
+    let batch = run(&["1 + 1", "%edit 1", "2 + 2"]);
+    assert!(
+        batch.contains("%edit is available only in interactive REPL mode"),
+        "batch edit did not explain that no prompt can be pre-filled:\n{batch}"
+    );
+    assert!(
+        batch.contains("Out[2]: 4"),
+        "batch edit consumed an input number or stopped the session:\n{batch}"
+    );
 }
 
 #[test]
@@ -645,4 +721,16 @@ fn program_output_is_shown_once() {
     let out = run(&["puts(\"marker-once\");", "1 + 1"]);
     let hits = out.matches("marker-once").count();
     assert_eq!(hits, 1, "output replayed {hits} times:\n{out}");
+
+    // The visible partial-line marker is terminal UI, never program output in
+    // a deterministic script/pipe transcript.
+    let partial = run(&["printf(\"partial\");", "1 + 1"]);
+    assert!(
+        partial.contains("partial\n"),
+        "partial output lost:\n{partial}"
+    );
+    assert!(
+        !partial.contains('↵'),
+        "TTY marker leaked into pipe:\n{partial}"
+    );
 }

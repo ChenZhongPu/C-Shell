@@ -4,7 +4,7 @@ Settled architecture decisions, the one big open problem, and the traps buried
 in the code that you must know about before changing it. README is for users;
 this file is for whoever develops the tool next.
 
-Status: v0.1.2 working. ~5700 lines of Rust, 97 tests (61 unit + 36
+Status: v0.2.0 working. ~6200 lines of Rust, 101 tests (64 unit + 37
 end-to-end smoke), clippy/fmt clean, English UI. Verified on Linux with gcc
 16.1.1 and clang 22.1.6. CI exercises the default macOS compiler and two
 Windows driver dialects (a GNU-style driver and MSVC); see
@@ -23,10 +23,10 @@ Windows driver dialects (a GNU-style driver and MSVC); see
 | `lex.rs` | byte-level scan: bracket balance, literals/comments, purity and identifier heuristics |
 | `errmap.rs` | diagnostic provenance/remapping, scaffolding removal, stale-warning filtering |
 | `tests/smoke.rs` | end-to-end tests driving the real binary and compiler |
-| `proc.rs` | child deadlines, output capture and timeout-path process-tree cleanup |
-| `magic.rs` | `%` commands, `$EDITOR` integration and optional `clang-format` presentation |
+| `proc.rs` | child deadlines, output capture, request-driven stdin tape transport and timeout-path process-tree cleanup |
+| `magic.rs` | `%` commands, numbered-input lookup and optional `clang-format` presentation |
 | `codegen.rs` | program assembly, shadowing/replacement variants, `_Generic` runtimes |
-| `session.rs` | session state, shadowing scopes, file-item replacement, undo and completion vocabulary |
+| `session.rs` | session state, in-memory stdin tape, shadowing scopes, file-item replacement, undo and completion vocabulary |
 | `ui.rs` | terminal styling, startup banner |
 
 Implemented: expression evaluation with value printing, statements, automatic
@@ -36,8 +36,8 @@ pass-through, diagnostic remapping, completion-marker validation, live
 terminal output with bounded capture, crash reporting and timeout handling,
 one-per-session external-side-effect replay warnings, missing-semicolon repair,
 syntax-impossible expression-trial elision, generated-diagnostic sanitizing,
-pointer-safe recursive struct printing, actionable rejection of user-defined
-`main`, compiler-validated local
+pointer-safe recursive struct printing, request-driven `scanf` stdin replay,
+actionable rejection of user-defined `main`, compiler-validated local
 shadowing and file-scope replacement, blank-line
 confirmation for a completed interactive `if`, `if`/`else` batch lookahead,
 control/do-while/preprocessor continuation, tab completion (magics, C keywords,
@@ -118,14 +118,30 @@ item. This is C shadowing rather than assignment (`int x = x + 1;` sees the
 new `x` in its initializer), and retained earlier calls bind to a replaced
 function; both consequences are shown honestly by `%src`.
 
-**Warn once before known external side effects can enter replay.**
+**Direct `scanf` uses a request-driven, session-local stdin tape.** RUNTIME
+rebinds `scanf` to `cs_taped_scanf`, which emits `M_STDIN` before delegating to
+`vscanf`. `LiveFilter` classifies each request as historical (before `M_NEW`)
+or current. `proc` gives the child a pipe rather than the real terminal:
+historical requests receive `Session::stdin_tape` events, while a current
+request synchronously reads and records one fresh line. Human wait time resets
+the execution deadline. Events attach only after `M_DONE`, are removed by
+`%undo`/`%reset`, stay memory-only, and `%src` exposes only a redacted count.
+Functions and loops work because requests are dynamic; a changed request count
+marks the run divergent and never falls through to real stdin. This first
+portable adapter deliberately covers direct standard `scanf`, one line per
+call—not `fscanf`, `fgets`, `getchar`, raw fd reads, `#undef scanf`, or calls
+inside precompiled libraries. Piped-REPL stdin is C source and cannot also be
+program input; TTY, `-e`, and script modes can supply current lines.
+
+**Warn once before other known external side effects can enter replay.**
 `lex::external_replay_calls` recognizes a conservative list of standard/POSIX
 file, input, environment and process APIs while ignoring comments and string
-literals. `submit` prints an English warning before evaluation; the Session
-flag is set only after that input completes and is retained, so a failed or
-crashing attempt cannot consume the warning. `%reset` starts a fresh warning
-epoch. This is mitigation, not safety: wrappers, function pointers and unknown
-application APIs remain invisible without interprocedural analysis.
+literals; supported direct `scanf` is removed from that warning. `submit`
+prints an English warning before evaluation; the Session flag is set only
+after that input completes and is retained, so a failed or crashing attempt
+cannot consume the warning. `%reset` starts a fresh warning epoch. This is
+mitigation, not safety: wrappers, function pointers and unknown application
+APIs remain invisible without interprocedural analysis.
 
 **Forget only bare expressions judged pure.** A bare expression is normally a
 question and is forgotten after its value is printed. Bare assignments,
@@ -152,16 +168,17 @@ printers and protocol markers. `%src --raw` keeps the complete compiler input
 for debugging. Both are presentation-formatted under the existing
 three-second `clang-format` deadline.
 
-**`%edit [n]` resubmits a numbered C input, not a persistent transcript.** With
-no argument it selects the latest input; an argument indexes the current
-session's one-based `In[n]` archive. The text is copied to a temporary `.c` file
-and opened with `$VISUAL`, then `$EDITOR`, then the platform fallback. Saving
-changed nonempty text returns `Action::Submit`, which re-enters the normal
-submit/evaluate/commit path and receives a fresh number without mutating the
-original archive entry; unchanged/empty files cancel. The edited block is also
-added to process-local Rustyline recall so Up retrieves it before the `%edit`
-command. Editing is disabled when stdin is not a terminal, and editor failure
-is reported without terminating the REPL.
+**`%edit [n]` pre-fills the terminal prompt; it does not submit by itself.**
+With no argument it selects the latest input; an argument indexes the current
+session's one-based `In[n]` archive. `magic::Action::Prefill` returns a copy to
+the interactive loop, which calls Rustyline's `readline_with_initial` at the
+same `In[n]` number with the cursor at the end. Only the user's later Enter
+re-enters the normal submit/evaluate/commit path and receives a fresh number;
+even an unchanged buffer is not submitted by `%edit` itself, and the original
+archive entry is never mutated. Ctrl-C or an emptied buffer cancels through the
+ordinary line-editor path. The submitted block naturally enters process-local
+Up/Down recall. Batch, script and `-e` modes reject a valid prefill request
+because they have no interactive edit buffer.
 
 **The language standard follows the compiler's default; `_Generic` is the
 capability floor.** The original design forced `-std=c17` and was reversed:
@@ -232,10 +249,11 @@ best effort and can never prevent startup.
 
 ### Symptom
 
-Accumulate-and-replay replays side effects. `scanf` prompts the user again on
-every later evaluation, file writes repeat, and `%src` is an ever-growing
-ledger rather than the current state. Known external APIs now trigger a
-one-time warning, but that cannot make replay safe. (`rand()` is fine: without
+Accumulate-and-replay replays side effects. Direct `scanf` now consumes a
+private recorded line tape instead of prompting again, but other input APIs
+and file/process writes still repeat, and `%src` is an ever-growing ledger
+rather than the current state. Known external APIs trigger a one-time warning,
+but that cannot make replay safe. (`rand()` is fine: without
 `srand` it is deterministic in C.)
 
 Goal: closer to Python — the session holds *current state*, not a replay
@@ -331,8 +349,9 @@ Three traps already identified for that design:
 3. **VLAs cannot persist** (size unknown at compile time — no slot for them);
    block-scope ones that die within a step are unaffected.
 
-Staging: v0.2 stdin recording + journal polish (the recovery layer — nothing
-wasted regardless of what follows) → v0.3 tree-sitter declaration parsing
+Staging: v0.2.x broadens the current direct-`scanf` tape to a real stdin
+stream adapter + journal polish (the recovery layer — nothing wasted regardless of
+what follows) → v0.3 tree-sitter declaration parsing
 (first used for better classification, exact aliases and declarator-aware
 rewrites) → v0.4 the slot-runner hot path, feature-gated alongside replay.
 
@@ -529,15 +548,20 @@ an unrelated process group.
 **Live output filtering must work across arbitrary pipe chunks** (`eval.rs`,
 `LiveFilter`). Replay output before `M_NEW`, value bytes after `M_VAL`, and
 protocol markers are suppressed; only the newest input's own stdout/stderr is
-forwarded. Retain only a trailing byte sequence that is an actual marker
-prefix. Retaining `marker.len() - 1` bytes unconditionally delays short prompts
-such as `"name: "` and defeats the purpose of streaming before `scanf`.
-Because streamed bytes are no longer present in `Outcome::output`, the filter
-also records whether the last visible byte was `\n`; the renderer must insert
-one before warnings, `Out[n]` or the next rustyline prompt. Otherwise a prompt
-can repaint a no-newline `printf` out of view, or the value appears as
-`textOut[n]`. Capture remains bounded at `proc::MAX_CAPTURE_BYTES`, but readers must keep
-draining and discard excess bytes or the child will deadlock on a full pipe.
+forwarded. `M_STDIN` is different: stderr occurrences before/after `M_NEW`
+become replay/current requests on an mpsc channel and are never rendered.
+Every marker parser must retain only a trailing byte sequence that is an actual
+marker prefix. Retaining `marker.len() - 1` bytes unconditionally delays short
+prompts such as `"name: "` and defeats live interaction before `scanf`.
+Because streamed bytes are no longer present in `Outcome::output`, both stream
+observers serialize terminal writes through `TerminalVisibility`, which records
+the actual last visible byte across interleaved stdout/stderr. If it is not
+`\n`, the renderer appends a dim `↵` and a protective newline before warnings,
+`Out[n]` or the next prompt. A real program newline has no marker; adding an
+extra blank line there would falsely depict two newlines. Batch transcripts
+retain the old marker-free deterministic rendering. Capture remains bounded at
+`proc::MAX_CAPTURE_BYTES`, but readers must keep draining and discard excess
+bytes or the child will deadlock on a full pipe.
 
 **An input must reach `M_DONE` before it is committed** (`codegen.rs`,
 `eval.rs`, `main.rs`). Exit status zero is insufficient: `exit(0)`, `_Exit`
