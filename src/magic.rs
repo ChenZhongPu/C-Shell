@@ -85,7 +85,8 @@ Commands:
 Notes:
   A bare expression prints its value; a trailing ';' runs it silently.
   A completed if waits for a blank continuation line; type else / else if
-  there instead to continue it. Other closed blocks submit immediately.
+  there instead to continue it. Other closed blocks submit immediately, but
+  a struct/union/enum definition waits for its mandatory trailing ';'.
   Function definitions, #include and typedef go to file scope automatically.
   %edit n can reopen any C In[n] from this session, including a failed one;
   it only fills the next prompt. Modify it and press Enter to submit it under

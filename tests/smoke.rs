@@ -506,6 +506,19 @@ fn piped_stdin_accumulates_multi_line_definitions() {
     // interactive validator provides at a terminal.
     let out = run(&["int sq(int a)", "{", "    return a * a;", "}", "sq(9)"]);
     assert!(out.contains("Out[2]: 81"), "unexpected output:\n{out}");
+
+    // A tag's closing brace does not complete its declaration: the following
+    // semicolon must stay in the same input rather than becoming a new In[n].
+    let tag = run(&[
+        "struct P { int x; int y; }",
+        ";",
+        "struct P point = { 3, 4 };",
+        "point",
+    ]);
+    assert!(
+        tag.contains("Out[3]: { .x = 3, .y = 4 }"),
+        "tag definition was submitted before its semicolon:\n{tag}"
+    );
 }
 
 #[test]

@@ -210,14 +210,16 @@ pub fn is_structurally_incomplete(input: &str) -> bool {
         || lex::awaits_body(input)
         || control_header_awaits_body(input)
         || do_awaits_while(input)
+        || tag_definition_awaits_semicolon(input)
 }
 
 /// Is this interactive input still waiting for more lines?
 ///
 /// C cannot tell whether a complete `if` will be followed by `else`. A
 /// completed leading `if` therefore needs a blank continuation line to confirm
-/// submission. Other constructs (functions, loops, structs, initializers)
-/// submit as soon as their required syntax closes.
+/// submission. Functions and control blocks submit as soon as their required
+/// syntax closes; a braced struct/union/enum definition remains structurally
+/// incomplete until its mandatory declaration semicolon.
 ///
 /// Single source of truth, shared by the validator and Enter handler.
 pub fn is_incomplete(input: &str) -> bool {
@@ -348,6 +350,94 @@ fn do_awaits_while(input: &str) -> bool {
         .find(|&i| sc.code[i] && !b[i].is_ascii_whitespace())
         .is_some_and(|i| b[i] == b';');
     !saw_while || !ends_with_semicolon
+}
+
+/// A braced tag specifier is still a declaration and therefore cannot finish
+/// at its `}`. Keep the editor open for `;` (or a declarator followed by `;`).
+/// Restrict this to declaration-shaped prefixes so compound literals such as
+/// `(struct P){1, 2}` remain complete expressions, and a function returning a
+/// previously declared struct still submits at its body brace.
+fn tag_definition_awaits_semicolon(input: &str) -> bool {
+    const TAGS: &[&str] = &["struct", "union", "enum"];
+
+    let sc = lex::scan(input);
+    if sc.depth != 0 || sc.unterminated {
+        return false;
+    }
+    let b = input.as_bytes();
+    let Some(first) = next_code_nonspace(b, &sc.code, 0) else {
+        return false;
+    };
+    let Some((first_word, first_end)) = code_identifier(input, &sc.code, first) else {
+        return false;
+    };
+    let Some(last) = (0..b.len())
+        .rev()
+        .find(|&i| sc.code[i] && !b[i].is_ascii_whitespace())
+    else {
+        return false;
+    };
+    if b[last] == b';' {
+        return false;
+    }
+
+    if TAGS.contains(&first_word) {
+        return tag_word_is_followed_by_brace(input, &sc.code, first_end);
+    }
+    if first_word != "typedef" {
+        return false;
+    }
+
+    // Qualifiers may occur between `typedef` and the tag keyword. Search code
+    // identifiers only; comments and string contents are invisible.
+    let mut i = first_end;
+    while let Some(next) = next_code_nonspace(b, &sc.code, i) {
+        let Some((word, end)) = code_identifier(input, &sc.code, next) else {
+            i = next + 1;
+            continue;
+        };
+        if TAGS.contains(&word) && tag_word_is_followed_by_brace(input, &sc.code, end) {
+            return true;
+        }
+        i = end;
+    }
+    false
+}
+
+fn tag_word_is_followed_by_brace(input: &str, code: &[bool], word_end: usize) -> bool {
+    let b = input.as_bytes();
+    let Some(mut next) = next_code_nonspace(b, code, word_end) else {
+        return false;
+    };
+    // The tag name is optional (`typedef struct { ... } Name;`).
+    if let Some((_, end)) = code_identifier(input, code, next) {
+        let Some(after_name) = next_code_nonspace(b, code, end) else {
+            return false;
+        };
+        next = after_name;
+    }
+    b.get(next) == Some(&b'{')
+}
+
+fn next_code_nonspace(bytes: &[u8], code: &[bool], mut from: usize) -> Option<usize> {
+    while from < bytes.len() && (!code[from] || bytes[from].is_ascii_whitespace()) {
+        from += 1;
+    }
+    (from < bytes.len()).then_some(from)
+}
+
+fn code_identifier<'a>(input: &'a str, code: &[bool], start: usize) -> Option<(&'a str, usize)> {
+    let b = input.as_bytes();
+    if !code.get(start).copied().unwrap_or(false)
+        || !(b[start] == b'_' || b[start].is_ascii_alphabetic())
+    {
+        return None;
+    }
+    let mut end = start + 1;
+    while end < b.len() && code[end] && (b[end] == b'_' || b[end].is_ascii_alphanumeric()) {
+        end += 1;
+    }
+    Some((&input[start..end], end))
 }
 
 impl Validator for CHelper {
@@ -516,8 +606,25 @@ mod tests {
         let function = "int f(void)\n{\n  return 1;\n}";
         assert!(!is_structurally_incomplete(function));
         assert!(!is_incomplete(function));
+        assert!(!is_incomplete("struct P *make(void) {\n  return 0;\n}"));
         assert!(!is_incomplete("while (0) {\n}"));
         assert!(!is_incomplete("do {\n} while (0);"));
+    }
+
+    #[test]
+    fn braced_tag_definitions_wait_for_their_semicolon() {
+        let definition = "struct P { int x; int y; }";
+        assert!(is_structurally_incomplete(definition));
+        assert!(is_incomplete(definition));
+        assert!(!is_incomplete(&format!("{definition};")));
+        assert!(is_incomplete("typedef union { int i; double d; } Value"));
+        assert!(is_incomplete("enum Color { RED, GREEN }"));
+
+        // These braces do not end a tag declaration.
+        assert!(!is_incomplete("(struct P){ 1, 2 }"));
+        assert!(!is_incomplete(
+            "struct P make(void) { return (struct P){0}; }"
+        ));
     }
 
     #[test]

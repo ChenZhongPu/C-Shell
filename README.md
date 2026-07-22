@@ -102,10 +102,12 @@ unsupported explicit `--std` is an error both at startup and in `%std`.
 
 A completed interactive `if` uses blank-line confirmation: press Enter on the
 empty continuation line to submit it, or type `else` / `else if` there to
-continue the same statement. Functions, loops, structs and initializers submit
-directly when their required closing syntax is entered. Control headers with
-their body on the next line, mandatory `do ... while`, and conditional
-preprocessor groups through `#endif` are accumulated automatically. In scripts
+continue the same statement. Functions and loops submit directly when their
+required closing syntax is entered. A braced `struct`, `union` or `enum`
+definition remains open after `}` until its mandatory declaration semicolon is
+entered. Control headers with their body on the next line, mandatory
+`do ... while`, and conditional preprocessor groups through `#endif` are
+accumulated automatically. In scripts
 and pipes, one-line lookahead attaches `else` without requiring a blank line.
 
 c-shell generates its own `main` to host session locals and the output
@@ -380,6 +382,10 @@ version. Expired or malformed entries simply cause fresh probes.
 - No session save/load.
 - `cl.exe` needs an MSVC build environment with `INCLUDE`/`LIB` configured;
   a Developer Command Prompt is the usual way to obtain one.
+- **Windows testing is still limited.** CI covers GNU-style and MSVC compiler
+  drivers, but interactive behavior has not been extensively tested on real
+  Windows installations. Windows feedback and bug reports are very welcome;
+  please open an issue with the terminal and compiler details.
 
 ## Development
 

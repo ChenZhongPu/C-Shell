@@ -4,7 +4,7 @@ Settled architecture decisions, the one big open problem, and the traps buried
 in the code that you must know about before changing it. README is for users;
 this file is for whoever develops the tool next.
 
-Status: v0.2.0 working. ~6200 lines of Rust, 101 tests (64 unit + 37
+Status: v0.2.0 working. ~6200 lines of Rust, 102 tests (65 unit + 37
 end-to-end smoke), clippy/fmt clean, English UI. Verified on Linux with gcc
 16.1.1 and clang 22.1.6. CI exercises the default macOS compiler and two
 Windows driver dialects (a GNU-style driver and MSVC); see
@@ -482,19 +482,24 @@ it. `#include`/`#define` items are deliberately not replacement candidates.
 
 **Interactive completeness and batch completeness are different policies**
 (`editor.rs`). Structural checks cover open brackets/literals, function and
-control headers awaiting a body, mandatory `do ... while`, backslash
+control headers awaiting a body, the mandatory semicolon after a braced
+`struct`/`union`/`enum` definition, mandatory `do ... while`, backslash
 continuations and conditional preprocessor groups. Only a completed leading
 interactive `if` adds blank-line confirmation so it can still receive `else`;
-functions and other closed blocks submit immediately. Batch mode instead holds
-a complete leading `if` for one physical line of
-lookahead and submits it before an unrelated next line. Reusing the
+functions and ordinary closed blocks submit immediately. Batch mode instead
+holds a complete leading `if` for one physical line of lookahead and submits it
+before an unrelated next line. Reusing the
 interactive blank-line policy in scripts would accidentally merge the next C
 statement into the same input.
 
-**The validator must recognize a function signature awaiting its body**
-(`lex::awaits_body`). `int fact(int n)` has balanced brackets; without the
-check it is submitted immediately, then "repaired" with a semicolon into a
-forward declaration — functions in Allman style become impossible to type.
+**The validator must recognize syntax that is balanced but not complete.**
+`lex::awaits_body` catches `int fact(int n)`: without it, missing-semicolon
+repair turns an Allman-style signature into a forward declaration. Likewise,
+`editor::tag_definition_awaits_semicolon` keeps `struct P { int x; }` open after
+the balanced closing brace; submitting it immediately would put the required
+`;` at a new `In[n]`. The tag check is limited to declaration-shaped prefixes
+so `(struct P){1}` remains a complete compound-literal expression and
+`struct P f(void) { ... }` remains a complete function definition.
 
 **Diagnostic gutters need source provenance, not just renumbering**
 (`Program::session_line_ranges`, `errmap::remap_gutter`). Remapping only the
