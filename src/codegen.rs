@@ -1,9 +1,10 @@
 //! Assembling a complete C program from the session's accumulated input.
 //!
 //! The model is accumulate-and-replay: every evaluation rebuilds and reruns
-//! the whole program from scratch. Session variables are therefore just
-//! ordinary locals in `main` that get re-created on each run — no globals, no
-//! symbol table, no splitting of declarations from their initialisers.
+//! the whole program from scratch. Session variables are ordinary locals in
+//! `main`; compiler-approved redeclarations open nested shadowing scopes that
+//! enclose later statements. There is no symbol table and declarations are
+//! never split from their initialisers.
 //!
 //! The cost is that side effects replay too. Markers written into the output
 //! streams let the caller show only what the newest input produced.
@@ -27,6 +28,7 @@ const HEADERS: &str = "\
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <stddef.h>
 #include <limits.h>
 #include <ctype.h>
@@ -50,8 +52,56 @@ static inline void cs_p_i (long long v)          { CS_VAL(); printf("%lld\n", v)
 static inline void cs_p_u (unsigned long long v) { CS_VAL(); printf("%llu\n", v); }
 static inline void cs_p_d (double v)             { CS_VAL(); printf("%g\n", v); }
 static inline void cs_p_ld(long double v)        { CS_VAL(); printf("%Lg\n", v); }
-static inline void cs_p_s (const char *v)        { CS_VAL(); if (v) printf("\"%s\"\n", v); else printf("(null)\n"); }
-static inline void cs_p_p (const void *v)        { CS_VAL(); printf("%p\n", (void *)v); }
+static inline void cs_p_s (const char *v)        { CS_VAL(); if (v) printf("\"%s\"\n", v); else printf("NULL\n"); }
+static inline void cs_p_p (const void *v)        { CS_VAL(); if (v) printf("0x%" PRIxPTR "\n", (uintptr_t)v); else printf("NULL\n"); }
+
+/* Struct-member formatting is deliberately different from top-level value
+   formatting: a char pointer member is an address, never an implicit %s
+   dereference. Generated struct printers extend the two empty association
+   lists below after the user's type definitions are visible. */
+static inline void cs_m_b (const volatile _Bool *v)              { printf("%s", *v ? "true" : "false"); }
+static inline void cs_m_c (const volatile char *v)               { printf("%d", (int)*v); }
+static inline void cs_m_sc(const volatile signed char *v)        { printf("%lld", (long long)*v); }
+static inline void cs_m_uc(const volatile unsigned char *v)      { printf("%llu", (unsigned long long)*v); }
+static inline void cs_m_s (const volatile short *v)              { printf("%lld", (long long)*v); }
+static inline void cs_m_us(const volatile unsigned short *v)     { printf("%llu", (unsigned long long)*v); }
+static inline void cs_m_i (const volatile int *v)                { printf("%lld", (long long)*v); }
+static inline void cs_m_ui(const volatile unsigned int *v)       { printf("%llu", (unsigned long long)*v); }
+static inline void cs_m_l (const volatile long *v)               { printf("%lld", (long long)*v); }
+static inline void cs_m_ul(const volatile unsigned long *v)      { printf("%llu", (unsigned long long)*v); }
+static inline void cs_m_ll(const volatile long long *v)          { printf("%lld", (long long)*v); }
+static inline void cs_m_ull(const volatile unsigned long long *v){ printf("%llu", (unsigned long long)*v); }
+static inline void cs_m_f (const volatile float *v)              { printf("%g", (double)*v); }
+static inline void cs_m_d (const volatile double *v)             { printf("%g", *v); }
+static inline void cs_m_ld(const volatile long double *v)        { printf("%Lg", *v); }
+static inline void cs_m_unknown(const volatile void *v)          { (void)v; fputs("<unprintable>", stdout); }
+
+#define CS_MEMBER_REF_TYPES(T, F)                                        \
+    T *: F, const T *: F, volatile T *: F, const volatile T *: F
+#define CS_AGG_PRINT_ASSOCIATIONS
+#define CS_AGG_MEMBER_ASSOCIATIONS
+#define CS_MEMBER_REF(x) _Generic(&(x),                                  \
+    CS_MEMBER_REF_TYPES(_Bool, cs_m_b),                                  \
+    CS_MEMBER_REF_TYPES(char, cs_m_c),                                   \
+    CS_MEMBER_REF_TYPES(signed char, cs_m_sc),                           \
+    CS_MEMBER_REF_TYPES(unsigned char, cs_m_uc),                         \
+    CS_MEMBER_REF_TYPES(short, cs_m_s),                                  \
+    CS_MEMBER_REF_TYPES(unsigned short, cs_m_us),                        \
+    CS_MEMBER_REF_TYPES(int, cs_m_i),                                    \
+    CS_MEMBER_REF_TYPES(unsigned int, cs_m_ui),                          \
+    CS_MEMBER_REF_TYPES(long, cs_m_l),                                   \
+    CS_MEMBER_REF_TYPES(unsigned long, cs_m_ul),                         \
+    CS_MEMBER_REF_TYPES(long long, cs_m_ll),                             \
+    CS_MEMBER_REF_TYPES(unsigned long long, cs_m_ull),                   \
+    CS_MEMBER_REF_TYPES(float, cs_m_f),                                  \
+    CS_MEMBER_REF_TYPES(double, cs_m_d),                                 \
+    CS_MEMBER_REF_TYPES(long double, cs_m_ld),                           \
+    CS_AGG_MEMBER_ASSOCIATIONS                                           \
+    default: cs_m_unknown)(&(x))
+#define CS_MEMBER_PTR(x) do {                                            \
+    if ((x) == 0) fputs("NULL", stdout);                                \
+    else printf("(void *)0x%" PRIxPTR, (uintptr_t)(x));                 \
+} while (0)
 
 #define CS_PRINT(x) _Generic((x),                                        \
     _Bool: cs_p_b,              char: cs_p_c,                            \
@@ -63,6 +113,7 @@ static inline void cs_p_p (const void *v)        { CS_VAL(); printf("%p\n", (voi
     float: cs_p_d,              double: cs_p_d,                          \
     long double: cs_p_ld,                                                \
     char *: cs_p_s,             const char *: cs_p_s,                    \
+    CS_AGG_PRINT_ASSOCIATIONS                                            \
     default: cs_p_p)(x)
 
 /* C has no general type reflection.  This portable _Generic table reports
@@ -127,6 +178,10 @@ pub struct Program {
     /// How many lines that text occupies, so diagnostics landing just past it
     /// are not misattributed to the user.
     pub new_line_count: usize,
+    /// Line ranges occupied by earlier retained user inputs. Diagnostics and
+    /// source excerpts outside these ranges and the new-input range are
+    /// generated scaffolding and must not leak into the UI.
+    pub session_line_ranges: Vec<(usize, usize)>,
     /// True when the input sits inside a `CS_PRINT((` or `CS_TYPE_NAME((`
     /// wrapper. MSVC's traditional preprocessor attributes diagnostics from a
     /// multi-line macro invocation to the invocation's *first* line — the
@@ -135,34 +190,95 @@ pub struct Program {
     pub wrapped: bool,
 }
 
+#[derive(Clone, Copy)]
+enum BuildFlavor {
+    Normal(Slot),
+    SilentExpr,
+    TypeProbe,
+    ScopedStmt,
+    ReplaceFile(usize),
+}
+
+impl BuildFlavor {
+    fn slot(self) -> Slot {
+        match self {
+            Self::Normal(slot) => slot,
+            Self::SilentExpr | Self::TypeProbe => Slot::Expr,
+            Self::ScopedStmt => Slot::Stmt,
+            Self::ReplaceFile(_) => Slot::FileScope,
+        }
+    }
+}
+
+/// Render only the C program a user conceptually assembled: retained
+/// file-scope inputs plus retained statements in `main`. Runtime printers and
+/// protocol markers belong to `%src --raw`, not the default source view.
+pub fn build_user_view(session: &Session) -> String {
+    let mut src = String::new();
+    for item in &session.file_items {
+        src.push_str(item);
+        src.push('\n');
+    }
+    if !session.file_items.is_empty() {
+        src.push('\n');
+    }
+    src.push_str("int main(void)\n{\n");
+    for stmt in &session.stmts {
+        src.push_str(stmt);
+        src.push('\n');
+    }
+    for _ in 0..session.scope_depth {
+        src.push_str("    }\n");
+    }
+    src.push_str("}\n");
+    src
+}
+
 /// Build the program for evaluating `input` in `slot` against `session`.
 pub fn build(session: &Session, input: &str, slot: Slot) -> Program {
-    build_inner(session, input, slot, false, false)
+    build_inner(session, input, BuildFlavor::Normal(slot))
+}
+
+/// Retry a block-scope declaration inside a fresh nested scope. If the real
+/// compiler accepts this after rejecting the normal assembly, later inputs
+/// remain in that scope and see the new binding.
+pub fn build_scoped_stmt(session: &Session, input: &str) -> Program {
+    build_inner(session, input, BuildFlavor::ScopedStmt)
+}
+
+/// Retry a file-scope definition by substituting it for one existing item at
+/// the same index. The compiler, not a name parser, decides which candidate
+/// replacement makes the whole session valid.
+pub fn build_file_replacement(session: &Session, input: &str, index: usize) -> Program {
+    build_inner(session, input, BuildFlavor::ReplaceFile(index))
 }
 
 /// Build a program that evaluates an expression without trying to print it.
 /// Used only after the normal value-printer trial failed, to distinguish an
 /// unsupported value category (struct/complex/void/etc.) from invalid C.
 pub fn build_expr_probe(session: &Session, input: &str) -> Program {
-    build_inner(session, input, Slot::Expr, true, false)
+    build_inner(session, input, BuildFlavor::SilentExpr)
 }
 
 /// Build a non-mutating `%type` query. `_Generic` selects a type-name string
 /// without evaluating `input`; M_VAL keeps the result out of live program
 /// output so the magic renderer can print it itself.
 pub fn build_type_probe(session: &Session, input: &str) -> Program {
-    build_inner(session, input, Slot::Expr, false, true)
+    build_inner(session, input, BuildFlavor::TypeProbe)
 }
 
-fn build_inner(
-    session: &Session,
-    input: &str,
-    slot: Slot,
-    silent_expr: bool,
-    type_probe: bool,
-) -> Program {
+fn build_inner(session: &Session, input: &str, flavor: BuildFlavor) -> Program {
+    let slot = flavor.slot();
+    let silent_expr = matches!(flavor, BuildFlavor::SilentExpr);
+    let type_probe = matches!(flavor, BuildFlavor::TypeProbe);
+    let scoped_stmt = matches!(flavor, BuildFlavor::ScopedStmt);
+    let file_replacement = match flavor {
+        BuildFlavor::ReplaceFile(index) => Some(index),
+        _ => None,
+    };
     let mut src = String::with_capacity(4096);
     let mut new_start_line = 1usize;
+    let mut session_line_ranges = Vec::new();
 
     src.push_str(HEADERS);
     // Ahead of the runtime, which expands them.
@@ -171,20 +287,31 @@ fn build_inner(
     src.push_str(&format!("#define CS_M_DONE \"{}\"\n", escape(M_DONE)));
     src.push_str(RUNTIME);
 
-    for item in &session.file_items {
-        src.push_str(item);
+    for (index, item) in session.file_items.iter().enumerate() {
+        if file_replacement == Some(index) {
+            new_start_line = src.lines().count() + 1;
+            src.push_str(input);
+        } else {
+            let start = src.lines().count() + 1;
+            src.push_str(item);
+            session_line_ranges.push((start, item.lines().count().max(1)));
+        }
         src.push('\n');
     }
 
-    if slot == Slot::FileScope {
+    if slot == Slot::FileScope && file_replacement.is_none() {
         new_start_line = src.lines().count() + 1;
         src.push_str(input);
         src.push('\n');
     }
 
+    let aggregate_printers = build_aggregate_printers(&src);
+    src.push_str(&aggregate_printers);
     src.push_str("\nint main(void)\n{\n");
     for stmt in &session.stmts {
+        let start = src.lines().count() + 1;
         src.push_str(stmt);
+        session_line_ranges.push((start, stmt.lines().count().max(1)));
         src.push('\n');
     }
     src.push_str("    CS_MARK(CS_M_NEW);\n");
@@ -192,6 +319,9 @@ fn build_inner(
     match slot {
         Slot::FileScope => {}
         Slot::Stmt => {
+            if scoped_stmt {
+                src.push_str("    {\n");
+            }
             new_start_line = src.lines().count() + 1;
             src.push_str(input);
             src.push('\n');
@@ -226,14 +356,561 @@ fn build_inner(
     }
 
     src.push_str("    CS_MARK(CS_M_DONE);\n");
+    for _ in 0..session.scope_depth + usize::from(scoped_stmt) {
+        src.push_str("    }\n");
+    }
     src.push_str("    return 0;\n}\n");
     let new_line_count = input.lines().count().max(1);
     Program {
         src,
         new_start_line,
         new_line_count,
+        session_line_ranges,
         wrapped: slot == Slot::Expr && !silent_expr,
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AggregateToken {
+    Ident(String),
+    Punct(char),
+    Directive,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AggregateMemberKind {
+    Value,
+    Pointer,
+    Array {
+        dimensions: usize,
+        pointer_elements: bool,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AggregateMember {
+    name: String,
+    kind: AggregateMemberKind,
+    type_hint: Option<String>,
+    visibly_nested: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AggregatePrinter {
+    ty: String,
+    members: Vec<AggregateMember>,
+    byte_fallback: bool,
+}
+
+/// Build safe, session-specific struct printers after the user's type
+/// definitions are visible. Pointers are never dereferenced. Declarators that
+/// are easy to misidentify (multi-declarators, function pointers, bit-fields
+/// and anonymous members) select an explicit raw-byte fallback instead.
+fn build_aggregate_printers(source: &str) -> String {
+    let printers = collect_aggregate_printers(source);
+    if printers.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("\n/* c-shell aggregate printers */\n");
+    out.push_str("static unsigned cs_aggregate_depth;\n");
+    out.push_str(
+        "static void cs_aggregate_indent(void) { unsigned i; for (i = 0; i < cs_aggregate_depth; ++i) fputs(\"    \", stdout); }\n",
+    );
+    for (index, printer) in printers.iter().enumerate() {
+        out.push_str(&format!(
+            "static void cs_m_ag_{index}(const volatile {} *);\n",
+            printer.ty
+        ));
+        out.push_str(&format!("static void cs_p_ag_{index}({});\n", printer.ty));
+    }
+
+    out.push_str("#undef CS_AGG_PRINT_ASSOCIATIONS\n");
+    out.push_str("#define CS_AGG_PRINT_ASSOCIATIONS ");
+    for (index, printer) in printers.iter().enumerate() {
+        out.push_str(&format!("{}: cs_p_ag_{index}, ", printer.ty));
+    }
+    out.push('\n');
+    out.push_str("#undef CS_AGG_MEMBER_ASSOCIATIONS\n");
+    out.push_str("#define CS_AGG_MEMBER_ASSOCIATIONS ");
+    for (index, printer) in printers.iter().enumerate() {
+        out.push_str(&format!(
+            "{} *: cs_m_ag_{index}, const {} *: cs_m_ag_{index}, volatile {} *: cs_m_ag_{index}, const volatile {} *: cs_m_ag_{index}, ",
+            printer.ty, printer.ty, printer.ty, printer.ty
+        ));
+    }
+    out.push('\n');
+
+    for (index, printer) in printers.iter().enumerate() {
+        if printer.byte_fallback {
+            emit_byte_fallback(&mut out, index, printer);
+        } else {
+            emit_struct_formatter(&mut out, index, printer);
+        }
+        out.push_str(&format!(
+            "static void cs_p_ag_{index}({ty} v) {{ CS_VAL(); cs_aggregate_depth = 0; cs_m_ag_{index}(&v); putchar('\\n'); }}\n",
+            ty = printer.ty
+        ));
+    }
+    out
+}
+
+fn emit_byte_fallback(out: &mut String, index: usize, printer: &AggregatePrinter) {
+    let label = escape(&printer.ty);
+    out.push_str(&format!(
+        "static void cs_m_ag_{index}(const volatile {ty} *v) {{\n\
+         const volatile unsigned char *p = (const volatile unsigned char *)v;\n\
+         size_t i; fputs(\"<{label} raw bytes:\", stdout);\n\
+         for (i = 0; i < sizeof(*v); ++i) printf(\" %02x\", (unsigned)p[i]);\n\
+         fputc('>', stdout);\n\
+         }}\n",
+        ty = printer.ty
+    ));
+}
+
+fn emit_struct_formatter(out: &mut String, index: usize, printer: &AggregatePrinter) {
+    let multiline = printer.members.len() > 4
+        || printer.members.iter().any(|member| {
+            member.visibly_nested || matches!(member.kind, AggregateMemberKind::Array { .. })
+        });
+    out.push_str(&format!(
+        "static void cs_m_ag_{index}(const volatile {} *v) {{\n",
+        printer.ty
+    ));
+    if multiline {
+        out.push_str("fputs(\"{\\n\", stdout); ++cs_aggregate_depth;\n");
+    } else {
+        out.push_str("fputs(\"{ \", stdout);\n");
+    }
+    for (member_index, member) in printer.members.iter().enumerate() {
+        if multiline {
+            if member_index > 0 {
+                out.push_str("fputs(\",\\n\", stdout);\n");
+            }
+            out.push_str("cs_aggregate_indent();\n");
+        } else if member_index > 0 {
+            out.push_str("fputs(\", \", stdout);\n");
+        }
+        out.push_str(&format!("fputs(\".{} = \", stdout);\n", member.name));
+        let expr = format!("v->{}", member.name);
+        match member.kind {
+            AggregateMemberKind::Value => {
+                out.push_str(&format!("CS_MEMBER_REF({expr});\n"));
+            }
+            AggregateMemberKind::Pointer => {
+                out.push_str(&format!("CS_MEMBER_PTR({expr});\n"));
+            }
+            AggregateMemberKind::Array {
+                dimensions,
+                pointer_elements,
+            } => emit_array_formatter(out, &expr, dimensions, pointer_elements, member_index, 0),
+        }
+    }
+    if multiline {
+        out.push_str("--cs_aggregate_depth; fputc('\\n', stdout); cs_aggregate_indent(); fputc('}', stdout);\n");
+    } else {
+        out.push_str("fputs(\" }\", stdout);\n");
+    }
+    out.push_str("}\n");
+}
+
+fn emit_array_formatter(
+    out: &mut String,
+    expr: &str,
+    dimensions: usize,
+    pointer_elements: bool,
+    member_index: usize,
+    level: usize,
+) {
+    let index = format!("cs_i_{member_index}_{level}");
+    let count = format!("cs_n_{member_index}_{level}");
+    out.push_str("{ ");
+    out.push_str(&format!(
+        "size_t {count} = sizeof({expr}) / sizeof(({expr})[0]); size_t {index}; fputc('{{', stdout); "
+    ));
+    out.push_str(&format!(
+        "for ({index} = 0; {index} < {count}; ++{index}) {{ if ({index}) fputs(\", \", stdout); "
+    ));
+    let element = format!("({expr})[{index}]");
+    if level + 1 < dimensions {
+        emit_array_formatter(
+            out,
+            &element,
+            dimensions,
+            pointer_elements,
+            member_index,
+            level + 1,
+        );
+    } else if pointer_elements {
+        out.push_str(&format!("CS_MEMBER_PTR({element}); "));
+    } else {
+        out.push_str(&format!("CS_MEMBER_REF({element}); "));
+    }
+    out.push_str("} fputc('}', stdout); }\n");
+}
+
+fn collect_aggregate_printers(source: &str) -> Vec<AggregatePrinter> {
+    let tokens = aggregate_tokens(source);
+    let mut printers = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut brace_depth = 0usize;
+
+    for (i, token) in tokens.iter().enumerate() {
+        let AggregateToken::Ident(kind) = token else {
+            match token {
+                AggregateToken::Punct('{') => brace_depth += 1,
+                AggregateToken::Punct('}') => brace_depth = brace_depth.saturating_sub(1),
+                _ => {}
+            }
+            continue;
+        };
+        if brace_depth != 0 || !matches!(kind.as_str(), "struct" | "union") {
+            continue;
+        }
+
+        let (tag, open) = match (tokens.get(i + 1), tokens.get(i + 2)) {
+            (Some(AggregateToken::Ident(tag)), Some(AggregateToken::Punct('{'))) => {
+                (Some(tag.clone()), i + 2)
+            }
+            (Some(AggregateToken::Punct('{')), _) => (None, i + 1),
+            _ => continue,
+        };
+        let Some(close) = matching_brace(&tokens, open) else {
+            continue;
+        };
+        let ty = if let Some(tag) = tag {
+            format!("{kind} {tag}")
+        } else {
+            let preceded_by_typedef = i
+                .checked_sub(1)
+                .and_then(|j| tokens.get(j))
+                .is_some_and(|t| matches!(t, AggregateToken::Ident(word) if word == "typedef"));
+            if !preceded_by_typedef {
+                continue;
+            }
+            match (tokens.get(close + 1), tokens.get(close + 2)) {
+                (Some(AggregateToken::Ident(alias)), Some(AggregateToken::Punct(';'))) => {
+                    alias.clone()
+                }
+                _ => continue,
+            }
+        };
+        if !seen.insert(ty.clone()) {
+            continue;
+        }
+
+        let members = parse_aggregate_members(&tokens[open + 1..close]);
+        let (members, byte_fallback) = match members {
+            Ok(members) if kind == "struct" && !members.is_empty() => (members, false),
+            _ => (Vec::new(), true),
+        };
+        printers.push(AggregatePrinter {
+            ty,
+            members,
+            byte_fallback,
+        });
+    }
+    let known: BTreeSet<String> = printers.iter().map(|printer| printer.ty.clone()).collect();
+    for printer in &mut printers {
+        for member in &mut printer.members {
+            member.visibly_nested |= matches!(member.kind, AggregateMemberKind::Value)
+                && member
+                    .type_hint
+                    .as_ref()
+                    .is_some_and(|hint| known.contains(hint));
+        }
+    }
+    printers
+}
+
+fn matching_brace(tokens: &[AggregateToken], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, token) in tokens.iter().enumerate().skip(open) {
+        match token {
+            AggregateToken::Punct('{') => depth += 1,
+            AggregateToken::Punct('}') => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_aggregate_members(tokens: &[AggregateToken]) -> Result<Vec<AggregateMember>, ()> {
+    if tokens
+        .iter()
+        .any(|token| matches!(token, AggregateToken::Directive))
+    {
+        return Err(());
+    }
+    let mut members = Vec::new();
+    let mut start = 0usize;
+    let (mut braces, mut parens, mut brackets) = (0usize, 0usize, 0usize);
+    for (i, token) in tokens.iter().enumerate() {
+        match token {
+            AggregateToken::Punct('{') => braces += 1,
+            AggregateToken::Punct('}') => braces = braces.saturating_sub(1),
+            AggregateToken::Punct('(') => parens += 1,
+            AggregateToken::Punct(')') => parens = parens.saturating_sub(1),
+            AggregateToken::Punct('[') => brackets += 1,
+            AggregateToken::Punct(']') => brackets = brackets.saturating_sub(1),
+            AggregateToken::Punct(';') if braces == 0 && parens == 0 && brackets == 0 => {
+                let decl = &tokens[start..i];
+                if !decl.is_empty()
+                    && !matches!(decl.first(), Some(AggregateToken::Ident(word)) if word == "_Static_assert" || word == "static_assert")
+                {
+                    members.push(parse_aggregate_member(decl)?);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if tokens[start..]
+        .iter()
+        .any(|token| !matches!(token, AggregateToken::Punct(';')))
+    {
+        return Err(());
+    }
+    Ok(members)
+}
+
+fn parse_aggregate_member(tokens: &[AggregateToken]) -> Result<AggregateMember, ()> {
+    let mut top_identifiers = Vec::new();
+    let (mut braces, mut parens, mut brackets) = (0usize, 0usize, 0usize);
+    let mut stars = 0usize;
+    let mut dimensions = 0usize;
+    let mut flexible = false;
+    let mut inline_aggregate = false;
+    let mut saw_parentheses = false;
+
+    for (i, token) in tokens.iter().enumerate() {
+        match token {
+            AggregateToken::Punct('{') => {
+                if braces == 0 && parens == 0 && brackets == 0 {
+                    inline_aggregate = true;
+                }
+                braces += 1;
+            }
+            AggregateToken::Punct('}') => braces = braces.saturating_sub(1),
+            AggregateToken::Punct('(') => {
+                if braces == 0 && brackets == 0 {
+                    saw_parentheses = true;
+                }
+                parens += 1;
+            }
+            AggregateToken::Punct(')') => parens = parens.saturating_sub(1),
+            AggregateToken::Punct('[') if braces == 0 && parens == 0 && brackets == 0 => {
+                dimensions += 1;
+                flexible |= matches!(tokens.get(i + 1), Some(AggregateToken::Punct(']')));
+                brackets += 1;
+            }
+            AggregateToken::Punct('[') => brackets += 1,
+            AggregateToken::Punct(']') => brackets = brackets.saturating_sub(1),
+            AggregateToken::Punct(',') if braces == 0 && parens == 0 && brackets == 0 => {
+                // Multi-declarators are intentionally conservative until a C
+                // declarator parser replaces this lexical extractor.
+                return Err(());
+            }
+            AggregateToken::Punct(':') if braces == 0 && parens == 0 && brackets == 0 => {
+                return Err(());
+            }
+            AggregateToken::Punct('*') if braces == 0 && brackets == 0 => {
+                if parens > 0 {
+                    // `int (*fp)(void)`: do not guess a name hidden in a
+                    // parenthesized declarator.
+                    return Err(());
+                }
+                stars += 1;
+            }
+            AggregateToken::Ident(word) if braces == 0 && parens == 0 && brackets == 0 => {
+                if matches!(word.as_str(), "__attribute__" | "__declspec") {
+                    return Err(());
+                }
+                top_identifiers.push((i, word.clone()));
+            }
+            _ => {}
+        }
+    }
+    if flexible || top_identifiers.len() < 2 {
+        return Err(());
+    }
+    let (_, name) = top_identifiers.last().ok_or(())?;
+    if is_type_word(name) {
+        return Err(());
+    }
+    let first = top_identifiers.first().map(|(_, word)| word.as_str());
+    let type_prefix = &top_identifiers[..top_identifiers.len() - 1];
+    let has_tag_keyword = type_prefix
+        .iter()
+        .any(|(_, word)| matches!(word.as_str(), "struct" | "union" | "enum"));
+    let unknown_type_words = type_prefix
+        .iter()
+        .filter(|(_, word)| !is_type_word(word))
+        .count();
+    let mixes_typedef_with_builtin = unknown_type_words > 0
+        && type_prefix
+            .iter()
+            .any(|(_, word)| is_concrete_type_word(word));
+    if !has_tag_keyword && (unknown_type_words > 1 || mixes_typedef_with_builtin) {
+        // A member macro can otherwise masquerade as an extra type word and
+        // make us silently omit fields introduced by its expansion.
+        return Err(());
+    }
+    if saw_parentheses && !matches!(first, Some("_Atomic" | "_Alignas" | "alignas")) {
+        // Function-like member macros and parenthesized declarators are not
+        // guessed. `_Atomic(T)` and alignment specifiers still leave a plain
+        // member name at top level.
+        return Err(());
+    }
+    if matches!(first, Some("struct" | "union" | "enum"))
+        && top_identifiers.len() == 2
+        && !inline_aggregate
+    {
+        return Err(());
+    }
+    if inline_aggregate && stars == 0 {
+        // C11 anonymous/by-value aggregate members need their own recursive
+        // declarator model. Fall back rather than silently omitting fields.
+        return Err(());
+    }
+
+    let visibly_nested = stars == 0 && matches!(first, Some("struct" | "union"));
+    let type_hint = if matches!(first, Some("struct" | "union")) {
+        top_identifiers
+            .get(1)
+            .map(|(_, tag)| format!("{} {tag}", first.expect("matched aggregate keyword")))
+    } else {
+        top_identifiers
+            .iter()
+            .rev()
+            .skip(1)
+            .find(|(_, word)| !is_type_qualifier(word))
+            .map(|(_, word)| word.clone())
+    };
+    let kind = if dimensions > 0 {
+        AggregateMemberKind::Array {
+            dimensions,
+            pointer_elements: stars > 0,
+        }
+    } else if stars > 0 {
+        AggregateMemberKind::Pointer
+    } else {
+        AggregateMemberKind::Value
+    };
+    Ok(AggregateMember {
+        name: name.clone(),
+        kind,
+        type_hint,
+        visibly_nested,
+    })
+}
+
+fn is_type_qualifier(word: &str) -> bool {
+    matches!(word, "const" | "volatile" | "restrict" | "_Atomic")
+}
+
+fn is_concrete_type_word(word: &str) -> bool {
+    matches!(
+        word,
+        "void"
+            | "_Bool"
+            | "char"
+            | "short"
+            | "int"
+            | "long"
+            | "float"
+            | "double"
+            | "signed"
+            | "unsigned"
+            | "_Complex"
+    )
+}
+
+fn is_type_word(word: &str) -> bool {
+    is_concrete_type_word(word)
+        || matches!(
+            word,
+            "const"
+                | "volatile"
+                | "restrict"
+                | "_Atomic"
+                | "_Alignas"
+                | "alignas"
+                | "struct"
+                | "union"
+                | "enum"
+        )
+}
+
+fn aggregate_tokens(src: &str) -> Vec<AggregateToken> {
+    let scan = lex::scan(src);
+    let bytes = src.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut at_line_start = true;
+    let mut in_directive = false;
+    let mut conditional_depth = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\n' {
+            let continued = i > 0 && bytes[i - 1] == b'\\';
+            if !continued {
+                in_directive = false;
+            }
+            at_line_start = !in_directive;
+            i += 1;
+            continue;
+        }
+        if at_line_start && bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if at_line_start && scan.code[i] && bytes[i] == b'#' {
+            let end = bytes[i..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(bytes.len(), |offset| i + offset);
+            let directive = src[i + 1..end].trim_start();
+            let word = directive
+                .split(|c: char| c.is_ascii_whitespace())
+                .next()
+                .unwrap_or("");
+            match word {
+                "if" | "ifdef" | "ifndef" => conditional_depth += 1,
+                "endif" => conditional_depth = conditional_depth.saturating_sub(1),
+                _ => {}
+            }
+            out.push(AggregateToken::Directive);
+            in_directive = true;
+            at_line_start = false;
+        } else if at_line_start && scan.code[i] {
+            at_line_start = false;
+        }
+        if in_directive || conditional_depth > 0 || !scan.code[i] || bytes[i].is_ascii_whitespace()
+        {
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'_' || bytes[i].is_ascii_alphabetic() {
+            let start = i;
+            i += 1;
+            while i < bytes.len()
+                && scan.code[i]
+                && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric())
+            {
+                i += 1;
+            }
+            out.push(AggregateToken::Ident(src[start..i].to_string()));
+            continue;
+        }
+        out.push(AggregateToken::Punct(bytes[i] as char));
+        i += 1;
+    }
+    out
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -384,5 +1061,105 @@ mod tests {
         session.stmts.push("struct Pair pair = { 1, 2 };".into());
         let program = build_type_probe(&session, "pair");
         assert!(program.src.contains("struct Pair: \"Struct Pair\""));
+    }
+
+    #[test]
+    fn aggregate_printers_are_safe_and_conservative_about_declarators() {
+        let printers = collect_aggregate_printers(
+            "#define FAKE_TYPE struct Fake { int hidden; }\n\
+             #define FIELDS int injected;\n\
+             #if 0\nstruct Conditional { int hidden; };\n#endif\n\
+             struct Person { char *name; int age; int scores[3]; struct Person *next; };\n\
+             struct Pair { int x, y; };\n\
+             struct MacroFields { FIELDS int visible; };\n\
+             struct Hooks { int (*callback)(void); int enabled; };\n\
+             struct Anonymous { struct { int value; }; int other; };",
+        );
+        assert!(
+            printers.iter().all(|printer| {
+                printer.ty != "struct Fake" && printer.ty != "struct Conditional"
+            }),
+            "preprocessor-controlled text is not a stable visible type definition"
+        );
+        let person = printers
+            .iter()
+            .find(|printer| printer.ty == "struct Person")
+            .expect("Person printer");
+        assert!(!person.byte_fallback);
+        assert_eq!(
+            person
+                .members
+                .iter()
+                .map(|member| (member.name.as_str(), member.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("name", AggregateMemberKind::Pointer),
+                ("age", AggregateMemberKind::Value),
+                (
+                    "scores",
+                    AggregateMemberKind::Array {
+                        dimensions: 1,
+                        pointer_elements: false
+                    }
+                ),
+                ("next", AggregateMemberKind::Pointer),
+            ]
+        );
+        for ty in [
+            "struct Pair",
+            "struct MacroFields",
+            "struct Hooks",
+            "struct Anonymous",
+        ] {
+            assert!(
+                printers
+                    .iter()
+                    .find(|printer| printer.ty == ty)
+                    .is_some_and(|printer| printer.byte_fallback),
+                "{ty} should use the conservative byte fallback"
+            );
+        }
+
+        let generated = build_aggregate_printers(
+            "struct Child { int value; }; struct Parent { struct Child child; char *text; };",
+        );
+        assert!(generated.contains("CS_AGG_MEMBER_ASSOCIATIONS"));
+        assert!(generated.contains("CS_MEMBER_PTR(v->text)"));
+        assert!(!generated.contains("CS_PRINT(v->text)"));
+    }
+
+    #[test]
+    fn user_source_view_omits_runtime_scaffolding() {
+        let mut session = Session::default();
+        session.commit("int twice(int x) { return x * 2; }", Slot::FileScope);
+        session.commit("int value = 21;", Slot::Stmt);
+        let src = build_user_view(&session);
+        assert!(src.contains("int twice(int x)"));
+        assert!(src.contains("int main(void)"));
+        assert!(src.contains("int value = 21;"));
+        assert!(!src.contains("CS_PRINT"));
+        assert!(!src.contains("CS_MARK"));
+    }
+
+    #[test]
+    fn scoped_statements_and_file_replacements_preserve_program_shape() {
+        let mut session = Session::default();
+        session.file_items.push("int f(void) { return 1; }".into());
+        session
+            .file_items
+            .push("int g(void) { return f(); }".into());
+
+        let replacement = build_file_replacement(&session, "int f(void) { return 2; }", 0).src;
+        let new_f = replacement.find("return 2").expect("replacement present");
+        let dependent_g = replacement.find("int g(void)").expect("dependent present");
+        assert!(new_f < dependent_g);
+        assert!(!replacement.contains("return 1"));
+
+        session.commit_scoped("int x = 2;");
+        let future = build(&session, "x", Slot::Expr).src;
+        let declaration = future.find("int x = 2;").expect("scoped declaration");
+        let query = future.rfind("\nx\n").expect("future query");
+        let close = future.rfind("    }\n    return 0;").expect("scope close");
+        assert!(declaration < query && query < close);
     }
 }

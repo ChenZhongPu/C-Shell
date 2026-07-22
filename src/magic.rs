@@ -3,8 +3,9 @@
 //! A line starting with `%` is never valid C, so the prefix needs no escaping
 //! rule to stay unambiguous.
 
-use anyhow::Result;
-use std::io::Write as _;
+use anyhow::{Context, Result, bail};
+use std::io::{IsTerminal, Write as _};
+use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -18,16 +19,16 @@ use crate::ui::Ui;
 pub enum Action {
     Continue,
     Quit,
+    Submit(String),
 }
 
 /// Pretty-print C source through clang-format when it is available, or
 /// return it unchanged when it is not.
 ///
-/// The assembled program is honest but ragged: it is built by string
-/// concatenation, and interactively-typed inputs carry the prompt-width
-/// padding the auto-indent inserted. Formatting is presentation only — the
-/// compiler always receives the raw text, so `%src` shows the same program,
-/// just readable.
+/// Both source views are built by string concatenation, and interactively
+/// typed inputs carry prompt-width indentation padding. Formatting is
+/// presentation only: evaluation always compiles codegen's unformatted raw
+/// program, regardless of which `%src` view is printed.
 fn format_c(src: &str) -> String {
     static CLANG_FORMAT: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
     let Some(path) = CLANG_FORMAT.get_or_init(|| which::which("clang-format").ok()) else {
@@ -47,16 +48,86 @@ fn format_c(src: &str) -> String {
     run().unwrap_or_else(|_| src.to_string())
 }
 
+enum EditResult {
+    Submit(String),
+    Unchanged,
+    Empty,
+}
+
+fn edit_text(original: &str) -> Result<EditResult> {
+    edit_text_with(original, launch_editor)
+}
+
+fn edit_text_with(
+    original: &str,
+    launch: impl FnOnce(&Path) -> Result<bool>,
+) -> Result<EditResult> {
+    let path = tempfile::Builder::new()
+        .prefix("c-shell-edit-")
+        .suffix(".c")
+        .tempfile()
+        .context("cannot create editor temporary file")?
+        .into_temp_path();
+    // Drop the open file handle before launching GUI editors; Windows editors
+    // otherwise vary in whether they can replace the temporary file.
+    std::fs::write(&path, original).context("cannot prepare editor temporary file")?;
+    if !launch(&path)? {
+        bail!("editor exited unsuccessfully");
+    }
+    let edited = std::fs::read_to_string(&path).context("cannot read edited input")?;
+    let edited = edited.trim();
+    if edited.is_empty() {
+        return Ok(EditResult::Empty);
+    }
+    if edited == original.trim() {
+        return Ok(EditResult::Unchanged);
+    }
+    Ok(EditResult::Submit(edited.to_string()))
+}
+
+fn launch_editor(path: &Path) -> Result<bool> {
+    let editor = std::env::var("VISUAL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "notepad".to_string()
+            } else {
+                "vi".to_string()
+            }
+        });
+
+    #[cfg(windows)]
+    let status = Command::new("cmd")
+        .arg("/C")
+        .arg(format!("{editor} \"{}\"", path.display()))
+        .status();
+    #[cfg(not(windows))]
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("c-shell-edit")
+        .arg(path)
+        .status();
+
+    Ok(status.context("cannot launch $VISUAL/$EDITOR")?.success())
+}
+
 const HELP: &str = "\
 Commands:
   %help              show this help
   %quit / %exit      quit (Ctrl-D works too)
   %clear             clear the screen without changing the session
   %reset             clear the session and start fresh
-  %history           show everything entered this session
-  %src               show the full C program the session assembles
+  %src [--raw]       show user C; --raw includes generated runtime/protocol
+  %edit [n]          edit latest or In[n] in $VISUAL/$EDITOR, then submit
   %type <expression> query an expression's type without evaluating it
-  %undo              drop the most recently accepted input
+  %undo              undo the most recent retained state change
   %cc [path]         show or switch the C compiler
   %std [std]         show or switch the language standard (c11/c17/c23);
                      %std default returns to the compiler's own default
@@ -66,15 +137,24 @@ Notes:
   A completed if waits for a blank continuation line; type else / else if
   there instead to continue it. Other closed blocks submit immediately.
   Function definitions, #include and typedef go to file scope automatically.
+  %edit n can reopen any C In[n] from this session, including a failed one;
+  saved text is submitted under a new number and the original is unchanged.
+  c-shell supplies main(); enter its body as statements and omit final return.
+  Redeclaring a local opens a nested shadowing scope. Redefining a function
+  or type replaces the prior file-scope input only if the compiler accepts
+  the complete rewritten session; functions are never demoted into main.
   %type uses _Generic matching: scalar types and scalar pointers are named;
   complete named structs/unions report e.g. Struct Point or Union Value;
   simple anonymous typedefs use the typedef name. Other aliases and top-level
   qualifiers are canonicalized, and arrays/functions undergo their normal
   expression conversions.
+  Struct values use designated members; nested known structs and arrays
+  expand, but pointer members are shown only as addresses or NULL. Use an
+  explicit member expression (p.name) or dereference (*ptr) to drill down.
   Pure bare expressions (x + 1, sizeof(int)) are evaluated and forgotten.
   Statements and bare expressions that may have effects are kept.
-  Every evaluation re-runs the whole session, so input-reading statements
-  like scanf will execute again.";
+  Every evaluation re-runs the whole session. Known file/input/process APIs
+  trigger a one-time warning because their external effects may repeat.";
 
 pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) -> Result<Action> {
     let body = line.trim().trim_start_matches('%');
@@ -101,25 +181,51 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
             println!("{}", ui.dim("session cleared"));
         }
 
-        "history" => {
-            if session.history.is_empty() {
-                println!("{}", ui.dim("(no input yet)"));
+        "src" => match rest.as_slice() {
+            [] => println!("{}", format_c(&codegen::build_user_view(session))),
+            [flag] if *flag == "--raw" => {
+                let prog = codegen::build(session, "", Slot::Stmt);
+                println!("{}", format_c(&prog.src));
             }
-            // Two sequences, kept visibly distinct: evaluated inputs carry
-            // their In[n] number, magic commands a dash — they never
-            // consumed one.
-            for e in &session.history {
-                let tag = match e.n {
-                    Some(n) => format!("In[{n:>3}]"),
-                    None => "  --   ".to_string(),
-                };
-                println!("{} {}", ui.dim(&tag), e.text);
-            }
-        }
+            _ => println!("{}", ui.err("usage: %src [--raw]")),
+        },
 
-        "src" => {
-            let prog = codegen::build(session, "", Slot::Stmt);
-            println!("{}", format_c(&prog.src));
+        "edit" => {
+            let original = match rest.as_slice() {
+                [] => match session.last_input() {
+                    Some(input) => input.to_string(),
+                    None => {
+                        println!("{}", ui.dim("nothing to edit"));
+                        return Ok(Action::Continue);
+                    }
+                },
+                [number] => {
+                    let Ok(number) = number.parse::<usize>() else {
+                        println!("{}", ui.err("usage: %edit [input-number]"));
+                        return Ok(Action::Continue);
+                    };
+                    let Some(input) = session.input(number) else {
+                        println!("{}", ui.err(&format!("no C input In[{number}]")));
+                        return Ok(Action::Continue);
+                    };
+                    input.to_string()
+                }
+                _ => {
+                    println!("{}", ui.err("usage: %edit [input-number]"));
+                    return Ok(Action::Continue);
+                }
+            };
+
+            if !std::io::stdin().is_terminal() {
+                println!("{}", ui.err("%edit requires an interactive terminal"));
+                return Ok(Action::Continue);
+            }
+            match edit_text(&original) {
+                Ok(EditResult::Submit(edited)) => return Ok(Action::Submit(edited)),
+                Ok(EditResult::Unchanged) => println!("{}", ui.dim("edit cancelled: unchanged")),
+                Ok(EditResult::Empty) => println!("{}", ui.dim("edit cancelled: empty input")),
+                Err(e) => println!("{}", ui.err(&format!("edit failed: {e}"))),
+            }
         }
 
         "type" => {
@@ -209,4 +315,25 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
         ),
     }
     Ok(Action::Continue)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editor_file_changes_are_returned_and_unchanged_edits_cancel() {
+        let changed = edit_text_with("int value = 1;", |path| {
+            std::fs::write(path, "int value = 2;\n")?;
+            Ok(true)
+        })
+        .expect("edited text");
+        assert!(matches!(
+            changed,
+            EditResult::Submit(ref text) if text == "int value = 2;"
+        ));
+
+        let unchanged = edit_text_with("int value = 1;", |_| Ok(true)).expect("unchanged edit");
+        assert!(matches!(unchanged, EditResult::Unchanged));
+    }
 }

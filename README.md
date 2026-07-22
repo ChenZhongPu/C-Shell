@@ -97,6 +97,7 @@ unsupported explicit `--std` is an error both at startup and in `%std`.
 | `x + 1;`               | trailing `;` runs it silently (as in IPython) |
 | `int x = 41;`          | declaration, visible to later inputs          |
 | `int f(int a) { ... }` | function definition, hoisted to file scope    |
+| `int main() { ... }`   | rejected with guidance; c-shell supplies main |
 | `#include <time.h>`    | likewise                                      |
 
 A completed interactive `if` uses blank-line confirmation: press Enter on the
@@ -107,11 +108,62 @@ their body on the next line, mandatory `do ... while`, and conditional
 preprocessor groups through `#endif` are accumulated automatically. In scripts
 and pipes, one-line lookahead attaches `else` without requiring a blank line.
 
+c-shell generates its own `main` to host session locals and the output
+protocol. Pasting a complete program such as `int main() { puts("hi"); }`
+therefore produces a direct explanation instead of a compiler redefinition or
+GCC nested-function warning: enter the statements from the body directly and
+omit the final `return`.
+
 Common headers (`stdio`, `stdlib`, `string`, `math`, `stdbool`, `stdint`,
 `stddef`, `limits`, `ctype`) are pre-included. Unix builds link `-lm`; Windows
 math functions come from the C runtime. GNU-style GCC/Clang drivers use
 `-Wall -Wextra`; MSVC-style `cl`/`clang-cl` drivers use `/W3`. The warning is
 often exactly the thing you came to check.
+
+### Rebinding declarations and definitions
+
+When a block-scope declaration fails with a compiler redeclaration diagnostic,
+c-shell retries it inside a new nested block. If the complete program then
+compiles, later inputs remain inside that block and see the shadowing binding:
+
+```text
+In [1]: int x = 1;
+In [2]: x = 5;
+In [3]: int x = 2;
+(opened a nested scope to shadow an earlier declaration)
+In [4]: x
+Out[4]: 2
+In [5]: %undo
+undone: int x = 2;
+In [5]: x
+Out[5]: 5
+```
+
+`%src` shows the actual braces; no C declaration is rewritten into an
+assignment. Consequently C's own scope rules still apply—for example, in
+`int x = x + 1;` the initializer refers to the newly declared `x`, not the
+outer one.
+
+A rejected file-scope redefinition is handled differently: c-shell tries the
+new function or type in place of each previous non-preprocessor file-scope
+input, and commits only the substitution for which the real compiler accepts
+the entire session:
+
+```text
+In [1]: int f(int n) { return n * 2; }
+(added at file scope)
+In [2]: f(3)
+Out[2]: 6
+In [3]: int f(int n) { return n * 3; }
+(replaced previous file-scope definition)
+In [4]: f(3)
+Out[4]: 9
+```
+
+The old item is replaced at its original position to preserve declaration
+order, and `%undo` restores it. A function-shaped input is never retried
+inside `main`; this prevents GCC nested-function extensions from creating a
+session that Clang or MSVC interprets differently.
 
 ![demo](demo.gif)
 
@@ -120,17 +172,30 @@ often exactly the thing you came to check.
 `%`-prefixed, in the spirit of IPython:
 
 ```
-%help      %quit      %clear     %reset     %history
+%help      %quit      %clear     %reset     %edit [n]
 %src       %type      %undo      %cc        %std
 ```
 
 `%clear` erases the terminal display and returns the cursor to the top without
 changing variables, retained C code or the input counter.
 
-`%src` prints the complete C program assembled for the session. It is
-formatted with `clang-format` when available; formatting is presentation
-only, has a three-second deadline, and evaluation still compiles the
-unformatted generated source.
+`%src` defaults to the user-facing program: current file-scope definitions and
+retained statements inside a clean `main`, including any rebinding braces, but
+without printers or protocol markers. `%src --raw` prints the complete
+compiler input with `CS_PRINT`, `_Generic` and marker machinery. Either view is
+formatted with `clang-format` when available; formatting is presentation only,
+has a three-second deadline, and evaluation still compiles the unformatted
+generated source.
+
+`%edit` edits the most recent C input; `%edit 12` retrieves `In[12]`. Numbered
+C inputs—including failed compilations and forgotten pure queries—remain
+addressable until `%reset`. The selected text is written to a temporary `.c`
+file and opened with `$VISUAL` or `$EDITOR` (falling back to `vi` on Unix and
+`notepad` on Windows), then submitted as a fresh `In[n]`; the original numbered
+input is unchanged. The edited block is also placed at the top of process-local
+Up/Down recall. An unchanged or empty file cancels. Editing is interactive-only;
+a previously accepted declaration follows the normal shadowing or file-scope
+replacement rules when resubmitted.
 
 `%type <expression>` reports the expression type without evaluating that
 expression, committing code or consuming an `In[n]` number:
@@ -169,29 +234,59 @@ anonymous aggregate typedef uses its typedef name. Truly anonymous aggregates
 and other types outside the table report `<unrecognized type>`.
 
 Tab completes `%` commands, C keywords, stdlib staples and retained session
-identifiers of at least two characters. The line editor's Up/Down history
-persists across sessions under `$XDG_DATA_HOME/c-shell/history` (falling back to
-`~/.local/share/c-shell/history`) or `%APPDATA%\c-shell\history` on Windows.
-`%history` itself lists only inputs from the current process.
+identifiers of at least two characters. Up/Down recalls up to 1000 inputs from
+the current process so multi-line blocks can be recovered, but nothing is
+loaded or saved across launches. There is no `%history` or history file. The
+separate current-session input archive exists only for direct `%edit n` lookup
+and is cleared by `%reset`.
 
 ## How it works
 
 **Accumulate and replay.** Every evaluation reassembles and reruns the whole
-session. Block-scope declarations become ordinary locals in `main`; items
-recognized as file-scope code are emitted above it. There is no separate
-symbol table or declaration/initializer state store.
+session. Block-scope declarations become ordinary locals in `main`; a
+compiler-approved redeclaration starts a nested shadowing scope that encloses
+later statements. Items recognized as file-scope code are emitted above
+`main`, and approved redefinitions replace an older item in place. There is
+no separate symbol table or declaration/initializer state store.
 
 **Classification uses a small heuristic plus trial compilation.** A lexical
 heuristic routes function definitions, preprocessor directives, typedefs and
-tag definitions toward file scope; this avoids GCC accepting a function as a
-nested extension. The compiler then validates that choice and arbitrates the
-ambiguous expression-versus-statement cases. File scope is deliberately not a
-general fallback because it could change shadowing and redeclaration
-semantics.
+tag definitions to file scope; these inputs are never demoted into `main`,
+which prevents GCC from silently accepting a nested function that Clang/MSVC
+reject. The compiler arbitrates expression-versus-statement cases, but an
+input whose final code token is `;` goes directly to the statement slot rather
+than launching an expression compile that cannot succeed. Clearly braced
+statements ending in `}` do the same; possible compound literals such as
+`(int){7}` retain expression classification. After a redeclaration diagnostic,
+alternate nested-scope or in-place replacement assemblies must compile as
+complete programs before c-shell accepts them. File scope remains unavailable
+as a general fallback.
 
 **Value printing.** `_Generic` selects a print _function_, which is then
 called — selecting a call expression instead would type-check every
 unselected branch against the wrong argument type and fail to compile.
+Session-visible named structs and simple anonymous struct typedefs get
+recursive printers whose output uses designated-initializer form:
+
+```text
+Out[5]: {
+    .name = (void *)0x7f068cbbac1b,
+    .age = 30,
+    .scores = {0, 7, 0},
+    .next = NULL
+}
+```
+
+Struct-member formatting never treats `char *` as a string: every pointer
+member is `NULL` or an address, fixed arrays are traversed structurally, and a
+known nested struct calls its own printer. A top-level `struct P *` likewise
+prints only its address; explicit `*ptr` requests expansion. This differs
+intentionally from a top-level `char *` expression, where the user explicitly
+asked for the existing string dereference. Small flat structs stay on one
+line; larger, nested or array-bearing structs use indented multiline output.
+Multi-declarator fields, function-pointer declarators, bit-fields, flexible
+arrays, C11 anonymous members and unions conservatively produce a labelled raw
+byte dump instead of guessed member names.
 
 **Bare expressions judged pure are forgotten.** A bare expression at the
 prompt is usually a question (`x + 1`, `sizeof(int)`), so it is answered and
@@ -201,12 +296,16 @@ or calls — are retained. Successfully evaluated statements/declarations
 retained without purity analysis. `%src` shows
 what will actually be replayed.
 
-**Diagnostics are remapped.** The compiler sees a generated file with a
-prelude and all earlier statements above your input, so its line numbers are
-meaningless at the prompt. Locations attributable to the newest input —
+**Diagnostics are remapped and sanitized.** The compiler sees a generated file
+with a prelude and all earlier statements above your input, so its line numbers
+are meaningless at the prompt. Locations attributable to the newest input —
 including GCC source-excerpt gutters — are rewritten to input-relative lines.
-Locations in generated scaffolding or older session code are not presented as
-the newest input.
+Code generation records which other lines came from retained user inputs;
+source excerpts from `CS_PRINT`, `_Generic`, marker calls and wrapper code are
+removed while genuine earlier-input cross-references remain. Parser fallout
+that names the marker macro's internal `do` token is removed; an incomplete
+expression reports `expected expression at end of input` instead of blaming
+the wrapper's closing `)`.
 
 **Compiler capabilities are cached.** Successful startup probes are cached
 for seven days under the platform cache directory
@@ -220,20 +319,29 @@ version. Expired or malformed entries simply cause fresh probes.
 - **Execution is not sandboxed.** Compilers and generated programs run with
   c-shell's user permissions and working directory. Do not evaluate untrusted
   code.
-- **Side effects replay.** Every evaluation reruns the session, so `scanf`,
-  file writes and `time()` execute again each time. Pure syntax exploration
-  never notices; be aware of it otherwise.
-- **No redeclaration in the same scope.** Declaring `int x` twice is an
-  error, because it is one in C. If the previous declaration is the latest
-  retained input, `%undo` can drop it.
+- **Side effects replay.** Every evaluation reruns retained statements, so
+  input, file and process changes can repeat silently. Calls to known APIs such
+  as `fopen`, `fprintf`, `remove`, `rename` and `system` produce a one-time
+  English warning before execution. Detection is lexical and finite: wrappers
+  and application-defined side effects can still escape it.
+- **Rebinding is C shadowing, not assignment.** A redeclared local lives in a
+  nested block. Its declarator is already in scope during its initializer, so
+  `int x = x + 1;` does not read the outer `x`. File-scope replacement also
+  makes retained earlier calls use the new function when the session replays.
 - **The purity heuristic is conservative.** Any expression containing a
   function call is kept, even if the function happens to be pure.
+- **Indeterminate values remain undefined C.** Address-only struct-member
+  formatting prevents c-shell from adding a `%s` memory dereference, but it
+  cannot make `struct P p; p` well-defined when members were never initialized;
+  reading an indeterminate pointer or scalar is itself not portable. Initialize
+  structs (for example with `{0}`) when the value matters.
 - **Not every C value is printable.** The `_Generic` runtime covers the
-  standard boolean/integer/real-floating types, `char` strings and common
-  object pointers. An otherwise
-  valid expression with an unsupported value category (for example a
-  struct/union, complex or `void` value) is evaluated without `Out[n]` and an
-  explanatory note is shown.
+  standard boolean/integer/real-floating types, top-level `char` strings,
+  common object pointers and session-visible structs as described above.
+  Header-only/anonymous aggregate types that have no reusable C spelling,
+  complex and `void` values are evaluated without `Out[n]` and receive an
+  explanatory note. A member whose type is not in the scalar or generated
+  aggregate table is shown as `<unprintable>` rather than being coerced.
 - **Program output is bounded.** When stdin is a real terminal, output from
   the newest input is streamed immediately, so a prompt before `scanf` is
   visible. With non-terminal stdin it remains buffered for deterministic

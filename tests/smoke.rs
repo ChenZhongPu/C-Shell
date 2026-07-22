@@ -55,6 +55,31 @@ fn prints_floating_point_and_bool() {
 }
 
 #[test]
+fn complete_main_definition_gets_actionable_guidance() {
+    let out = run(&[
+        "int main(void) { printf(\"hello-main\\n\"); return 0; }",
+        "1 + 1",
+    ]);
+    assert!(
+        out.contains("already provides main()")
+            && out.contains("enter the statements from its body directly"),
+        "missing main guidance:\n{out}"
+    );
+    assert!(
+        !out.contains("warning"),
+        "-Wmain-style noise leaked:\n{out}"
+    );
+    assert!(
+        !out.lines().any(|line| line == "hello-main"),
+        "user main was unexpectedly executed:\n{out}"
+    );
+    assert!(
+        out.contains("Out[2]: 2"),
+        "session did not continue after guidance:\n{out}"
+    );
+}
+
+#[test]
 fn defines_and_calls_functions() {
     let out = run(&["int add(int a, int b) { return a + b; }", "add(3, 4)"]);
     assert!(out.contains("Out[2]: 7"), "unexpected output:\n{out}");
@@ -67,10 +92,186 @@ fn statements_execute_and_mutate_state() {
 }
 
 #[test]
+fn local_redeclaration_opens_a_shadowing_scope_and_undo_restores_it() {
+    let out = run(&["int x = 1;", "x = 5;", "int x = 2;", "x", "%undo", "x"]);
+    assert!(
+        out.contains("opened a nested scope"),
+        "shadowing retry was not reported:\n{out}"
+    );
+    assert!(out.contains("Out[4]: 2"), "new binding not visible:\n{out}");
+    assert!(
+        out.contains("Out[5]: 5"),
+        "undo did not restore the old binding:\n{out}"
+    );
+}
+
+#[test]
+fn file_scope_redefinition_replaces_in_place_portably() {
+    let out = run(&[
+        "int f(int n) { return n * 2; }",
+        "f(3)",
+        "int f(int n) { return n * 3; }",
+        "f(3)",
+    ]);
+    assert!(
+        out.contains("Out[2]: 6"),
+        "old function result missing:\n{out}"
+    );
+    assert!(
+        out.contains("replaced previous file-scope definition"),
+        "replacement was not reported:\n{out}"
+    );
+    assert!(out.contains("Out[4]: 9"), "new function not used:\n{out}");
+    assert!(
+        !out.contains("kept inside main"),
+        "function was silently demoted:\n{out}"
+    );
+}
+
+#[test]
+fn tag_redefinition_replaces_the_old_type_when_retained_session_still_compiles() {
+    let out = run(&[
+        "struct Box { int old_value; };",
+        "struct Box box = { 3 };",
+        "struct Box { int new_value; };",
+        "box.new_value",
+    ]);
+    assert!(
+        out.contains("replaced previous file-scope definition"),
+        "tag definition was not replaced:\n{out}"
+    );
+    assert!(
+        out.contains("Out[4]: 3"),
+        "retained declaration did not use the new type:\n{out}"
+    );
+}
+
+#[test]
+fn file_scope_replacement_is_undoable_and_functions_never_demote() {
+    let out = run(&[
+        "int g(int n) { return n * 2; }",
+        "int g(int n) { return n * 3; }",
+        "%undo",
+        "g(3)",
+        "int local = 7;",
+        "int illegal(void) { return local; }",
+        "local",
+    ]);
+    assert!(
+        out.contains("Out[3]: 6"),
+        "undo did not restore the old function:\n{out}"
+    );
+    assert!(
+        out.contains("error") && out.contains("local"),
+        "file-scope failure was hidden by nested-function demotion:\n{out}"
+    );
+    assert!(
+        out.contains("Out[6]: 7"),
+        "session did not survive the rejected function:\n{out}"
+    );
+}
+
+#[test]
+fn compound_literal_initializer_stays_at_block_scope() {
+    let out = run(&[
+        "typedef struct { int x, y; } Point;",
+        "(int){ 7 }",
+        "Point p = (Point){ 1, 2 };",
+        "p.x + p.y",
+    ]);
+    assert_eq!(
+        out.matches("added at file scope").count(),
+        1,
+        "compound literal declaration was mistaken for a function:\n{out}"
+    );
+    assert!(
+        out.contains("Out[2]: 7"),
+        "scalar compound literal stopped being an expression:\n{out}"
+    );
+    assert!(out.contains("Out[4]: 3"), "unexpected result:\n{out}");
+}
+
+#[test]
+fn struct_printing_never_implicitly_dereferences_pointer_members() {
+    let out = run(&[
+        "struct Person { char *name; int age; int scores[3]; struct Person *next; };",
+        "struct Person p = { (char *)(uintptr_t)0x1234, 30, { 0, 7, 0 }, NULL };",
+        "p",
+        "p.name = \"Alice\";",
+        "p.name",
+        "struct Person *person_ptr = &p;",
+        "person_ptr",
+        "*person_ptr",
+        "struct Pair { int x, y; };",
+        "struct Pair pair = { 1, 2 };",
+        "pair",
+        "1 + 1",
+    ]);
+    assert!(
+        out.contains(".name = (void *)") && out.contains("1234"),
+        "pointer member was not rendered as an address:\n{out}"
+    );
+    assert!(
+        out.contains("Out[5]: \"Alice\""),
+        "an explicit char-pointer member did not use string formatting:\n{out}"
+    );
+    assert_eq!(
+        out.matches(".age = 30").count(),
+        2,
+        "a struct value and explicit *ptr should both expand:\n{out}"
+    );
+    assert!(
+        out.contains(".scores = {0, 7, 0}"),
+        "array member missing:\n{out}"
+    );
+    assert!(out.contains(".next = NULL"), "NULL member missing:\n{out}");
+    assert!(
+        out.contains("<struct Pair raw bytes:"),
+        "unsupported multi-declarator did not fall back safely:\n{out}"
+    );
+    assert!(
+        out.contains("Out[12]: 2"),
+        "printing the invalid pointer dereferenced or crashed:\n{out}"
+    );
+}
+
+#[test]
 fn survives_compile_errors() {
     let out = run(&["int x = ;", "1 + 1"]);
     assert!(out.contains("error"), "no diagnostic shown:\n{out}");
     assert!(out.contains("Out[2]: 2"), "session did not survive:\n{out}");
+}
+
+#[test]
+fn diagnostics_hide_generated_wrappers_and_marker_tokens() {
+    let out = run(&["int number = 1;", "numbr + 1", "1 + 1"]);
+    assert!(out.contains("numbr"), "real diagnostic missing:\n{out}");
+    assert!(
+        !out.contains("CS_PRINT") && !out.contains("CS_MARK"),
+        "generated source leaked:\n{out}"
+    );
+    assert!(
+        !out.contains("'do'") && !out.contains("‘do’") && !out.contains("`do'"),
+        "generated marker expansion leaked:\n{out}"
+    );
+    assert!(
+        !out.contains("expected ';'") && !out.contains("expected ‘;’"),
+        "synthetic statement-fallback diagnostic leaked:\n{out}"
+    );
+    assert!(
+        out.contains("Out[3]: 2"),
+        "session did not survive cleaned diagnostic:\n{out}"
+    );
+
+    let incomplete = run(&["1 +", "1 + 1"]);
+    assert!(
+        incomplete.contains("expected expression at end of input"),
+        "incomplete expression lost its diagnostic:\n{incomplete}"
+    );
+    assert!(
+        !incomplete.contains("before ‘)’") && !incomplete.contains("before ')'"),
+        "closing expression wrapper leaked:\n{incomplete}"
+    );
 }
 
 #[test]
@@ -117,8 +318,8 @@ fn disguised_calls_commit_their_side_effects() {
     // P0 regression: `f/**/()` evaluated correctly but was misjudged as a
     // pure expression and never committed, silently losing session state.
     // The counter lives inside f to keep the scenario portable: a
-    // file-scope function cannot see main's locals (gcc would quietly
-    // accept that as a nested function; clang rejects it outright).
+    // file-scope function cannot see main's locals, and c-shell deliberately
+    // never demotes function-shaped input into GCC's nested-function mode.
     let out = run(&[
         "int f(void) { static int n; return ++n; }",
         "int (*fp)(void) = f;",
@@ -295,6 +496,45 @@ fn type_magic_recognizes_named_and_typedef_aggregates() {
 }
 
 #[test]
+fn src_defaults_to_user_view_and_raw_keeps_scaffolding() {
+    let user = run(&["int source_value = 7;", "%src"]);
+    assert!(user.contains("int main(void)"), "main missing:\n{user}");
+    assert!(
+        user.contains("int source_value = 7;"),
+        "retained statement missing:\n{user}"
+    );
+    assert!(
+        !user.contains("CS_PRINT") && !user.contains("CS_MARK"),
+        "runtime scaffolding leaked into default source view:\n{user}"
+    );
+
+    let raw = run(&["int source_value = 7;", "%src --raw"]);
+    assert!(
+        raw.contains("CS_PRINT") && raw.contains("CS_MARK"),
+        "raw source omitted runtime scaffolding:\n{raw}"
+    );
+}
+
+#[test]
+fn edit_without_previous_or_matching_c_input_is_safe() {
+    let out = run(&["%edit", "1 + 1"]);
+    assert!(
+        out.contains("nothing to edit"),
+        "unexpected edit result:\n{out}"
+    );
+    assert!(
+        out.contains("Out[1]: 2"),
+        "edit consumed an input number:\n{out}"
+    );
+
+    let missing = run(&["1 + 1", "%edit 7"]);
+    assert!(
+        missing.contains("no C input In[7]"),
+        "missing numbered input was not diagnosed:\n{missing}"
+    );
+}
+
+#[test]
 fn clear_erases_screen_without_resetting_session() {
     let out = run(&["int kept = 42;", "%clear", "kept"]);
     assert!(
@@ -305,15 +545,6 @@ fn clear_erases_screen_without_resetting_session() {
         out.contains("Out[2]: 42"),
         "clear changed session state or input numbering:\n{out:?}"
     );
-}
-
-#[test]
-fn history_separates_input_numbers_from_magic_commands() {
-    let out = run(&["int h1 = 41;", "%src", "h1 + 1", "%history"]);
-    assert!(out.contains("In[  1] int h1 = 41;"), "numbered row:\n{out}");
-    assert!(out.contains("In[  2] h1 + 1"), "numbered row:\n{out}");
-    // Magic commands are in the history but never consumed an input number.
-    assert!(out.contains("--    %src"), "magic row:\n{out}");
 }
 
 #[test]
@@ -382,6 +613,29 @@ fn unsupported_explicit_standard_is_an_error() {
         String::from_utf8_lossy(&out.stderr).contains("does not support requested standard"),
         "unexpected diagnostic:\n{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn external_side_effect_replay_warning_is_shown_once() {
+    let out = run(&[
+        "void write_risk(FILE *fp) { fprintf(fp, \"line\\n\"); fclose(fp); }",
+        "void process_risk(void) { system(\"echo not-called\"); }",
+        "1 + 1",
+    ]);
+    assert!(
+        out.contains("external side-effect call detected (fprintf(), fclose())"),
+        "missing actionable replay warning:\n{out}"
+    );
+    assert_eq!(
+        out.matches("file or process effects may happen repeatedly")
+            .count(),
+        1,
+        "replay warning was not once-per-session:\n{out}"
+    );
+    assert!(
+        out.contains("Out[3]: 2"),
+        "session did not continue:\n{out}"
     );
 }
 

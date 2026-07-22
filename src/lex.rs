@@ -202,6 +202,87 @@ pub fn may_have_side_effects(src: &str) -> bool {
     false
 }
 
+/// Standard/POSIX APIs whose replay can silently affect files, processes or
+/// input streams outside the generated program. This is intentionally a
+/// conservative lexical warning, not a claim that a call definitely executes.
+pub fn external_replay_calls(src: &str) -> Vec<String> {
+    const RISKY: &[&str] = &[
+        "fopen",
+        "freopen",
+        "fclose",
+        "fflush",
+        "fprintf",
+        "fscanf",
+        "fgetc",
+        "fgets",
+        "fputc",
+        "fputs",
+        "fread",
+        "fwrite",
+        "scanf",
+        "getchar",
+        "remove",
+        "rename",
+        "tmpfile",
+        "tmpnam",
+        "system",
+        "popen",
+        "pclose",
+        "open",
+        "creat",
+        "close",
+        "read",
+        "write",
+        "unlink",
+        "mkdir",
+        "rmdir",
+        "chdir",
+        "chmod",
+        "truncate",
+        "ftruncate",
+        "fsync",
+        "fork",
+        "execl",
+        "execle",
+        "execlp",
+        "execv",
+        "execve",
+        "execvp",
+        "kill",
+        "setenv",
+        "unsetenv",
+        "putenv",
+    ];
+
+    let sc = scan(src);
+    let b = src.as_bytes();
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if !sc.code[i] || !(b[i] == b'_' || b[i].is_ascii_alphabetic()) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        while i < b.len() && sc.code[i] && is_ident_byte(b[i]) {
+            i += 1;
+        }
+        let word = &src[start..i];
+        if !RISKY.contains(&word) || found.iter().any(|seen| seen == word) {
+            continue;
+        }
+        let mut next = i;
+        while next < b.len() && (!sc.code[next] || b[next].is_ascii_whitespace()) {
+            next += 1;
+        }
+        if b.get(next) == Some(&b'(') {
+            found.push(word.to_string());
+        }
+    }
+    found
+}
+
 /// True when the input looks like a function signature whose body has not
 /// been typed yet — `int f(int n)` with the `{` still to come on the next
 /// line.
@@ -249,6 +330,22 @@ pub fn awaits_body(input: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_external_replay_risks_without_reading_comments_or_literals() {
+        assert_eq!(
+            external_replay_calls(
+                "FILE *fp = fopen(\"data\", \"a\");\n\
+                 fprintf /* comment */ (fp, \"line\\n\"); fclose(fp); fopen(\"x\", \"r\");"
+            ),
+            vec!["fopen", "fprintf", "fclose"]
+        );
+        assert!(external_replay_calls("// remove(\"x\")\n\"system(\"").is_empty());
+        assert_eq!(
+            external_replay_calls("system (\"echo hi\")"),
+            vec!["system"]
+        );
+    }
 
     #[test]
     fn detects_a_signature_waiting_for_its_body() {

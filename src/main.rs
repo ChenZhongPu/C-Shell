@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use crate::codegen::Slot;
 use crate::eval::{Eval, Evaluator};
-use crate::session::{HistoryEntry, Session};
+use crate::session::Session;
 use crate::ui::Ui;
 
 #[derive(Parser)]
@@ -150,10 +150,6 @@ fn main() -> Result<()> {
     let idents = Arc::new(std::sync::Mutex::new(Vec::new()));
     rl.set_helper(Some(editor::CHelper::new(color, Arc::clone(&idents))));
 
-    let hist_path = history_path();
-    if let Some(p) = &hist_path {
-        let _ = rl.load_history(p); // absent on first run; fine
-    }
     // Enter auto-indents continuation lines: padded to the prompt width so
     // code aligns under code, plus two spaces per open bracket. `}` on a
     // blank indent steps one level back out.
@@ -180,40 +176,26 @@ fn main() -> Result<()> {
         if raw.is_empty() {
             continue;
         }
+        let before_edit = session.counter;
+        let editing = raw.split_ascii_whitespace().next() == Some("%edit");
         let _ = rl.add_history_entry(raw);
         let (_, quit) = submit(raw, &mut session, &mut ev, &ui, Style::Repl)?;
+        // The `%edit [n]` command is useful history, but the changed multi-line
+        // C is what Up should retrieve first after the editor closes.
+        if editing
+            && session.counter > before_edit
+            && let Some(edited) = session.last_input()
+        {
+            let _ = rl.add_history_entry(edited);
+        }
         *idents.lock().expect("ident vocabulary") = session.identifiers();
         if quit {
             break;
         }
     }
 
-    if let Some(p) = &hist_path {
-        if let Some(dir) = p.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = rl.save_history(p); // best effort; losing history is not fatal
-    }
     println!("{}", ui.dim("bye"));
     Ok(())
-}
-
-/// Where the persistent readline history lives:
-/// `$XDG_DATA_HOME`/`~/.local/share` on Unix, `%APPDATA%` on Windows,
-/// each with `c-shell/history` appended.
-fn history_path() -> Option<std::path::PathBuf> {
-    let base = if cfg!(windows) {
-        std::env::var_os("APPDATA").map(std::path::PathBuf::from)
-    } else {
-        std::env::var_os("XDG_DATA_HOME")
-            .map(std::path::PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(|h| std::path::PathBuf::from(h).join(".local").join("share"))
-            })
-    }?;
-    Some(base.join("c-shell").join("history"))
 }
 
 /// Feed complete inputs from a reader, accumulating lines until the input is
@@ -294,23 +276,36 @@ fn submit(
         return Ok((true, false));
     }
     if raw.starts_with('%') {
-        session.history.push(HistoryEntry {
-            n: None,
-            text: raw.to_string(),
-        });
         return match magic::handle(raw, session, ev, ui)? {
             magic::Action::Quit => Ok((true, true)),
             magic::Action::Continue => Ok((true, false)),
+            magic::Action::Submit(edited) => submit(&edited, session, ev, ui, style),
         };
     }
 
     let bare = style == Style::Bare;
     let n = session.counter + 1;
     session.counter = n;
-    session.history.push(HistoryEntry {
-        n: Some(n),
-        text: raw.to_string(),
-    });
+    session.remember_input(n, raw);
+
+    let external_calls = lex::external_replay_calls(raw);
+    let external_warning = !external_calls.is_empty() && !session.external_replay_warning_shown();
+    if external_warning {
+        let calls = external_calls
+            .iter()
+            .map(|name| format!("{name}()"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let msg = ui.warn(&format!(
+            "warning: external side-effect call detected ({calls}); retained inputs are replayed before every later evaluation, so input operations and file or process effects may happen repeatedly"
+        ));
+        if bare {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+    }
+
     match ev.eval(session, raw)? {
         Eval::CompileError(diag) => {
             let msg = ui.err(diag.trim_end());
@@ -384,13 +379,28 @@ fn submit(
                     }
                     note("(input not kept in the session)");
                 }
-                None => session.commit(&committed, o.slot),
+                None => {
+                    if let Some(index) = o.file_replacement {
+                        session.replace_file(index, &committed);
+                    } else if o.scoped_rebind {
+                        session.commit_scoped(&committed);
+                    } else {
+                        session.commit(&committed, o.slot);
+                    }
+                    if external_warning {
+                        session.mark_external_replay_warning_shown();
+                    }
+                }
             }
-            if o.slot == Slot::FileScope && o.abnormal.is_none() {
-                note("(added at file scope)");
-            }
-            if o.demoted && o.abnormal.is_none() {
-                note("(note: kept inside main — it did not compile at file scope)");
+            if o.abnormal.is_none() {
+                if o.file_replacement.is_some() {
+                    note("(replaced previous file-scope definition)");
+                } else if o.slot == Slot::FileScope {
+                    note("(added at file scope)");
+                }
+                if o.scoped_rebind {
+                    note("(opened a nested scope to shadow an earlier declaration)");
+                }
             }
             Ok((o.abnormal.is_none(), false))
         }

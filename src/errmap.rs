@@ -7,12 +7,20 @@
 
 /// Rewrite `raw` so locations inside the new input become input-relative.
 ///
-/// `src` is the path handed to the compiler, `start` is the 1-based line in
-/// the generated file where the user's text begins, and `count` is how many
-/// lines that text occupies. Anything outside `start..start+count` belongs to
-/// generated scaffolding or an earlier input and must not be presented as if
-/// the user had typed it.
-pub fn remap(raw: &str, src: &str, start: usize, count: usize, wrapped: bool) -> String {
+/// `src` is the path handed to the compiler, `generated` is its contents,
+/// `start` is the 1-based line where the newest input begins, and `count` is
+/// how many lines that text occupies. `session_ranges` distinguishes retained
+/// user text from runtime/wrapper lines so source excerpts can hide generated
+/// scaffolding without discarding useful cross-reference diagnostics.
+pub fn remap(
+    raw: &str,
+    src: &str,
+    generated: &str,
+    start: usize,
+    count: usize,
+    session_ranges: &[(usize, usize)],
+    wrapped: bool,
+) -> String {
     // Map a generated-file line to an input-relative one. With `wrapped`,
     // the wrapper lines directly above and below the input hold nothing but
     // `CS_PRINT((` and `));`, so a diagnostic anchored there — MSVC's
@@ -37,37 +45,84 @@ pub fn remap(raw: &str, src: &str, start: usize, count: usize, wrapped: bool) ->
         .file_name()
         .and_then(|s| s.to_str());
     let mut out = String::with_capacity(raw.len());
+    let mut dropping_generated_gutter = false;
     for line in raw.lines() {
         if basename.is_some_and(|b| line.trim() == b) {
             continue;
         }
+
+        if let Some(gutter) = remap_gutter(line, start, count, session_ranges) {
+            match gutter {
+                Gutter::Keep(line) => {
+                    dropping_generated_gutter = false;
+                    out.push_str(&line);
+                    out.push('\n');
+                }
+                Gutter::Generated => dropping_generated_gutter = true,
+            }
+            continue;
+        }
+        if is_gutter_continuation(line) {
+            if !dropping_generated_gutter {
+                out.push_str(line);
+                out.push('\n');
+            }
+            continue;
+        }
+        dropping_generated_gutter = false;
+
         match split_location(line, src) {
+            // An incomplete expression can make the closing `));` wrapper
+            // appear as the unexpected token. Report the actual user-facing
+            // condition without quoting punctuation c-shell injected.
+            Some((gen_line, rest))
+                if is_wrapper_fallout(gen_line, rest, generated, start, count) =>
+            {
+                out.push_str(&format!(
+                    "<input>:{count}: error: expected expression at end of input"
+                ));
+            }
+            // A parser error at the end of a statement can name `do` solely
+            // because the next generated line expands CS_MARK to do/while.
+            // Mark that whole diagnostic block as generated so later filters
+            // remove it rather than blaming a token the user never typed.
+            Some((gen_line, rest))
+                if is_marker_fallout(gen_line, rest, generated, start, count) =>
+            {
+                out.push_str(&format!("<generated>{rest}"));
+            }
             Some((gen_line, rest)) if map_line(gen_line).is_some() => {
                 let mapped = map_line(gen_line).expect("checked in guard");
                 out.push_str(&format!("<input>:{mapped}{rest}"));
             }
-            // A complaint anchored in the prelude, in the generated `main`
-            // wrapper, or in code from an earlier input. Kept, because it is
-            // often the other half of a cross-referencing diagnostic such as
-            // "previous definition was here", but never labelled `<input>`.
-            Some((_, rest)) => out.push_str(&format!("<session>{rest}")),
-            None => {
-                let scrubbed = line.replace(src, "<input>");
-                out.push_str(&remap_gutter(&scrubbed, start, count).unwrap_or(scrubbed));
+            Some((gen_line, rest)) if in_ranges(gen_line, session_ranges) => {
+                out.push_str(&format!("<session>{rest}"));
             }
+            // Diagnostics anchored in runtime macros, marker calls or the
+            // generated main wrapper are retained only under an internal tag;
+            // public warning/error filters drop the complete block.
+            Some((_, rest)) => out.push_str(&format!("<generated>{rest}")),
+            None => out.push_str(&line.replace(src, "<input>")),
         }
         out.push('\n');
     }
     out
 }
 
+enum Gutter {
+    Keep(String),
+    Generated,
+}
+
 /// Rewrite the line number in a GCC/Clang source-excerpt gutter (`  42 | ...`).
-///
-/// Without this the header says `<input>:1` while the excerpt underneath it
-/// still says `42`, which is exactly the kind of contradiction that makes a
-/// beginner distrust the tool. Numbers outside the input are blanked rather
-/// than renumbered: the excerpt text is real, its position is not the user's.
-fn remap_gutter(line: &str, start: usize, count: usize) -> Option<String> {
+/// New-input lines are renumbered, retained session lines keep their text with
+/// the meaningless generated number blanked, and scaffolding lines disappear.
+fn remap_gutter(
+    line: &str,
+    start: usize,
+    count: usize,
+    session_ranges: &[(usize, usize)],
+) -> Option<Gutter> {
     let trimmed = line.trim_start();
     let indent = line.len() - trimmed.len();
     let digits: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -79,12 +134,126 @@ fn remap_gutter(line: &str, start: usize, count: usize) -> Option<String> {
         return None;
     }
     let n: usize = digits.parse().ok()?;
-    let shown = if n >= start && n < start + count {
-        format!("{:>w$}", n - start + 1, w = digits.len())
-    } else {
-        " ".repeat(digits.len())
+    if n >= start && n < start + count {
+        let shown = format!("{:>w$}", n - start + 1, w = digits.len());
+        return Some(Gutter::Keep(format!(
+            "{}{}{}",
+            " ".repeat(indent),
+            shown,
+            rest
+        )));
+    }
+    if in_ranges(n, session_ranges) {
+        return Some(Gutter::Keep(format!(
+            "{}{}{}",
+            " ".repeat(indent),
+            " ".repeat(digits.len()),
+            rest
+        )));
+    }
+    Some(Gutter::Generated)
+}
+
+fn is_gutter_continuation(line: &str) -> bool {
+    line.trim_start().starts_with('|')
+}
+
+fn in_ranges(line: usize, ranges: &[(usize, usize)]) -> bool {
+    ranges
+        .iter()
+        .any(|&(start, count)| line >= start && line < start + count)
+}
+
+fn is_wrapper_fallout(
+    gen_line: usize,
+    rest: &str,
+    generated: &str,
+    start: usize,
+    count: usize,
+) -> bool {
+    let last_input_gen_line = start + count - 1;
+    let opening_wrapper_gen_line = start.saturating_sub(1);
+    if gen_line != opening_wrapper_gen_line
+        && gen_line != last_input_gen_line
+        && gen_line != last_input_gen_line + 1
+    {
+        return false;
+    }
+    let Some(last_input_line) = generated.lines().nth(last_input_gen_line - 1) else {
+        return false;
     };
-    Some(format!("{}{}{}", " ".repeat(indent), shown, rest))
+    if last_input_line.trim_end().ends_with(')') {
+        return false;
+    }
+    let Some(next_line) = generated.lines().nth(last_input_gen_line) else {
+        return false;
+    };
+    let closes_wrapper = matches!(next_line.trim(), "));" | ")));" | "),");
+    closes_wrapper
+        && (rest.contains("expected expression")
+            || (rest.contains("syntax error")
+                && ["')'", "‘)’", "`)'"]
+                    .iter()
+                    .any(|quoted| rest.contains(quoted))))
+}
+
+fn is_marker_fallout(
+    gen_line: usize,
+    rest: &str,
+    generated: &str,
+    start: usize,
+    count: usize,
+) -> bool {
+    if gen_line != start + count - 1 {
+        return false;
+    }
+    let Some(last_input_line) = generated.lines().nth(gen_line - 1) else {
+        return false;
+    };
+    // If the user really wrote a `do` token, the diagnostic is theirs. A
+    // false negative here merely leaves compiler prose intact; it is safer
+    // than hiding a real parser error.
+    if last_input_line
+        .split(|c: char| !(c == '_' || c.is_ascii_alphanumeric()))
+        .any(|token| token == "do")
+    {
+        return false;
+    }
+    let Some(next_line) = generated.lines().nth(gen_line) else {
+        return false;
+    };
+    if !next_line.trim_start().starts_with("CS_MARK(CS_M_DONE)") {
+        return false;
+    }
+    let names_generated_do = ["'do'", "‘do’", "`do'", "\"do\""]
+        .iter()
+        .any(|quoted| rest.contains(quoted));
+    if names_generated_do {
+        return true;
+    }
+
+    // Clang diagnoses the same fallback as "expected ';' after expression"
+    // without naming the following marker. It is synthetic only when the
+    // caret is just past the final user byte; a semicolon complaint before a
+    // real token on that line must remain visible.
+    let missing_semicolon = [
+        "expected ';' after expression",
+        "expected ‘;’ after expression",
+        "expected ';' at end",
+        "expected ‘;’ at end",
+    ]
+    .iter()
+    .any(|text| rest.contains(text));
+    missing_semicolon
+        && diagnostic_column(rest).is_some_and(|column| {
+            column >= last_input_line.trim_end().chars().count().saturating_add(1)
+        })
+}
+
+fn diagnostic_column(rest: &str) -> Option<usize> {
+    let after_colon = rest.strip_prefix(':')?;
+    let end = after_colon.find(|c: char| !c.is_ascii_digit())?;
+    after_colon[..end].parse().ok()
 }
 
 /// Keep only the diagnostic blocks anchored in the newest input.
@@ -129,16 +298,21 @@ fn filter_blocks(text: &str, keep_header: impl Fn(&str) -> bool) -> String {
             pending = Some(line.to_string());
             continue;
         }
-        if line.starts_with("<input>:") || line.starts_with("<session>") {
-            keep = keep_header(line);
+        if line.starts_with("<input>:")
+            || line.starts_with("<session>")
+            || line.starts_with("<generated>")
+        {
+            keep = !line.starts_with("<generated>") && keep_header(line);
         }
         if keep {
             if let Some(p) = pending.take() {
                 out.push_str(&p);
                 out.push('\n');
             }
-            out.push_str(line);
-            out.push('\n');
+            if out.lines().next_back() != Some(line) {
+                out.push_str(line);
+                out.push('\n');
+            }
         }
     }
     out
@@ -147,7 +321,7 @@ fn filter_blocks(text: &str, keep_header: impl Fn(&str) -> bool) -> String {
 /// A `<input>: In function 'main':` style banner: anchored to the file but to
 /// no particular line.
 fn is_group_banner(line: &str) -> bool {
-    for tag in ["<input>: ", "<session>: "] {
+    for tag in ["<input>: ", "<session>: ", "<generated>: "] {
         if let Some(rest) = line.strip_prefix(tag) {
             return !rest.starts_with(|c: char| c.is_ascii_digit());
         }
@@ -191,7 +365,7 @@ mod tests {
     fn maps_gnu_location_into_input_space() {
         let raw = "/tmp/x/in.c:42:5: error: 'y' undeclared";
         assert_eq!(
-            remap(raw, "/tmp/x/in.c", 40, 5, false).trim_end(),
+            remap(raw, "/tmp/x/in.c", "", 40, 5, &[], false).trim_end(),
             "<input>:3:5: error: 'y' undeclared"
         );
     }
@@ -200,30 +374,29 @@ mod tests {
     fn maps_msvc_location() {
         let raw = "C:\\t\\in.c(42): error C2065: 'y': undeclared identifier";
         assert_eq!(
-            remap(raw, "C:\\t\\in.c", 42, 1, false).trim_end(),
+            remap(raw, "C:\\t\\in.c", "", 42, 1, &[], false).trim_end(),
             "<input>:1: error C2065: 'y': undeclared identifier"
         );
     }
 
     #[test]
-    fn labels_locations_outside_the_input() {
+    fn distinguishes_retained_session_locations_from_generated_ones() {
         let raw = "/tmp/x/in.c:10:1: note: previous definition";
         assert_eq!(
-            remap(raw, "/tmp/x/in.c", 40, 1, false).trim_end(),
+            remap(raw, "/tmp/x/in.c", "", 40, 1, &[(10, 1)], false).trim_end(),
             "<session>:1: note: previous definition"
         );
         // Just past the end of a one-line input: the generated `return 0;`.
         let raw = "/tmp/x/in.c:41:5: error: expected ';' before 'return'";
-        assert!(remap(raw, "/tmp/x/in.c", 40, 1, false).starts_with("<session>"));
+        assert!(remap(raw, "/tmp/x/in.c", "", 40, 1, &[], false).starts_with("<generated>"));
     }
 
     #[test]
     fn renumbers_the_excerpt_gutter_to_match_the_header() {
         let raw = "   42 | int x = ;\n   43 |     return 0;";
-        let got = remap(raw, "/tmp/x/in.c", 42, 1, false);
+        let got = remap(raw, "/tmp/x/in.c", "", 42, 1, &[], false);
         assert!(got.contains("    1 | int x = ;"), "{got}");
-        // Scaffolding keeps its text but loses its misleading number.
-        assert!(got.contains("      |     return 0;"), "{got}");
+        assert!(!got.contains("return 0"), "scaffolding leaked: {got}");
     }
 
     #[test]
@@ -234,24 +407,77 @@ mod tests {
         // anchor is clamped to the expression.
         let raw = "C:\\t\\in.c(41): warning C4018: '>': signed/unsigned mismatch";
         assert_eq!(
-            remap(raw, "C:\\t\\in.c", 42, 1, true).trim_end(),
+            remap(raw, "C:\\t\\in.c", "", 42, 1, &[], true).trim_end(),
             "<input>:1: warning C4018: '>': signed/unsigned mismatch"
         );
         // The closing `));` line clamps to the input's last line.
         let raw2 = "C:\\t\\in.c(43): error C2143: syntax error";
         assert_eq!(
-            remap(raw2, "C:\\t\\in.c", 42, 1, true).trim_end(),
+            remap(raw2, "C:\\t\\in.c", "", 42, 1, &[], true).trim_end(),
             "<input>:1: error C2143: syntax error"
         );
         // Unwrapped slots keep strict attribution.
-        assert!(remap(raw, "C:\\t\\in.c", 42, 1, false).starts_with("<session>"));
+        assert!(remap(raw, "C:\\t\\in.c", "", 42, 1, &[], false).starts_with("<generated>"));
+    }
+
+    #[test]
+    fn removes_wrapper_source_excerpts_but_keeps_user_code() {
+        let raw = "/tmp/x/in.c:42:1: warning: pointer used after free\n\
+                    41 |     CS_PRINT((\n\
+                       |              ~\n\
+                    42 | *p\n\
+                       | ^~\n\
+                    43 |     ));\n\
+                       |     ~";
+        let got = remap(raw, "/tmp/x/in.c", "", 42, 1, &[], true);
+        assert!(got.contains("1 | *p"), "user excerpt missing: {got}");
+        assert!(!got.contains("CS_PRINT"), "opening wrapper leaked: {got}");
+        assert!(!got.contains("));"), "closing wrapper leaked: {got}");
+    }
+
+    #[test]
+    fn incomplete_expression_does_not_blame_the_closing_wrapper() {
+        let generated = "int main(void)\n1 +\n    ));\n";
+        let raw = "/tmp/x/in.c:2:4: error: expected expression before ')' token\n\
+                   /tmp/x/in.c:2:4: error: expected expression before ')' token";
+        let mapped = remap(raw, "/tmp/x/in.c", generated, 2, 1, &[], true);
+        let got = drop_stale_warnings(&mapped);
+        assert_eq!(
+            got.trim_end(),
+            "<input>:1: error: expected expression at end of input"
+        );
+
+        let msvc = "C:\\t\\in.c(1): error C2059: syntax error: ')'";
+        let mapped = remap(msvc, "C:\\t\\in.c", generated, 2, 1, &[], true);
+        assert_eq!(
+            drop_stale_warnings(&mapped).trim_end(),
+            "<input>:1: error: expected expression at end of input"
+        );
+    }
+
+    #[test]
+    fn drops_parser_fallout_that_names_the_generated_marker_macro() {
+        let generated = "int main(void)\nnumbr + 1\n    CS_MARK(CS_M_DONE);\n";
+        let raw = "/tmp/x/in.c:2:1: error: 'numbr' undeclared\n\
+                   /tmp/x/in.c:2:10: error: expected ';' before 'do'";
+        let mapped = remap(raw, "/tmp/x/in.c", generated, 2, 1, &[], false);
+        let got = drop_stale_warnings(&mapped);
+        assert!(got.contains("numbr"), "real diagnostic missing: {got}");
+        assert!(!got.contains("do"), "generated macro token leaked: {got}");
+
+        let clang = "/tmp/x/in.c:2:10: error: expected ';' after expression";
+        let mapped = remap(clang, "/tmp/x/in.c", generated, 2, 1, &[], false);
+        assert!(
+            drop_stale_warnings(&mapped).is_empty(),
+            "synthetic Clang semicolon diagnostic survived: {mapped}"
+        );
     }
 
     #[test]
     fn drops_msvc_bare_filename_lines() {
         // cl.exe echoes the source filename to stdout on every compile.
         let raw = "input.c\n/tmp/x/input.c:42:1: warning: something";
-        let got = remap(raw, "/tmp/x/input.c", 42, 1, false);
+        let got = remap(raw, "/tmp/x/input.c", "", 42, 1, &[], false);
         assert!(!got.contains("input.c"), "{got}");
         assert!(got.contains("<input>:1:1: warning"), "{got}");
     }
@@ -260,7 +486,7 @@ mod tests {
     fn scrubs_temp_path_from_unlocated_lines() {
         let raw = "cc1: warning while reading /tmp/x/in.c";
         assert_eq!(
-            remap(raw, "/tmp/x/in.c", 1, 1, false).trim_end(),
+            remap(raw, "/tmp/x/in.c", "", 1, 1, &[], false).trim_end(),
             "cc1: warning while reading <input>"
         );
     }

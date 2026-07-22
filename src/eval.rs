@@ -34,11 +34,12 @@ pub struct Outcome {
     /// Set when the input had to be repaired to compile; this is what should
     /// be committed to the session instead of what was typed.
     pub rewritten: Option<String>,
-    /// The input looked file-scope but only compiled inside `main`. Usually
-    /// a function definition referencing session variables, which gcc
-    /// quietly accepts as a GNU nested function and clang rejects — worth a
-    /// visible note, or the session breaks the moment the compiler changes.
-    pub demoted: bool,
+    /// The normal block-scope assembly failed, but entering a nested block
+    /// made the compiler accept this declaration as a shadowing rebind.
+    pub scoped_rebind: bool,
+    /// Existing file-scope item replaced in place, selected by successful
+    /// whole-program compilation rather than by parsing a declaration name.
+    pub file_replacement: Option<usize>,
     /// The input is a valid expression, but its value category has no printer;
     /// it was evaluated through the silent expression wrapper instead.
     pub unprintable: bool,
@@ -135,17 +136,39 @@ impl Evaluator {
         let (start, count) = (prog.new_start_line, prog.new_line_count);
         match self.compile_text(&prog.src) {
             Ok((exe, warns)) => {
-                let warnings =
-                    errmap::only_new(&errmap::remap(&warns, &src, start, count, prog.wrapped));
+                let warnings = errmap::only_new(&errmap::remap(
+                    &warns,
+                    &src,
+                    &prog.src,
+                    start,
+                    count,
+                    &prog.session_line_ranges,
+                    prog.wrapped,
+                ));
                 Ok(Eval::Done(self.run(&exe, Slot::Expr, warnings)?))
             }
             Err(diag) => Ok(Eval::CompileError(errmap::drop_stale_warnings(
-                &errmap::remap(&diag, &src, start, count, prog.wrapped),
+                &errmap::remap(
+                    &diag,
+                    &src,
+                    &prog.src,
+                    start,
+                    count,
+                    &prog.session_line_ranges,
+                    prog.wrapped,
+                ),
             ))),
         }
     }
 
     pub fn eval(&self, session: &Session, input: &str) -> Result<Eval> {
+        if function_definition_name(input).as_deref() == Some("main") {
+            return Ok(Eval::CompileError(
+                "c-shell already provides main(); enter the statements from its body directly and omit the final return"
+                    .to_string(),
+            ));
+        }
+
         let diag = match self.attempt(session, input)? {
             Ok(o) => return Ok(Eval::Done(o)),
             Err(d) => d,
@@ -167,63 +190,72 @@ impl Evaluator {
         Ok(Eval::CompileError(diag))
     }
 
-    /// Try each slot in turn; on total failure return the diagnostics from
-    /// whichever slot the input most likely meant.
+    /// Try compiler-validated assembly strategies. File-scope-shaped input is
+    /// never demoted into `main`: GCC nested functions would make identical
+    /// sessions diverge from Clang/MSVC. On a normal failure, candidate
+    /// rebinding strategies are accepted only when the whole program compiles.
     fn attempt(
         &self,
         session: &Session,
         input: &str,
     ) -> Result<std::result::Result<Outcome, String>> {
-        // A wrong guess here is not fatal: it only changes which attempt runs
-        // first, and the remaining slots are still tried. It matters because
-        // gcc accepts nested functions as a GNU extension, so a function
-        // definition would otherwise be silently buried inside main, where
-        // clang would later reject it.
-        let file_first = looks_file_scope(input);
-        // File scope is deliberately absent from the second list. It is a
-        // wider scope than `main`, so offering it as a last resort turns a
-        // redeclaration that ought to be an error into a silent global that
-        // the local of the same name then shadows. Only the expression /
-        // statement distinction is genuinely ambiguous; file-scope membership
-        // is settled by the heuristic above.
-        let order: &[Slot] = if file_first {
-            &[Slot::FileScope, Slot::Stmt, Slot::Expr]
-        } else {
-            &[Slot::Expr, Slot::Stmt]
-        };
-        // Any expression is also a valid statement, so the statement attempt
-        // reports the same underlying mistake in friendlier words. Report that
-        // one unless the input was clearly meant to be file-scope.
-        let report_slot = if file_first {
-            Slot::FileScope
-        } else {
-            Slot::Stmt
-        };
-        let mut reported = String::new();
+        if looks_file_scope(input) {
+            let normal = codegen::build(session, input, Slot::FileScope);
+            let reported = match self.try_program(normal, Slot::FileScope)? {
+                Ok(o) => return Ok(Ok(o)),
+                Err(diag) => diag,
+            };
 
-        for &slot in order {
-            let prog = codegen::build(session, input, slot);
-            let src = self.src_path().display().to_string();
-            let (start, count) = (prog.new_start_line, prog.new_line_count);
-            match self.compile_text(&prog.src) {
-                Ok((exe, warns)) => {
-                    let warnings =
-                        errmap::only_new(&errmap::remap(&warns, &src, start, count, prog.wrapped));
-                    let mut o = self.run(&exe, slot, warnings)?;
-                    o.demoted = file_first && slot != Slot::FileScope;
+            // Syntax/type errors must not trigger O(session size) retries.
+            // Only diagnostics in the compiler's redeclaration family enter
+            // replacement arbitration; the candidates themselves are still
+            // accepted solely by compiling the complete program.
+            if !is_rebinding_diagnostic(&reported) {
+                return Ok(Err(reported));
+            }
+
+            // Substitute each prior definition in place, newest first. An
+            // unrelated removal cannot normally cure a redefinition, while
+            // replacing the matching item does; the compiler remains the name
+            // and compatibility oracle. Preprocessor directives are not
+            // candidates because dropping an #include is not rebinding.
+            for index in (0..session.file_items.len()).rev() {
+                if session.file_items[index].trim_start().starts_with('#') {
+                    continue;
+                }
+                let prog = codegen::build_file_replacement(session, input, index);
+                if let Ok(mut o) = self.try_program(prog, Slot::FileScope)? {
+                    o.file_replacement = Some(index);
                     return Ok(Ok(o));
                 }
-                Err(diag) => {
-                    if slot == report_slot {
-                        reported = errmap::drop_stale_warnings(&errmap::remap(
-                            &diag,
-                            &src,
-                            start,
-                            count,
-                            prog.wrapped,
-                        ));
+            }
+            return Ok(Err(reported));
+        }
+
+        let mut reported = String::new();
+        let mut expr_reported = None;
+        let try_expr = should_try_expr(input);
+        let slots: &[Slot] = if try_expr {
+            &[Slot::Expr, Slot::Stmt]
+        } else {
+            &[Slot::Stmt]
+        };
+        for &slot in slots {
+            let normal = codegen::build(session, input, slot);
+            match self.try_program(normal, slot)? {
+                Ok(o) => return Ok(Ok(o)),
+                Err(diag) if slot == Slot::Stmt => {
+                    let retry_scoped = is_rebinding_diagnostic(&diag);
+                    reported = diag;
+                    if retry_scoped {
+                        let scoped = codegen::build_scoped_stmt(session, input);
+                        if let Ok(mut o) = self.try_program(scoped, Slot::Stmt)? {
+                            o.scoped_rebind = true;
+                            return Ok(Ok(o));
+                        }
                     }
                 }
+                Err(diag) => expr_reported = Some(diag),
             }
         }
 
@@ -231,22 +263,55 @@ impl Evaluator {
         // association for this value category. Before missing-semicolon
         // repair turns it into a statement, compile and execute the same text
         // as a silent expression so the UI can explain why there is no value.
-        let t = input.trim_end();
-        let bare_candidate =
-            !t.ends_with(';') && !t.ends_with('}') && !t.trim_start().starts_with('#');
-        if bare_candidate {
+        if try_expr {
             let prog = codegen::build_expr_probe(session, input);
-            let src = self.src_path().display().to_string();
-            let (start, count) = (prog.new_start_line, prog.new_line_count);
-            if let Ok((exe, warns)) = self.compile_text(&prog.src) {
-                let warnings = errmap::only_new(&errmap::remap(&warns, &src, start, count, false));
-                let mut o = self.run(&exe, Slot::Expr, warnings)?;
+            if let Ok(mut o) = self.try_program(prog, Slot::Expr)? {
                 o.value = None;
                 o.unprintable = true;
                 return Ok(Ok(o));
             }
         }
+        // Sanitizing statement-fallback fallout can remove its only block for
+        // a genuinely incomplete expression (`1 +`). Never return a blank
+        // error when the earlier expression compile has a real diagnostic.
+        if reported.trim().is_empty()
+            && let Some(expr) = expr_reported
+        {
+            reported = expr;
+        }
         Ok(Err(reported))
+    }
+
+    fn try_program(
+        &self,
+        prog: codegen::Program,
+        slot: Slot,
+    ) -> Result<std::result::Result<Outcome, String>> {
+        let src = self.src_path().display().to_string();
+        let (start, count) = (prog.new_start_line, prog.new_line_count);
+        match self.compile_text(&prog.src) {
+            Ok((exe, warns)) => {
+                let warnings = errmap::only_new(&errmap::remap(
+                    &warns,
+                    &src,
+                    &prog.src,
+                    start,
+                    count,
+                    &prog.session_line_ranges,
+                    prog.wrapped,
+                ));
+                Ok(Ok(self.run(&exe, slot, warnings)?))
+            }
+            Err(diag) => Ok(Err(errmap::drop_stale_warnings(&errmap::remap(
+                &diag,
+                &src,
+                &prog.src,
+                start,
+                count,
+                &prog.session_line_ranges,
+                prog.wrapped,
+            )))),
+        }
     }
 
     fn run(&self, exe: &PathBuf, slot: Slot, warnings: String) -> Result<Outcome> {
@@ -313,7 +378,8 @@ impl Evaluator {
             warnings,
             abnormal,
             rewritten: None,
-            demoted: false,
+            scoped_rebind: false,
+            file_replacement: None,
             unprintable: false,
         })
     }
@@ -587,9 +653,105 @@ fn describe_abnormal(st: &std::process::ExitStatus) -> Option<String> {
     })
 }
 
+/// Diagnostics that mean "this name already denotes something here".
+/// GNU/Clang spellings are textual; MSVC diagnostic codes remain stable even
+/// when its prose is localized. A positive match only enables a retry — the
+/// alternate assembly still has to compile and run before it can be committed.
+fn is_rebinding_diagnostic(diag: &str) -> bool {
+    let lower = diag.to_ascii_lowercase();
+    [
+        "redefinition",
+        "redeclaration",
+        "redeclared",
+        "conflicting types for",
+        "already has a body",
+        "c2011",
+        "c2084",
+        "c2086",
+        "c2365",
+        "c2371",
+        "c2373",
+        "c2374",
+        "c2375",
+        "c2556",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// Whether expression classification can possibly succeed.
+///
+/// A top-level trailing semicolon makes the `CS_PRINT((input))` wrapper
+/// syntactically impossible, so statement-shaped input takes one compiler
+/// process instead of predictably failing an expression compile first. A
+/// trailing `}` normally has the same property, except for C compound
+/// literals such as `(int){1}` or `x = (Point){1, 2}`.
+fn should_try_expr(input: &str) -> bool {
+    let scan = lex::scan(input);
+    let Some(last) = input
+        .as_bytes()
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(i, byte)| scan.code[*i] && !byte.is_ascii_whitespace())
+        .map(|(i, _)| i)
+    else {
+        return false;
+    };
+    match input.as_bytes()[last] {
+        b';' => false,
+        b'}' => ends_in_possible_compound_literal(input, &scan.code, last),
+        _ => true,
+    }
+}
+
+fn ends_in_possible_compound_literal(input: &str, code: &[bool], close: usize) -> bool {
+    let bytes = input.as_bytes();
+    let mut depth = 0usize;
+    let mut open = None;
+    for i in (0..=close).rev() {
+        if !code[i] {
+            continue;
+        }
+        match bytes[i] {
+            b'}' => depth += 1,
+            b'{' => {
+                depth -= 1;
+                if depth == 0 {
+                    open = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(open) = open else { return true };
+    let Some(before) = (0..open)
+        .rev()
+        .find(|&i| code[i] && !bytes[i].is_ascii_whitespace())
+    else {
+        return false;
+    };
+    if bytes[before] != b')' {
+        return false;
+    }
+
+    // `if (x) { ... }` has the same `) {` boundary as a compound literal.
+    // Clear control-flow prefixes are statements; ambiguous forms keep the
+    // expression trial so classification can never reject valid C merely to
+    // save a process launch.
+    !lex::identifiers(input).first().is_some_and(|word| {
+        matches!(
+            word.as_str(),
+            "if" | "for" | "while" | "switch" | "do" | "else" | "case"
+        )
+    })
+}
+
 /// Does this input have to live outside `main`?
 ///
-/// Only a heuristic, and only used to pick which slot to try first.
+/// This lexical routing is exclusive: once input has file-scope shape it is
+/// never retried as a statement, because GCC might accept a nested function.
 fn looks_file_scope(input: &str) -> bool {
     let t = input.trim_start();
     if t.starts_with('#') {
@@ -635,24 +797,121 @@ fn looks_file_scope(input: &str) -> bool {
         }
         return false;
     }
-    has_paren_then_brace(input)
+    !first.is_empty() && function_definition_name(input).is_some()
 }
 
-/// True when a `)` is followed only by whitespace before the first `{`, the
-/// shape of a function definition's parameter list meeting its body.
-fn has_paren_then_brace(input: &str) -> bool {
+/// Return the simple function name whose parameter list meets a top-level
+/// body brace. Merely spotting `) {` is insufficient: compound literals such
+/// as `Point p = (Point){1, 2}` have the same byte pattern.
+fn function_definition_name(input: &str) -> Option<String> {
     let sc = lex::scan(input);
     let b = input.as_bytes();
-    let brace = match (0..b.len()).find(|&i| sc.code[i] && b[i] == b'{') {
-        Some(i) => i,
-        None => return false,
-    };
-    (0..brace)
+    let mut parens = 0i32;
+    let mut brackets = 0i32;
+    let mut brace = None;
+    for (i, &byte) in b.iter().enumerate() {
+        if !sc.code[i] {
+            continue;
+        }
+        match byte {
+            b'(' => parens += 1,
+            b')' => parens -= 1,
+            b'[' => brackets += 1,
+            b']' => brackets -= 1,
+            b'=' if parens == 0 && brackets == 0 => return None,
+            b'{' if parens == 0 && brackets == 0 => {
+                brace = Some(i);
+                break;
+            }
+            // Braces while parentheses remain open can belong to a struct in
+            // a parameter list (or to an expression); only a later top-level
+            // brace can be the function body.
+            b'{' => {}
+            _ => {}
+        }
+    }
+    let brace = brace?;
+    let close = (0..brace)
         .rev()
-        .filter(|&i| sc.code[i])
-        .find(|&i| !b[i].is_ascii_whitespace())
-        .map(|i| b[i] == b')')
-        .unwrap_or(false)
+        .find(|&i| sc.code[i] && !b[i].is_ascii_whitespace())?;
+    if b[close] != b')' {
+        return None;
+    }
+
+    // Find that closing paren's mate and require a declarator-like token just
+    // before it. This rejects `(Type){...}` and `cond ? (Type){...}`.
+    let mut depth = 0i32;
+    let mut open = None;
+    for i in (0..=close).rev() {
+        if !sc.code[i] {
+            continue;
+        }
+        match b[i] {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    open = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let open = open?;
+    let before = (0..open)
+        .rev()
+        .find(|&i| sc.code[i] && !b[i].is_ascii_whitespace())?;
+    if b[before] == b')' {
+        // Parenthesized declarator: `int (main)(void) { ... }`.
+        let mut depth = 0i32;
+        let mut inner_open = None;
+        for i in (0..=before).rev() {
+            if !sc.code[i] {
+                continue;
+            }
+            match b[i] {
+                b')' => depth += 1,
+                b'(' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        inner_open = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let inner_open = inner_open?;
+        return identifier_between(input, &sc.code, inner_open + 1, before);
+    }
+    identifier_ending_at(input, &sc.code, before)
+}
+
+fn identifier_ending_at(input: &str, code: &[bool], end: usize) -> Option<String> {
+    let b = input.as_bytes();
+    if !(b[end] == b'_' || b[end].is_ascii_alphanumeric()) {
+        return None;
+    }
+    let mut start = end;
+    while start > 0
+        && code[start - 1]
+        && (b[start - 1] == b'_' || b[start - 1].is_ascii_alphanumeric())
+    {
+        start -= 1;
+    }
+    (!b[start].is_ascii_digit()).then(|| input[start..=end].to_string())
+}
+
+fn identifier_between(input: &str, code: &[bool], start: usize, end: usize) -> Option<String> {
+    let b = input.as_bytes();
+    let first = (start..end).find(|&i| code[i] && !b[i].is_ascii_whitespace())?;
+    let last = (first..end)
+        .rev()
+        .find(|&i| code[i] && !b[i].is_ascii_whitespace())?;
+    let ident = identifier_ending_at(input, code, last)?;
+    let ident_start = last + 1 - ident.len();
+    (ident_start == first).then_some(ident)
 }
 
 #[cfg(test)]
@@ -660,8 +919,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn skips_impossible_expression_trials_without_losing_compound_literals() {
+        assert!(!should_try_expr("int value = 1;"));
+        assert!(!should_try_expr("value++; // retained statement"));
+        assert!(!should_try_expr("if (value) { value--; }"));
+        assert!(!should_try_expr("{ value++; }"));
+        assert!(should_try_expr("value + 1"));
+        assert!(should_try_expr("(int){ 7 }"));
+        assert!(should_try_expr("value = (struct Box){ 7 }"));
+    }
+
+    #[test]
+    fn recognizes_portable_rebinding_diagnostics() {
+        assert!(is_rebinding_diagnostic("error: redefinition of 'f'"));
+        assert!(is_rebinding_diagnostic("error: conflicting types for 'x'"));
+        assert!(is_rebinding_diagnostic(
+            "error C2084: function 'f' already has a body"
+        ));
+        assert!(!is_rebinding_diagnostic("error: expected expression"));
+    }
+
+    #[test]
+    fn recognizes_main_definitions_without_matching_similar_expressions() {
+        assert_eq!(
+            function_definition_name("int main(void) { return 0; }").as_deref(),
+            Some("main")
+        );
+        assert_eq!(
+            function_definition_name("int (main)(int argc, char **argv) { return argc; }")
+                .as_deref(),
+            Some("main")
+        );
+        assert_eq!(
+            function_definition_name("int domain(void) { return 1; }").as_deref(),
+            Some("domain")
+        );
+        assert_eq!(function_definition_name("Point p = (Point){1, 2};"), None);
+    }
+
+    #[test]
     fn routes_definitions_to_file_scope() {
         assert!(looks_file_scope("int add(int a, int b) { return a + b; }"));
+        assert!(looks_file_scope(
+            "int get(struct Local { int x; } v) { return v.x; }"
+        ));
         assert!(looks_file_scope("#include <time.h>"));
         assert!(looks_file_scope("typedef unsigned long ulong;"));
         assert!(looks_file_scope("struct P { int x; int y; };"));
@@ -671,6 +972,9 @@ mod tests {
     fn keeps_statements_in_main() {
         assert!(!looks_file_scope("if (x > 0) { puts(\"hi\"); }"));
         assert!(!looks_file_scope("for (int i = 0; i < 3; i++) { }"));
+        assert!(!looks_file_scope("(struct P){ 1, 2 }"));
+        assert!(!looks_file_scope("Point p = (Point){ 1, 2 };"));
+        assert!(!looks_file_scope("flag ? (Point){ 1, 2 } : other"));
         assert!(!looks_file_scope("int x = 41;"));
         assert!(!looks_file_scope("struct P p = {1, 2};"));
         assert!(!looks_file_scope("x + 1"));

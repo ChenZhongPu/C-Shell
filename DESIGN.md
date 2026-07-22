@@ -4,7 +4,7 @@ Settled architecture decisions, the one big open problem, and the traps buried
 in the code that you must know about before changing it. README is for users;
 this file is for whoever develops the tool next.
 
-Status: v0.1.2 working. ~4200 lines of Rust, 73 tests (47 unit + 26
+Status: v0.1.2 working. ~5700 lines of Rust, 97 tests (61 unit + 36
 end-to-end smoke), clippy/fmt clean, English UI. Verified on Linux with gcc
 16.1.1 and clang 22.1.6. CI exercises the default macOS compiler and two
 Windows driver dialects (a GNU-style driver and MSVC); see
@@ -17,16 +17,16 @@ Windows driver dialects (a GNU-style driver and MSVC); see
 | Module | Responsibility |
 |---|---|
 | `toolchain.rs` | compiler detection, cached capability probing, GNU/Clang/MSVC flag dialects, default-std detection, `_Generic` floor |
-| `eval.rs` | trial-compile classification, compile, run with timeout, crash diagnosis |
+| `eval.rs` | trial-compile classification/rebinding, compile, run with timeout, crash diagnosis |
 | `editor.rs` | syntect highlighting, completion, multi-line input and indentation |
 | `main.rs` | CLI, REPL, `-e`, script and piped-input modes |
 | `lex.rs` | byte-level scan: bracket balance, literals/comments, purity and identifier heuristics |
-| `errmap.rs` | diagnostic line remapping, stale-warning filtering |
+| `errmap.rs` | diagnostic provenance/remapping, scaffolding removal, stale-warning filtering |
 | `tests/smoke.rs` | end-to-end tests driving the real binary and compiler |
 | `proc.rs` | child deadlines, output capture and timeout-path process-tree cleanup |
-| `magic.rs` | `%` commands and optional `clang-format` presentation |
-| `codegen.rs` | program assembly, `_Generic` value-printing and type-name runtime |
-| `session.rs` | session state, numbered history and completion vocabulary |
+| `magic.rs` | `%` commands, `$EDITOR` integration and optional `clang-format` presentation |
+| `codegen.rs` | program assembly, shadowing/replacement variants, `_Generic` runtimes |
+| `session.rs` | session state, shadowing scopes, file-item replacement, undo and completion vocabulary |
 | `ui.rs` | terminal styling, startup banner |
 
 Implemented: expression evaluation with value printing, statements, automatic
@@ -34,11 +34,16 @@ file-scope hoisting for functions/`#include`/`typedef`, multi-line input,
 syntax highlighting, compiler detection and mid-session switching, warning
 pass-through, diagnostic remapping, completion-marker validation, live
 terminal output with bounded capture, crash reporting and timeout handling,
-missing-semicolon repair, blank-line confirmation for a completed interactive
-`if`, `if`/`else` batch lookahead, control/do-while/preprocessor continuation,
-tab completion (magics, C keywords, session names), persistent input history,
-`-e`/script/piped-input batch modes,
-`%help %quit %clear %reset %history %src %type %undo %cc %std`, deadlines and
+one-per-session external-side-effect replay warnings, missing-semicolon repair,
+syntax-impossible expression-trial elision, generated-diagnostic sanitizing,
+pointer-safe recursive struct printing, actionable rejection of user-defined
+`main`, compiler-validated local
+shadowing and file-scope replacement, blank-line
+confirmation for a completed interactive `if`, `if`/`else` batch lookahead,
+control/do-while/preprocessor continuation, tab completion (magics, C keywords,
+retained session names), process-local Up/Down recall and numbered-input
+`%edit [n]`, `-e`/script/piped-input batch modes,
+`%help %quit %clear %reset %src %edit %type %undo %cc %std`, deadlines and
 timeout-path tree cleanup for compiler/probe/user-program children, cached
 compiler capability probes, CI for 4 platform configs, and a tag-triggered release
 workflow.
@@ -57,17 +62,70 @@ toolchain.
 
 **Use a lexical file-scope heuristic, then classify by trial compilation.**
 `eval::looks_file_scope` sends preprocessor directives, typedefs, tag
-definitions and function-shaped inputs to a file-scope attempt first. Other
-inputs never receive file scope as a fallback, because moving a declaration
-out of `main` can silently change shadowing and redeclaration semantics. The
-compiler validates the heuristic and arbitrates expression versus statement;
-classics like `foo * bar;` follow the compiler's current typedef context.
+definitions and function-shaped inputs exclusively to file scope. They are
+never demoted into `main`, because GCC nested functions would make an
+identical session diverge from Clang/MSVC. Other inputs never receive file
+scope as a fallback, because moving a declaration out of `main` can silently
+change shadowing semantics. The compiler arbitrates expression versus
+statement; classics like `foo * bar;` follow its current typedef context.
+
+**Do not launch an expression compile that syntax alone disproves.**
+`eval::should_try_expr` sends a final code-token `;` directly to `Slot::Stmt`;
+`CS_PRINT((input))` cannot accept that token sequence. Inputs ending in `}`
+also skip the doomed trial when they are clearly controls/blocks. Ambiguous
+`) { ... }` tails retain the trial because a valid compound literal such as
+`(int){7}` or `x = (Point){...}` is an expression. This removes one compiler
+process from the normal semicolon-terminated path without replacing compiler
+classification with a declaration parser. PCH is deliberately not the answer
+to this measured bottleneck: process invocation dominates and common-header
+parsing is a small minority, so its complexity would optimize the wrong cost.
+
+**Generated diagnostic text is never user source.** `codegen::Program` records
+line ranges occupied by retained inputs. `errmap` uses that provenance to keep
+new/earlier user excerpts while dropping gutters and diagnostic blocks from
+`CS_PRINT`, `_Generic`, marker calls and the generated `main`. It also removes
+the statement-fallback parser error at the final input byte when the following
+`CS_MARK` expansion is the only source of the named `do` token (and Clang's
+equivalent synthetic end-of-expression semicolon error). Real `do` tokens and
+semicolon errors before user tokens remain visible.
+
+**The generated `main` is reserved, with an actionable error.** A complete
+hello-world program is a likely first input. Compiling another `main` either
+produces a redefinition or, in the old fallback path, lets GCC accept a nested
+function that is never called while Clang rejects it. The lexical function
+recognizer extracts the declarator name before compilation; `main` receives a
+short instruction to enter its body statements directly and omit the final
+`return`. It consumes an `In[n]` like any rejected input but never enters the
+session.
 
 **Accumulate and replay.** Every evaluation rebuilds and reruns the whole
-program. Block-scope declarations are ordinary locals in `main`; inputs
-classified as file-scope items are emitted above it. There is no separate
-symbol table or declaration/initializer state store. The cost (side effects
-replay) is the subject of §3.
+program. Block-scope declarations are ordinary locals in `main`; approved
+redeclarations start nested blocks that enclose all later statements. Inputs
+classified as file-scope items are emitted above `main`, and approved
+redefinitions replace an older item at its original index. There is no
+separate symbol table or declaration/initializer state store. The cost (side
+effects replay) is the subject of §3.
+
+**Rebinding is an alternate whole-program assembly validated by the
+compiler.** After the ordinary assembly fails with a redeclaration-family
+diagnostic, a block-scope input is retried inside `{ ... }`; success records
+the opening brace and all future statements stay inside it. File-scope input
+is instead substituted for each previous non-preprocessor item, newest first,
+until the complete program compiles, and the successful item is replaced in
+place so declaration order does not move. No declaration-name parser chooses
+the winner. `%undo` removes an opened scope or restores the previous file
+item. This is C shadowing rather than assignment (`int x = x + 1;` sees the
+new `x` in its initializer), and retained earlier calls bind to a replaced
+function; both consequences are shown honestly by `%src`.
+
+**Warn once before known external side effects can enter replay.**
+`lex::external_replay_calls` recognizes a conservative list of standard/POSIX
+file, input, environment and process APIs while ignoring comments and string
+literals. `submit` prints an English warning before evaluation; the Session
+flag is set only after that input completes and is retained, so a failed or
+crashing attempt cannot consume the warning. `%reset` starts a fresh warning
+epoch. This is mitigation, not safety: wrappers, function pointers and unknown
+application APIs remain invisible without interprocedural analysis.
 
 **Forget only bare expressions judged pure.** A bare expression is normally a
 question and is forgotten after its value is printed. Bare assignments,
@@ -75,6 +133,35 @@ question and is forgotten after its value is printed. Bare assignments,
 `lex::may_have_side_effects` heuristic. Every successfully evaluated
 statement/declaration and file-scope item is retained without purity analysis;
 notably, adding a trailing `;` turns an expression into a stored statement.
+
+**Keep recall/editing local and bounded; do not expose or persist history.**
+Rustyline keeps up to 1000 deduplicated entries in memory for Up/Down during
+one process, but c-shell never calls load/save-history and has no history file
+or `%history`. `Session::inputs` retains each numbered C input—including failed
+attempts and forgotten pure queries—for direct `%edit n` lookup; magic commands
+do not enter this archive, and `%reset` clears it. Completion remains
+independent, built from static C vocabulary plus identifiers in retained file
+items/statements. The private Session change log
+also remains because `%undo` must reverse scope openings and replacements; it
+stores state changes rather than a user-visible transcript.
+
+**`%src` is user-facing by default; scaffolding is opt-in.**
+`codegen::build_user_view` emits current file items plus retained statements in
+a clean `main`, including open rebinding epochs but excluding headers,
+printers and protocol markers. `%src --raw` keeps the complete compiler input
+for debugging. Both are presentation-formatted under the existing
+three-second `clang-format` deadline.
+
+**`%edit [n]` resubmits a numbered C input, not a persistent transcript.** With
+no argument it selects the latest input; an argument indexes the current
+session's one-based `In[n]` archive. The text is copied to a temporary `.c` file
+and opened with `$VISUAL`, then `$EDITOR`, then the platform fallback. Saving
+changed nonempty text returns `Action::Submit`, which re-enters the normal
+submit/evaluate/commit path and receives a fresh number without mutating the
+original archive entry; unchanged/empty files cancel. The edited block is also
+added to process-local Rustyline recall so Up retrieves it before the `%edit`
+command. Editing is disabled when stdin is not a terminal, and editor failure
+is reported without terminating the REPL.
 
 **The language standard follows the compiler's default; `_Generic` is the
 capability floor.** The original design forced `-std=c17` and was reversed:
@@ -88,6 +175,23 @@ and marks the selected mode as automatic. The final gate compiles a
 representative subset of the value-printer runtime (`inline`, `_Bool` and
 `_Generic`) under the selected mode rather than inferring support from a
 version string. An unsupported explicit standard is rejected.
+
+**Aggregate printing never implicitly follows a pointer.** Codegen collects
+session-visible named structs and simple anonymous struct typedefs, extracts
+only conservative plain member declarators, and extends `_Generic` with their
+exact types. Known nested structs dispatch recursively; fixed arrays recurse
+by `sizeof`, while every pointer member—including `char *`—prints `NULL` or a
+`(void *)` address. Thus `p` exposes structure, `p.name` explicitly requests
+the existing top-level string behavior, `struct P *ptr` remains an address,
+and only `*ptr` expands. Output uses designated-initializer syntax and switches
+to indentation for larger/nested values. `_Generic` has no aggregate wildcard,
+so its member default accepts an address and prints `<unprintable>` rather than
+passing a struct value to `const void *`. Multi-declarators, function-pointer
+declarators, bit-fields, flexible arrays, C11 anonymous members and unions use
+a labelled object-representation byte dump; guessing a member name would be
+worse. Raw-byte fallback is diagnostic, not a claim about an active union
+member or initialized padding. This policy removes tool-added dereferences; it
+does not make reading an indeterminate pointer/scalar well-defined C.
 
 **`%type` is a portable `_Generic` query, not reflection.** C has no portable
 way to stringify an arbitrary type. The generated runtime therefore maps
@@ -130,11 +234,12 @@ best effort and can never prevent startup.
 
 Accumulate-and-replay replays side effects. `scanf` prompts the user again on
 every later evaluation, file writes repeat, and `%src` is an ever-growing
-ledger rather than the current state. (`rand()` is fine: without `srand` it
-is deterministic in C.)
+ledger rather than the current state. Known external APIs now trigger a
+one-time warning, but that cannot make replay safe. (`rand()` is fine: without
+`srand` it is deterministic in C.)
 
-Goal: closer to Python — the session holds *current state*, not input
-history, and during normal healthy-runner operation each input executes once.
+Goal: closer to Python — the session holds *current state*, not a replay
+journal, and during normal healthy-runner operation each input executes once.
 Crash recovery is necessarily weaker, as described below.
 
 ### Why it is hard — two findings
@@ -228,8 +333,8 @@ Three traps already identified for that design:
 
 Staging: v0.2 stdin recording + journal polish (the recovery layer — nothing
 wasted regardless of what follows) → v0.3 tree-sitter declaration parsing
-(first used only for better classification and redeclaration detection) →
-v0.4 the slot-runner hot path, feature-gated alongside replay.
+(first used for better classification, exact aliases and declarator-aware
+rewrites) → v0.4 the slot-runner hot path, feature-gated alongside replay.
 
 References: [crepl](https://l-m.dev/cs/crepl/)
 ([source](https://github.com/l1mey112/crepl)),
@@ -268,10 +373,15 @@ References: [crepl](https://l-m.dev/cs/crepl/)
   point without a C parser would also make intentionally incomplete snippets
   impossible to submit.
 - The value printer handles the standard boolean/integer/real-floating types,
-  `char` strings and common object pointers. Struct/union, complex and `void`
-  expressions have no printer; a silent expression probe now keeps them from
-  being misclassified as statements and the UI explains the missing
-  `Out[n]`, but richer value formatting is still absent.
+  top-level `char` strings, common object pointers and session-visible named or
+  simply-typedef'd structs. Aggregate definitions hidden in headers or lacking
+  a reusable spelling, plus complex and `void` expressions, still use the
+  silent expression probe and have no `Out[n]`. Rich enum/complex formatting
+  and parser-complete declarator support remain absent.
+- **Rebinding is scope/replacement, not mutable symbol state.** A local's
+  declarator is visible in its own initializer, so `int x = x + 1;` inside a
+  shadowing epoch does not read the outer `x`. Replacing a file-scope function
+  also makes retained earlier calls resolve to the new body during replay.
 - The purity heuristic keeps any expression containing a call, even calls to
   pure functions. (Hardened 2026-07 after a P0: calls disguised as `f/**/()`,
   `(f)()`, `(*fp)()` were misjudged pure and their side effects silently
@@ -305,6 +415,17 @@ at the call site instead files `puts("hi")`'s own output under its return
 value (`Out[1]: hi\n3`). This bug was introduced once, while removing the
 `_n` bindings.
 
+**A struct member must never call top-level `CS_PRINT`.** Top-level `char *`
+means “show this string” and invokes `%s`; inheriting that behavior while
+printing `p` silently dereferences every character-pointer member, including
+indeterminate ones. Generated formatters use `CS_MEMBER_PTR` for lexically
+confirmed pointer declarators and address-based `CS_MEMBER_REF` for values.
+The latter's default consumes `&(member)` as `const volatile void *`, so an
+unknown nested aggregate is explicit and compile-safe rather than reproducing
+the classic `_Generic` default-function type error. Keep aggregate association
+macros late-bound: type definitions precede generated printer prototypes and
+all exact visible aggregate types must be in the member table.
+
 **An MSVC probe cannot trust exit status alone.** `cl.exe` reports an unknown
 option such as `/std:bogus` as warning D9002 and exits successfully; clang-cl
 can similarly report an unused argument. Capability probes treat these
@@ -312,20 +433,33 @@ specific diagnostics as failure, or an invalid explicit `--std` can be
 silently accepted. Changing this rule also requires a cache-schema bump so a
 previous false-positive result cannot survive on disk.
 
-**gcc accepts nested functions under `-std=c17`** (GNU extension); clang
-rejects them. Function definitions must be routed to file scope by the
-heuristic up front — trial-compile failure cannot be relied on to do it, or
-gcc silently buries the function inside `main` and the session breaks the
-moment you switch to clang. The fallback (file-scope-looking input that only
-compiles inside `main`) still exists for the heuristic's false positives,
-but it is no longer silent: the outcome carries `demoted` and the prompt
-prints "(note: kept inside main — it did not compile at file scope)".
+**Function-shaped input must never fall back into `main`.** gcc accepts nested
+functions as an extension even under `-std=c17`; Clang and MSVC reject them.
+A failed file-scope function that is retried as a statement therefore creates
+a tool-induced compiler disagreement. `eval::attempt` now keeps all
+file-scope-shaped input exclusively at file scope: a redeclaration may replace
+an older item after whole-program validation, but an input that refers to a
+`main` local receives the honest file-scope diagnostic on every compiler.
 
-**File scope must not be a fallback slot** (`eval.rs`, `attempt`). It is
-wider than `main`: `int dup = 2;` after `int dup = 1;` must be a
-redefinition error, but a file-scope fallback would silently make it a
-global shadowed by the earlier local. The heuristic alone decides file-scope
-membership; trial compilation only arbitrates expression vs statement.
+**A user-defined `main` is guidance, not a replacement candidate.** The
+runtime's generated `main` owns replay ordering and protocol markers; replacing
+it or auto-executing an extracted body would let `return`, `exit` and parameter
+semantics bypass those guarantees. `Evaluator::eval` recognizes the declarator
+name before `attempt` and returns the stable guidance message without invoking
+the compiler.
+
+**Local redeclaration must not fall back to file scope** (`eval.rs`,
+`attempt`). It is wider than `main`: moving `int dup = 2;` above `main` would
+silently create a global shadowed by the earlier local. A recognized
+redeclaration is instead retried in a nested block. The opening brace is
+journal state, all later statements remain inside it, codegen closes every
+open epoch before `return`, and `%undo` must remove both declaration and brace.
+
+**File-scope replacement stays at the old item's index.** Removing an old
+function/type and appending the replacement can break later file items that
+relied on its earlier declaration. Candidate programs substitute one item in
+place; `Session::replace_file` records the previous text so `%undo` can restore
+it. `#include`/`#define` items are deliberately not replacement candidates.
 
 **Interactive completeness and batch completeness are different policies**
 (`editor.rs`). Structural checks cover open brackets/literals, function and
@@ -343,11 +477,13 @@ statement into the same input.
 check it is submitted immediately, then "repaired" with a semicolon into a
 forward declaration — functions in Allman style become impossible to type.
 
-**Diagnostic gutters must be rewritten too** (`errmap::remap_gutter`).
-Remapping only the header line leaves gcc's source excerpt showing the
-generated file's `42 |` under a header that says `<input>:1` — exactly the
-kind of contradiction that makes a beginner distrust the tool. Gutter
-numbers pointing at scaffolding are blanked, never passed off as user code.
+**Diagnostic gutters need source provenance, not just renumbering**
+(`Program::session_line_ranges`, `errmap::remap_gutter`). Remapping only the
+header leaves gcc excerpts showing generated `CS_PRINT((` / `));` lines under
+`<input>:1`. New-input gutters are renumbered, earlier retained-user excerpts
+keep their text with generated line numbers blanked, and scaffolding excerpts
+plus their caret rows are dropped entirely. Every codegen flavor must maintain
+the ranges when its assembly order changes.
 
 **syntect must use `default-fancy`, not the default `default-onig`.** The
 latter pulls in oniguruma, a C library — awkward for a tool whose whole
@@ -368,7 +504,7 @@ left stranded above nothing.
 attributes a diagnostic arising inside a multi-line macro invocation to the
 line of the macro *name* — for the Expr slot that is the `CS_PRINT((`
 wrapper line just above the input, which strict attribution labels
-`<session>` and the warning filter then silently drops. Symptom: values
+`<generated>` and the warning filter then silently drops. Symptom: values
 print but warnings vanish, only on MSVC, only for expressions. Wrapper-line
 anchors are clamped into the input; nothing but the wrapper lives on those
 lines, so the clamp cannot mislabel foreign diagnostics.
