@@ -35,6 +35,7 @@ const HEADERS: &str = "\
 #include <limits.h>
 #include <ctype.h>
 #include <stdarg.h>
+#include <time.h>
 ";
 
 /// Value printing dispatches through `_Generic` on the *function*, not on the
@@ -119,6 +120,57 @@ static inline void cs_m_unknown(const volatile void *v)          { (void)v; fput
     CS_AGG_PRINT_ASSOCIATIONS                                            \
     default: cs_p_p)(x)
 
+/* An array decays to a pointer before _Generic can see it, so array-ness is
+   settled at run time instead: an array object begins at its first element,
+   while a pointer object is stored somewhere else entirely.  Both branches
+   type-check for either category, so one program serves both.  The element
+   count comes from sizeof, so no declarator has to be parsed. */
+#define CS_ARRAY_LIMIT 100
+#define CS_IS_ARRAY(x) \
+    ((const volatile void *)&(x) == (const volatile void *)&(x)[0])
+#define CS_ARRAY_ELIDE(n) printf("... (%llu more)", (unsigned long long)(n))
+
+#define CS_PRINT_ARRAY1(x) do {                                          \
+    if (!CS_IS_ARRAY(x)) { CS_PRINT(x); break; }                         \
+    CS_VAL();                                                            \
+    { size_t cs_n0 = sizeof(x) / sizeof((x)[0]), cs_i0;                  \
+      fputc('{', stdout);                                                \
+      for (cs_i0 = 0; cs_i0 < cs_n0; ++cs_i0) {                          \
+          if (cs_i0) fputs(", ", stdout);                                \
+          if (cs_i0 == CS_ARRAY_LIMIT) { CS_ARRAY_ELIDE(cs_n0 - cs_i0); break; } \
+          CS_MEMBER_REF((x)[cs_i0]);                                     \
+      }                                                                  \
+      fputc('}', stdout); }                                              \
+    putchar('\n');                                                       \
+} while (0)
+
+/* Nesting depth is a static property, so it cannot be chosen at run time the
+   way array-ness can.  Indexing twice does still type-check for an array of
+   pointers, where the inner subscript would walk off into whatever each
+   pointer happens to address, so the element gets the same run-time array
+   test as the whole and falls back to the member printer when it fails. */
+#define CS_PRINT_ARRAY2(x) do {                                          \
+    if (!CS_IS_ARRAY(x)) { CS_PRINT(x); break; }                         \
+    CS_VAL();                                                            \
+    { size_t cs_n0 = sizeof(x) / sizeof((x)[0]), cs_i0;                  \
+      fputc('{', stdout);                                                \
+      for (cs_i0 = 0; cs_i0 < cs_n0; ++cs_i0) {                          \
+          if (cs_i0) fputs(", ", stdout);                                \
+          if (cs_i0 == CS_ARRAY_LIMIT) { CS_ARRAY_ELIDE(cs_n0 - cs_i0); break; } \
+          if (!CS_IS_ARRAY((x)[cs_i0])) { CS_MEMBER_REF((x)[cs_i0]); continue; } \
+          { size_t cs_n1 = sizeof((x)[cs_i0]) / sizeof((x)[cs_i0][0]), cs_i1; \
+            fputc('{', stdout);                                          \
+            for (cs_i1 = 0; cs_i1 < cs_n1; ++cs_i1) {                    \
+                if (cs_i1) fputs(", ", stdout);                          \
+                if (cs_i1 == CS_ARRAY_LIMIT) { CS_ARRAY_ELIDE(cs_n1 - cs_i1); break; } \
+                CS_MEMBER_REF((x)[cs_i0][cs_i1]);                        \
+            }                                                            \
+            fputc('}', stdout); }                                        \
+      }                                                                  \
+      fputc('}', stdout); }                                              \
+    putchar('\n');                                                       \
+} while (0)
+
 /* C has no general type reflection.  This portable _Generic table reports
    scalar types and scalar pointers.  The controlling expression is not
    evaluated; its normal lvalue/array/function conversions still apply. */
@@ -179,7 +231,25 @@ static int cs_taped_scanf(const char *format, ...)
 #undef scanf
 #endif
 #define scanf cs_taped_scanf
+
+static inline uint64_t cs_timeit_now_ns(void) {
+#if defined(_WIN32)
+    return (uint64_t)clock() * 1000000ULL;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#endif
+}
 "##;
+
+/// Deepest array nesting the runtime has a printer for. `CS_PRINT_ARRAY<n>`
+/// must exist for every depth up to this.
+pub const MAX_ARRAY_DEPTH: usize = 2;
+
+/// What a member or element with no printer renders as. Callers use it to
+/// tell "printed nothing useful" from a real value.
+pub const UNPRINTABLE: &str = "<unprintable>";
 
 /// Where a new input is spliced into the generated program.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -220,6 +290,10 @@ enum BuildFlavor {
     Normal(Slot),
     SilentExpr,
     TypeProbe,
+    TimeitProbe(u64),
+    /// Print an expression through the array-aware printer, indexing to the
+    /// given nesting depth.
+    ArrayExpr(usize),
     ScopedStmt,
     ReplaceFile(usize),
 }
@@ -228,7 +302,9 @@ impl BuildFlavor {
     fn slot(self) -> Slot {
         match self {
             Self::Normal(slot) => slot,
-            Self::SilentExpr | Self::TypeProbe => Slot::Expr,
+            Self::SilentExpr | Self::TypeProbe | Self::TimeitProbe(_) | Self::ArrayExpr(_) => {
+                Slot::Expr
+            }
             Self::ScopedStmt => Slot::Stmt,
             Self::ReplaceFile(_) => Slot::FileScope,
         }
@@ -298,11 +374,34 @@ pub fn build_type_probe(session: &Session, input: &str) -> Program {
     build_inner(session, input, BuildFlavor::TypeProbe)
 }
 
+/// Build a program that prints an expression as an array of `depth`
+/// dimensions. Used only after the ordinary printer reported a bare address,
+/// which is all `_Generic` can say once an array has decayed to a pointer.
+/// The generated code still decides array versus pointer at run time; `depth`
+/// only controls how far it indexes, and a depth deeper than the value has
+/// simply fails to compile.
+pub fn build_array_expr(session: &Session, input: &str, depth: usize) -> Program {
+    build_inner(session, input, BuildFlavor::ArrayExpr(depth))
+}
+
+/// Build a program that benchmarks an expression or statement over `loops` iterations.
+pub fn build_timeit_probe(session: &Session, input: &str, loops: u64) -> Program {
+    build_inner(session, input, BuildFlavor::TimeitProbe(loops))
+}
+
 fn build_inner(session: &Session, input: &str, flavor: BuildFlavor) -> Program {
     let slot = flavor.slot();
     let silent_expr = matches!(flavor, BuildFlavor::SilentExpr);
     let type_probe = matches!(flavor, BuildFlavor::TypeProbe);
     let scoped_stmt = matches!(flavor, BuildFlavor::ScopedStmt);
+    let array_depth = match flavor {
+        BuildFlavor::ArrayExpr(depth) => Some(depth),
+        _ => None,
+    };
+    let timeit_loops = match flavor {
+        BuildFlavor::TimeitProbe(loops) => Some(loops),
+        _ => None,
+    };
     let file_replacement = match flavor {
         BuildFlavor::ReplaceFile(index) => Some(index),
         _ => None,
@@ -386,8 +485,27 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor) -> Program {
                     }
                     src.push_str("        default: \"<unrecognized type>\"));\n");
                 }
+            } else if let Some(loops) = timeit_loops {
+                src.push_str("    CS_VAL();\n");
+                src.push_str("    {\n");
+                src.push_str(&format!("        uint64_t _cs_loops = {loops}ULL;\n"));
+                src.push_str("        uint64_t _cs_start = cs_timeit_now_ns();\n");
+                src.push_str("        for (uint64_t _cs_i = 0; _cs_i < _cs_loops; ++_cs_i) {\n");
+                if crate::eval::should_try_expr(input) {
+                    src.push_str(&format!("            (void)(\n{input}\n            );\n"));
+                } else {
+                    src.push_str(&format!("            {{\n{input}\n            }}\n"));
+                }
+                src.push_str("        }\n");
+                src.push_str("        uint64_t _cs_end = cs_timeit_now_ns();\n");
+                src.push_str(
+                    "        printf(\"%llu\\n\", (unsigned long long)(_cs_end - _cs_start));\n",
+                );
+                src.push_str("    }\n");
             } else if silent_expr {
                 src.push_str(&format!("    (void)(\n{input}\n    );\n"));
+            } else if let Some(depth) = array_depth {
+                src.push_str(&format!("    CS_PRINT_ARRAY{depth}((\n{input}\n    ));\n"));
             } else {
                 src.push_str(&format!("    CS_PRINT((\n{input}\n    ));\n"));
             }
@@ -406,7 +524,7 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor) -> Program {
         new_line_count,
         session_line_ranges,
         uses_stdin_tape,
-        wrapped: slot == Slot::Expr && !silent_expr,
+        wrapped: slot == Slot::Expr && !silent_expr && timeit_loops.is_none(),
     }
 }
 
@@ -569,7 +687,8 @@ fn emit_array_formatter(
         "size_t {count} = sizeof({expr}) / sizeof(({expr})[0]); size_t {index}; fputc('{{', stdout); "
     ));
     out.push_str(&format!(
-        "for ({index} = 0; {index} < {count}; ++{index}) {{ if ({index}) fputs(\", \", stdout); "
+        "for ({index} = 0; {index} < {count}; ++{index}) {{ if ({index}) fputs(\", \", stdout); \
+         if ({index} == CS_ARRAY_LIMIT) {{ CS_ARRAY_ELIDE({count} - {index}); break; }} "
     ));
     let element = format!("({expr})[{index}]");
     if level + 1 < dimensions {
@@ -1101,6 +1220,34 @@ mod tests {
         session.stmts.push("struct Pair pair = { 1, 2 };".into());
         let program = build_type_probe(&session, "pair");
         assert!(program.src.contains("struct Pair: \"Struct Pair\""));
+    }
+
+    #[test]
+    fn runtime_backs_every_advertised_array_constant() {
+        assert!(
+            RUNTIME.contains(&format!("fputs(\"{UNPRINTABLE}\", stdout)")),
+            "the member fallback no longer prints UNPRINTABLE"
+        );
+        for depth in 1..=MAX_ARRAY_DEPTH {
+            assert!(
+                RUNTIME.contains(&format!("#define CS_PRINT_ARRAY{depth}(")),
+                "no runtime printer for array depth {depth}"
+            );
+        }
+        assert!(
+            !RUNTIME.contains(&format!("#define CS_PRINT_ARRAY{}(", MAX_ARRAY_DEPTH + 1)),
+            "a deeper printer exists but MAX_ARRAY_DEPTH does not reach it"
+        );
+    }
+
+    #[test]
+    fn array_expression_builds_select_the_matching_depth_wrapper() {
+        let session = Session::default();
+        let one = build_array_expr(&session, "values", 1);
+        assert!(one.src.contains("CS_PRINT_ARRAY1((\nvalues\n    ));"));
+        assert!(one.wrapped, "the array wrapper must remap like CS_PRINT");
+        let two = build_array_expr(&session, "grid", 2);
+        assert!(two.src.contains("CS_PRINT_ARRAY2((\ngrid\n    ));"));
     }
 
     #[test]

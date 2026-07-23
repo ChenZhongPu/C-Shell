@@ -51,6 +51,19 @@ fn format_c(src: &str) -> String {
 /// Resolve `%edit [n]` without changing the session. `None` means that the
 /// no-argument form had no previous C input; malformed or missing numbered
 /// forms carry the exact user-facing diagnostic.
+fn format_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs_f64();
+    if secs < 1e-6 {
+        format!("{} ns", d.as_nanos())
+    } else if secs < 1e-3 {
+        format!("{:.2} µs", secs * 1e6)
+    } else if secs < 1.0 {
+        format!("{:.2} ms", secs * 1e3)
+    } else {
+        format!("{:.2} s", secs)
+    }
+}
+
 fn edit_input(args: &[&str], session: &Session) -> std::result::Result<Option<String>, String> {
     match args {
         [] => Ok(session.last_input().map(str::to_string)),
@@ -68,21 +81,24 @@ fn edit_input(args: &[&str], session: &Session) -> std::result::Result<Option<St
     }
 }
 
-const HELP: &str = "\
-Commands:
-  %help              show this help
+const HELP: &str = "Commands:
+  %help [--verbose]  show commands; --verbose adds usage notes
   %quit / %exit      quit (Ctrl-D works too)
   %clear             clear the screen without changing the session
   %reset             clear the session and start fresh
   %src [--raw]       show user C; --raw includes generated runtime/protocol
   %edit [n]          copy latest or In[n] into the prompt for editing
   %type <expression> query an expression's type without evaluating it
+  %time <code...>    time the execution of a statement or expression once
+  %timeit <code...>  benchmark a statement or expression over multiple loops
   %undo              undo the most recent retained state change
   %cc [path]         show or switch the C compiler
   %std [std]         show or switch the language standard (c11/c17/c23);
-                     %std default returns to the compiler's own default
+                     %std default returns to the compiler's own default";
 
-Notes:
+/// The behavioral rules that are not guessable from the command list. Kept
+/// behind  so the default help stays a one-screen reference.
+const HELP_NOTES: &str = "Notes:
   A bare expression prints its value; a trailing ';' runs it silently.
   A completed if waits for a blank continuation line; type else / else if
   there instead to continue it. Other closed blocks submit immediately, but
@@ -100,9 +116,16 @@ Notes:
   simple anonymous typedefs use the typedef name. Other aliases and top-level
   qualifiers are canonicalized, and arrays/functions undergo their normal
   expression conversions.
+  %time evaluates an expression or statement once, displays its output/value,
+  and reports wall-clock execution time. Side effects are retained in session.
+  %timeit benchmarks an expression or statement in an auto-ranged loop over
+  multiple runs without modifying the session state.
   Struct values use designated members; nested known structs and arrays
   expand, but pointer members are shown only as addresses or NULL. Use an
   explicit member expression (p.name) or dereference (*ptr) to drill down.
+  Arrays print their elements, one or two dimensions deep, bounded at 100 per
+  dimension; a real pointer still prints as an address, and elements with no
+  printer of their own show <unprintable>.
   Pure bare expressions (x + 1, sizeof(int)) are evaluated and forgotten.
   Statements and bare expressions that may have effects are kept.
   Direct scanf calls record one private input line per dynamic request; later
@@ -119,19 +142,35 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
     let tail = body.get(cmd.len()..).unwrap_or("").trim();
 
     match cmd {
-        "help" | "h" | "?" => println!("{HELP}"),
+        "help" | "h" | "?" => match rest.as_slice() {
+            [] => println!("{HELP}"),
+            [flag] if *flag == "--verbose" => println!(
+                "{HELP}
+
+{HELP_NOTES}"
+            ),
+            _ => println!("{}", ui.err("usage: %help [--verbose]")),
+        },
         "quit" | "exit" | "q" => return Ok(Action::Quit),
 
         "clear" => {
             // ANSI erase-display + cursor-home. This is terminal control, not
             // color styling, so --no-color deliberately does not disable it.
-            print!("\x1b[2J\x1b[H");
+            print!("[2J[H");
             let _ = std::io::stdout().flush();
         }
 
         "reset" => {
             session.reset();
             println!("{}", ui.dim("session cleared"));
+        }
+
+        "undo" => {
+            if session.undo().is_some() {
+                println!("{}", ui.dim("undo successful"));
+            } else {
+                println!("{}", ui.err("nothing to undo"));
+            }
         }
 
         "src" => match rest.as_slice() {
@@ -183,10 +222,80 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
             }
         }
 
-        "undo" => match session.undo() {
-            Some(text) => println!("{} {text}", ui.dim("undone:")),
-            None => println!("{}", ui.dim("nothing to undo")),
-        },
+        "time" => {
+            if tail.is_empty() {
+                println!("{}", ui.err("usage: %time <expression or statement>"));
+            } else {
+                let n = session.counter + 1;
+                session.counter = n;
+                session.remember_input(n, tail);
+
+                match ev.eval(session, tail)? {
+                    Eval::CompileError(diag) => println!("{}", ui.err(diag.trim_end())),
+                    Eval::Done(o) => {
+                        if o.streamed_output_needs_newline {
+                            println!("{}", ui.inserted_newline_marker());
+                        }
+                        let note = |s: &str| println!("{}", ui.dim(s));
+                        if o.rewritten.is_some() {
+                            note("(missing semicolon added automatically)");
+                        }
+                        if !o.warnings.trim().is_empty() {
+                            println!("{}", ui.warn(o.warnings.trim_end()));
+                        }
+
+                        if !o.errors.is_empty() {
+                            print!("{}", ui.err(&o.errors));
+                        }
+                        if let Some(v) = &o.value {
+                            println!("{}{}", ui.out_label(n), v);
+                        }
+                        let committed = o.rewritten.clone().unwrap_or_else(|| tail.to_string());
+                        match &o.abnormal {
+                            Some(msg) => {
+                                println!("{}", ui.err(msg));
+                                note("(input not kept in the session)");
+                            }
+                            None => {
+                                if let Some(index) = o.file_replacement {
+                                    session.replace_file(index, &committed);
+                                } else if o.scoped_rebind {
+                                    session.commit_scoped(&committed);
+                                } else {
+                                    session.commit(&committed, o.slot);
+                                }
+                                session.attach_stdin_events(o.stdin_events.clone());
+                            }
+                        }
+                        println!(
+                            "{}",
+                            ui.dim(&format!("Wall time: {}", format_duration(o.duration)))
+                        );
+                    }
+                }
+            }
+        }
+
+        "timeit" => {
+            if tail.is_empty() {
+                println!("{}", ui.err("usage: %timeit <expression or statement>"));
+            } else {
+                match ev.timeit(session, tail)? {
+                    Eval::CompileError(diag) => println!("{}", ui.err(diag.trim_end())),
+                    Eval::Done(o) => {
+                        if o.streamed_output_needs_newline {
+                            println!("{}", ui.inserted_newline_marker());
+                        }
+
+                        if let Some(msg) = o.abnormal {
+                            println!("{}", ui.err(&msg));
+                        } else if let Some(report) = o.value {
+                            println!("{report}");
+                        }
+                    }
+                }
+            }
+        }
 
         "cc" => {
             if rest.is_empty() {

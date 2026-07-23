@@ -5,7 +5,7 @@ behaves, skip the new-file / write-`main` / compile / run loop — just type it
 at the prompt.
 
 ```
-c-shell 0.2.0  ·  cc (GCC) 16.1.1 (default std gnu23)
+c-shell 0.2.2  ·  cc (GCC) 16.1.1 (default std gnu23)
 In [1]: int x = 41;
 In [2]: x + 1
 Out[2]: 42
@@ -135,10 +135,6 @@ In [3]: int x = 2;
 (opened a nested scope to shadow an earlier declaration)
 In [4]: x
 Out[4]: 2
-In [5]: %undo
-undone: int x = 2;
-In [5]: x
-Out[5]: 5
 ```
 
 `%src` shows the actual braces; no C declaration is rewritten into an
@@ -163,9 +159,14 @@ Out[4]: 9
 ```
 
 The old item is replaced at its original position to preserve declaration
-order, and `%undo` restores it. A function-shaped input is never retried
-inside `main`; this prevents GCC nested-function extensions from creating a
-session that Clang or MSVC interprets differently.
+order. A function-shaped input is never retried inside `main`; this prevents
+GCC nested-function extensions from creating a session that Clang or MSVC
+interprets differently.
+
+Both forms only ever move forward: there is no undo. A binding is corrected by
+declaring or assigning it again, and a definition by defining it again. When a
+retained statement blocks a replacement—say it calls a function whose signature
+you are changing—`%reset` is the way out.
 
 ![demo](demo.gif)
 
@@ -175,8 +176,13 @@ session that Clang or MSVC interprets differently.
 
 ```
 %help      %quit      %clear     %reset     %edit [n]
-%src       %type      %undo      %cc        %std
+%src       %type      %cc        %std
 ```
+
+`%help` lists the commands and nothing else, so it stays a one-screen
+reference. `%help --verbose` appends the usage notes: which inputs are
+retained, how continuation and rebinding behave, what the value printer and
+`%type` cover, and how the `scanf` tape replays.
 
 `%clear` erases the terminal display and returns the cursor to the top without
 changing variables, retained C code or the input counter.
@@ -259,8 +265,7 @@ fresh line, which is retained only in memory; historical calls receive those
 recorded lines and never reconnect to the terminal. Calls inside functions,
 recursion and loops therefore replay in their original order. `%src` annotates
 the associated statement with only a request count—the bytes remain hidden.
-`%undo` and `%reset` remove the matching tape, and no tape is written to a
-history file. If function replacement or changed control flow consumes a
+`%reset` discards the tape, and no tape is written to a history file. If function replacement or changed control flow consumes a
 different number of requests, evaluation stops with an explicit stdin-tape
 divergence instead of silently prompting or waiting for the normal timeout.
 
@@ -292,9 +297,37 @@ Out[5]: {
 }
 ```
 
+An array is a harder case than it looks, because C converts one to a pointer
+before `_Generic` can see its type — the printer is handed an address and has
+no way to ask how many elements it addresses. So when a value does print as a
+bare address, c-shell re-prints it through an array-aware wrapper that settles
+the question with the real object at run time: an array begins at its own
+first element, a pointer variable does not.
+
+```text
+In [1]: int values[4] = {3, 1, 4, 1};
+In [2]: values
+Out[2]: {3, 1, 4, 1}
+In [3]: int grid[2][2] = {{1, 2}, {3, 4}};
+In [4]: grid
+Out[4]: {{1, 2}, {3, 4}}
+In [5]: int *ptr = values;
+In [6]: ptr
+Out[6]: 0x7ffd2f8c4a10
+```
+
+Element counts come from `sizeof`, so no declarator is parsed and a genuine
+pointer keeps printing as an address. `char text[] = "hi"` still prints
+`"hi"`: it reaches the string printer directly and never looks like an
+address. Beyond 100 elements the rest are summarized as `... (n more)`.
+Nesting is the one static property this cannot recover at run time, so arrays
+deeper than two dimensions, and arrays whose elements have no printer of their
+own (an array of pointers, for instance), show `<unprintable>` elements rather
+than a guess.
+
 Struct-member formatting never treats `char *` as a string: every pointer
-member is `NULL` or an address, fixed arrays are traversed structurally, and a
-known nested struct calls its own printer. A top-level `struct P *` likewise
+member is `NULL` or an address, fixed arrays are traversed structurally with
+the same 100-element bound, and a known nested struct calls its own printer. A top-level `struct P *` likewise
 prints only its address; explicit `*ptr` requests expansion. This differs
 intentionally from a top-level `char *` expression, where the user explicitly
 asked for the existing string dereference. Small flat structs stay on one

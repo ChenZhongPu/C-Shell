@@ -4,7 +4,7 @@ Settled architecture decisions, the one big open problem, and the traps buried
 in the code that you must know about before changing it. README is for users;
 this file is for whoever develops the tool next.
 
-Status: v0.2.0 working. ~6200 lines of Rust, 102 tests (65 unit + 37
+Status: v0.2.2 working. ~7100 lines of Rust, 107 tests (67 unit + 40
 end-to-end smoke), clippy/fmt clean, English UI. Verified on Linux with gcc
 16.1.1 and clang 22.1.6. CI exercises the default macOS compiler and two
 Windows driver dialects (a GNU-style driver and MSVC); see
@@ -26,7 +26,7 @@ Windows driver dialects (a GNU-style driver and MSVC); see
 | `proc.rs` | child deadlines, output capture, request-driven stdin tape transport and timeout-path process-tree cleanup |
 | `magic.rs` | `%` commands, numbered-input lookup and optional `clang-format` presentation |
 | `codegen.rs` | program assembly, shadowing/replacement variants, `_Generic` runtimes |
-| `session.rs` | session state, in-memory stdin tape, shadowing scopes, file-item replacement, undo and completion vocabulary |
+| `session.rs` | session state, in-memory stdin tape, shadowing scopes, file-item replacement and completion vocabulary |
 | `ui.rs` | terminal styling, startup banner |
 
 Implemented: expression evaluation with value printing, statements, automatic
@@ -43,7 +43,7 @@ confirmation for a completed interactive `if`, `if`/`else` batch lookahead,
 control/do-while/preprocessor continuation, tab completion (magics, C keywords,
 retained session names), process-local Up/Down recall and numbered-input
 `%edit [n]`, `-e`/script/piped-input batch modes,
-`%help %quit %clear %reset %src %edit %type %undo %cc %std`, deadlines and
+`%help [--verbose] %quit %clear %reset %src %edit %type %cc %std`, deadlines and
 timeout-path tree cleanup for compiler/probe/user-program children, cached
 compiler capability probes, CI for 4 platform configs, and a tag-triggered release
 workflow.
@@ -113,8 +113,9 @@ the opening brace and all future statements stay inside it. File-scope input
 is instead substituted for each previous non-preprocessor item, newest first,
 until the complete program compiles, and the successful item is replaced in
 place so declaration order does not move. No declaration-name parser chooses
-the winner. `%undo` removes an opened scope or restores the previous file
-item. This is C shadowing rather than assignment (`int x = x + 1;` sees the
+the winner. Neither form is reversible: the session only moves forward, and
+`%reset` is the only escape. This is C shadowing rather than assignment
+(`int x = x + 1;` sees the
 new `x` in its initializer), and retained earlier calls bind to a replaced
 function; both consequences are shown honestly by `%src`.
 
@@ -124,8 +125,8 @@ rebinds `scanf` to `cs_taped_scanf`, which emits `M_STDIN` before delegating to
 or current. `proc` gives the child a pipe rather than the real terminal:
 historical requests receive `Session::stdin_tape` events, while a current
 request synchronously reads and records one fresh line. Human wait time resets
-the execution deadline. Events attach only after `M_DONE`, are removed by
-`%undo`/`%reset`, stay memory-only, and `%src` exposes only a redacted count.
+the execution deadline. Events attach only after `M_DONE`, are discarded by
+`%reset`, stay memory-only, and `%src` exposes only a redacted count.
 Functions and loops work because requests are dynamic; a changed request count
 marks the run divergent and never falls through to real stdin. This first
 portable adapter deliberately covers direct standard `scanf`, one line per
@@ -157,9 +158,9 @@ or `%history`. `Session::inputs` retains each numbered C input—including faile
 attempts and forgotten pure queries—for direct `%edit n` lookup; magic commands
 do not enter this archive, and `%reset` clears it. Completion remains
 independent, built from static C vocabulary plus identifiers in retained file
-items/statements. The private Session change log
-also remains because `%undo` must reverse scope openings and replacements; it
-stores state changes rather than a user-visible transcript.
+items/statements. `Session` keeps no change log at all: it stores what the
+program currently is, never how it got there, so there is nothing to reverse
+and nothing resembling a transcript.
 
 **`%src` is user-facing by default; scaffolding is opt-in.**
 `codegen::build_user_view` emits current file items plus retained statements in
@@ -209,6 +210,21 @@ a labelled object-representation byte dump; guessing a member name would be
 worse. Raw-byte fallback is diagnostic, not a claim about an active union
 member or initialized padding. This policy removes tool-added dereferences; it
 does not make reading an indeterminate pointer/scalar well-defined C.
+
+**Array-ness is decided by the object, not by a declarator.** An array decays
+to a pointer before `_Generic` sees it, so the ordinary printer can only
+report an address. A bare address is therefore the trigger: `Evaluator::
+refine_array` re-runs the same expression through `CS_PRINT_ARRAY<depth>`,
+whose generated code compares `&x` with `&x[0]`—equal only for an array—and
+otherwise defers to `CS_PRINT`. Element counts come from `sizeof`, so nothing
+parses a declaration, and the extra compile is paid only by values that
+already printed as an address. Nesting depth cannot be chosen at run time the
+way array-ness can, so depth 1 is tried first and a deeper pass runs only when
+the elements themselves had no printer; the deeper wrapper repeats the array
+test on each element so an array of pointers is never indexed twice. Side-
+effecting inputs are excluded, because the refinement replays the session an
+extra time. Output is bounded at `CS_ARRAY_LIMIT` elements per dimension, for
+struct members too.
 
 **`%type` is a portable `_Generic` query, not reflection.** C has no portable
 way to stringify an arbitrary type. The generated runtime therefore maps
@@ -311,7 +327,7 @@ CS_EXPORT void cs_step(void **cs_slot) { /* user input appears verbatim */ }
 ```
 c-shell (Rust) ──pipe──> runner child (slot table + the user's heap/files)
      │            per input: compile one small TU → dlopen/LoadLibrary → cs_step()
-     └── journal (today's session.rs) = crash recovery + %undo + %save/%load
+     └── journal (today's session.rs) = crash recovery + %save/%load
 ```
 
 - Each step library exports exactly one c-shell entry symbol (`cs_step` —
@@ -383,6 +399,15 @@ References: [crepl](https://l-m.dev/cs/crepl/)
   names per step would be the fix); ANSI colors on legacy conhost.
 - No session save/load. `Session` is not serializable yet; adding serde is
   straightforward.
+- **No way to remove a retained input short of `%reset`.** `%undo` existed
+  through 0.2.0 and was dropped: compiler-validated rebinding already covers
+  the common correction (redeclare, redefine), and a LIFO stack whose "last
+  change" need not be the last thing typed—pure expressions are forgotten—did
+  not match the `In[n]` the user sees. What is still uncovered is removing a
+  *specific* retained statement, which is what blocks a signature change while
+  an older call site survives. A targeted `%drop n` keyed on the input number
+  would fit the visible model better than undo did, at the cost of
+  reintroducing per-input change tracking in `session.rs`.
 - UI strings are English but scattered across `main.rs` / `magic.rs` /
   `eval.rs` / `toolchain.rs`; centralize before attempting i18n.
 - Highlight theme is hardcoded (`base16-ocean.dark`); poor on light terminals.
@@ -391,6 +416,10 @@ References: [crepl](https://l-m.dev/cs/crepl/)
   type name, need an explicit trailing `\\`; recognizing every continuation
   point without a C parser would also make intentionally incomplete snippets
   impossible to submit.
+- Array printing recovers one and two dimensions. Deeper nesting, and elements
+  whose own type has no printer (an array of pointers is the common case),
+  render as `<unprintable>` — the run-time array test settles array versus
+  pointer, but nesting depth is static and only the build can choose it.
 - The value printer handles the standard boolean/integer/real-floating types,
   top-level `char` strings, common object pointers and session-visible named or
   simply-typedef'd structs. Aggregate definitions hidden in headers or lacking
@@ -470,15 +499,16 @@ the compiler.
 **Local redeclaration must not fall back to file scope** (`eval.rs`,
 `attempt`). It is wider than `main`: moving `int dup = 2;` above `main` would
 silently create a global shadowed by the earlier local. A recognized
-redeclaration is instead retried in a nested block. The opening brace is
-journal state, all later statements remain inside it, codegen closes every
-open epoch before `return`, and `%undo` must remove both declaration and brace.
+redeclaration is instead retried in a nested block. The brace is a real
+`stmts` entry, all later statements remain inside it, and codegen closes every
+open epoch before `return`.
 
 **File-scope replacement stays at the old item's index.** Removing an old
 function/type and appending the replacement can break later file items that
 relied on its earlier declaration. Candidate programs substitute one item in
-place; `Session::replace_file` records the previous text so `%undo` can restore
-it. `#include`/`#define` items are deliberately not replacement candidates.
+place, and `Session::replace_file` overwrites that index rather than removing
+and appending. `#include`/`#define` items are deliberately not replacement
+candidates.
 
 **Interactive completeness and batch completeness are different policies**
 (`editor.rs`). Structural checks cover open brackets/literals, function and

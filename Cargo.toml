@@ -1,6 +1,6 @@
 [package]
 name = "c-shell"
-version = "0.2.0"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.96"
 description = "An interactive shell for C: type an expression, a statement or a function and see what your real compiler does with it"

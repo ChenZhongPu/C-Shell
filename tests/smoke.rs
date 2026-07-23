@@ -747,3 +747,61 @@ fn program_output_is_shown_once() {
         "TTY marker leaked into pipe:\n{partial}"
     );
 }
+
+#[test]
+fn time_and_timeit_magics_work() {
+    let out = run(&[
+        "int acc = 0;",
+        "%time acc += 10;",
+        "acc",
+        "%timeit acc + 5",
+        "acc",
+    ]);
+    assert!(
+        out.contains("Wall time:"),
+        "missing %time output:
+{out}"
+    );
+    assert!(
+        out.contains("Out[3]: 10"),
+        "side effect of %time not committed:
+{out}"
+    );
+    assert!(
+        out.contains("per loop"),
+        "missing %timeit report:
+{out}"
+    );
+    assert!(
+        out.contains("Out[4]: 10"),
+        "%timeit modified session state:
+{out}"
+    );
+}
+
+#[test]
+fn help_lists_commands_and_keeps_usage_notes_behind_verbose() {
+    let plain = run(&["%help"]);
+    assert!(
+        plain.contains("Commands:"),
+        "missing Commands list:
+{plain}"
+    );
+    assert!(
+        !plain.contains("Notes:"),
+        "%help unexpectedly printed Notes:
+{plain}"
+    );
+
+    let verbose = run(&["%help --verbose"]);
+    assert!(
+        verbose.contains("Commands:"),
+        "missing Commands list:
+{verbose}"
+    );
+    assert!(
+        verbose.contains("Notes:"),
+        "missing Notes in verbose help:
+{verbose}"
+    );
+}

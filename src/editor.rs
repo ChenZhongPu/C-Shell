@@ -19,7 +19,8 @@ use crate::lex;
 
 /// The magic commands, for completion.
 const MAGICS: &[&str] = &[
-    "%help", "%quit", "%exit", "%clear", "%reset", "%src", "%edit", "%type", "%undo", "%cc", "%std",
+    "%help", "%quit", "%exit", "%clear", "%reset", "%src", "%edit", "%type", "%time", "%timeit",
+    "%undo", "%cc", "%std",
 ];
 
 /// C keywords, common types and stdlib staples worth offering at a C prompt.

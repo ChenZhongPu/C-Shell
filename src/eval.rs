@@ -10,7 +10,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-use crate::codegen::{self, M_DONE, M_NEW, M_STDIN, M_VAL, Slot};
+use crate::codegen::{self, M_DONE, M_NEW, M_STDIN, M_VAL, MAX_ARRAY_DEPTH, Slot, UNPRINTABLE};
 use crate::errmap;
 use crate::lex;
 use crate::proc;
@@ -45,6 +45,8 @@ pub struct Outcome {
     /// The input is a valid expression, but its value category has no printer;
     /// it was evaluated through the silent expression wrapper instead.
     pub unprintable: bool,
+    /// Execution duration of the compiled program.
+    pub duration: Duration,
 }
 
 pub enum Eval {
@@ -194,8 +196,15 @@ impl Evaluator {
         // mistake, and the diagnostic for it points at generated scaffolding
         // rather than at anything the user wrote. Retrying costs one compile
         // and only ever on the path that already failed.
+        //
+        // A closing `}` does not exempt an input from this. A braced
+        // initializer (`int a[3] = {1, 2, 3}`) ends in `}` yet is still a
+        // declaration needing its semicolon, and the diagnostic it produces is
+        // exactly the scaffolding `do` token that gets sanitized away — so
+        // without the retry the input fails in complete silence. Genuinely
+        // complete blocks never reach here, because they compiled already.
         let t = input.trim_end();
-        let repairable = !t.ends_with(';') && !t.ends_with('}') && !t.trim_start().starts_with('#');
+        let repairable = !t.ends_with(';') && !t.trim_start().starts_with('#');
         if repairable {
             let patched = format!("{t};");
             if let Ok(mut o) = self.attempt(session, &patched)? {
@@ -259,6 +268,9 @@ impl Evaluator {
         for &slot in slots {
             let normal = codegen::build(session, input, slot);
             match self.try_program(normal, slot, session.stdin_tape())? {
+                Ok(o) if slot == Slot::Expr => {
+                    return Ok(Ok(self.refine_array(session, input, o)?));
+                }
                 Ok(o) => return Ok(Ok(o)),
                 Err(diag) if slot == Slot::Stmt => {
                     let retry_scoped = is_rebinding_diagnostic(&diag);
@@ -298,6 +310,50 @@ impl Evaluator {
             reported = expr;
         }
         Ok(Err(reported))
+    }
+
+    /// Recover an array that `_Generic` could only report as an address.
+    ///
+    /// An array decays to a pointer before the value printer can see its type,
+    /// so a bare address is the one clue that the input might have been an
+    /// array. Re-printing it through the array-aware wrapper settles the
+    /// question with the real compiler and the real object: the generated code
+    /// falls back to the ordinary printer when the value turns out to be a
+    /// genuine pointer, and it fails to compile outright for values that
+    /// cannot be indexed at all (`void *`, function pointers). Either way the
+    /// original result stands, so this can only add information.
+    ///
+    /// Depth cannot be decided at run time the way array-ness can, so depth 1
+    /// is tried first — it is both the common case and the cheap one — and a
+    /// deeper pass runs only when the elements themselves had no printer.
+    fn refine_array(&self, session: &Session, input: &str, outcome: Outcome) -> Result<Outcome> {
+        let addressed = outcome
+            .value
+            .as_deref()
+            .is_some_and(|v| v.starts_with("0x"));
+        // Re-running the whole session must stay free of consequences.
+        if !addressed || lex::may_have_side_effects(input) {
+            return Ok(outcome);
+        }
+
+        let mut best = outcome;
+        for depth in 1..=MAX_ARRAY_DEPTH {
+            let prog = codegen::build_array_expr(session, input, depth);
+            let Ok(candidate) = self.try_program(prog, Slot::Expr, session.stdin_tape())? else {
+                break;
+            };
+            // No leading brace means the run-time check found a real pointer
+            // object and the wrapper deferred to the ordinary printer.
+            let Some(value) = candidate.value.as_deref().filter(|v| v.starts_with('{')) else {
+                break;
+            };
+            let elements_unprintable = value.contains(UNPRINTABLE);
+            best = candidate;
+            if !elements_unprintable {
+                break;
+            }
+        }
+        Ok(best)
     }
 
     fn try_program(
@@ -352,6 +408,7 @@ impl Evaluator {
         let (request_tx, request_rx) = mpsc::channel();
         let live =
             (self.stream_output || taped).then(|| LiveStreams::new(self.stream_output, request_tx));
+        let start_time = std::time::Instant::now();
         let cap = if taped {
             proc::run_observed_with_stdin_tape(
                 &mut cmd,
@@ -372,6 +429,7 @@ impl Evaluator {
             proc::run_captured(&mut cmd, self.timeout, self.allow_program_stdin)
         }
         .with_context(|| format!("failed to start {}", exe.display()))?;
+        let duration = start_time.elapsed();
         if let Some(live) = &live {
             live.finish();
         }
@@ -398,8 +456,7 @@ impl Evaluator {
         })
         .or_else(|| {
             cap.stdin_diverged.then(|| {
-                "stdin tape diverged while replaying retained input; use %undo or %reset"
-                    .to_string()
+                "stdin tape diverged while replaying retained input; use %reset".to_string()
             })
         })
         .or_else(|| {
@@ -438,8 +495,175 @@ impl Evaluator {
             scoped_rebind: false,
             file_replacement: None,
             unprintable: false,
+            duration,
         })
     }
+
+    /// Benchmark an expression or statement without committing it to the session.
+    pub fn timeit(&self, session: &Session, input: &str) -> Result<Eval> {
+        let mut loop_input = input.to_string();
+        let mut prog = codegen::build_timeit_probe(session, &loop_input, 1);
+        let res = match self.try_program(prog, Slot::Expr, session.stdin_tape())? {
+            Ok(o) => Ok(o),
+            Err(_) if !input.trim_end().ends_with(';') => {
+                loop_input = format!("{};", input.trim_end());
+                prog = codegen::build_timeit_probe(session, &loop_input, 1);
+                self.try_program(prog, Slot::Expr, session.stdin_tape())?
+            }
+            Err(e) => Err(e),
+        };
+
+        let outcome1 = match res {
+            Ok(o) => o,
+            Err(diag) => return Ok(Eval::CompileError(diag)),
+        };
+
+        if outcome1.abnormal.is_some() {
+            return Ok(Eval::Done(outcome1));
+        }
+
+        let elapsed_ns_1: u64 = outcome1
+            .value
+            .as_deref()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
+        let target_ns: u64 = 100_000_000;
+        let ladder: &[u64] = &[
+            1,
+            2,
+            5,
+            10,
+            20,
+            50,
+            100,
+            200,
+            500,
+            1_000,
+            2_000,
+            5_000,
+            10_000,
+            20_000,
+            50_000,
+            100_000,
+            200_000,
+            500_000,
+            1_000_000,
+            2_000_000,
+            5_000_000,
+            10_000_000,
+            20_000_000,
+            50_000_000,
+            100_000_000,
+        ];
+
+        let loops = if elapsed_ns_1 >= target_ns {
+            1
+        } else {
+            let needed = target_ns / elapsed_ns_1.max(1);
+            *ladder
+                .iter()
+                .find(|&&n| n >= needed)
+                .unwrap_or(&100_000_000)
+        };
+
+        let rounds = 5;
+        let mut samples_ns: Vec<f64> = Vec::with_capacity(rounds);
+        let mut last_outcome = outcome1;
+
+        for _ in 0..rounds {
+            let p = codegen::build_timeit_probe(session, &loop_input, loops);
+            if let Ok(Ok(o)) = self.try_program(p, Slot::Expr, session.stdin_tape()) {
+                let ns_val = o.value.as_deref().and_then(|v| v.parse::<u64>().ok());
+                if let Some(ns) = ns_val {
+                    let per_loop_ns = ns as f64 / loops as f64;
+                    samples_ns.push(per_loop_ns);
+                    last_outcome = o;
+                }
+            }
+        }
+
+        if samples_ns.is_empty() {
+            samples_ns.push(elapsed_ns_1 as f64);
+        }
+
+        let count = samples_ns.len() as f64;
+        let mean = samples_ns.iter().sum::<f64>() / count;
+        let variance = if samples_ns.len() > 1 {
+            samples_ns.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / (count - 1.0)
+        } else {
+            0.0
+        };
+        let std_dev = variance.sqrt();
+
+        let (mean_str, dev_str) = format_timeit_stats(mean, std_dev);
+        let report = format!(
+            "{} ± {} per loop (mean ± std. dev. of {} run{}, {} loop{} each)",
+            mean_str,
+            dev_str,
+            samples_ns.len(),
+            if samples_ns.len() == 1 { "" } else { "s" },
+            format_integer(loops),
+            if loops == 1 { "" } else { "s" }
+        );
+
+        Ok(Eval::Done(Outcome {
+            slot: Slot::Expr,
+            output: last_outcome.output,
+            value: Some(report),
+            errors: last_outcome.errors,
+            streamed_output_needs_newline: last_outcome.streamed_output_needs_newline,
+            stdin_events: Vec::new(),
+            warnings: last_outcome.warnings,
+            abnormal: None,
+            rewritten: None,
+            scoped_rebind: false,
+            file_replacement: None,
+            unprintable: false,
+            duration: last_outcome.duration,
+        }))
+    }
+}
+
+fn format_timeit_stats(mean_ns: f64, std_dev_ns: f64) -> (String, String) {
+    if mean_ns < 1_000.0 {
+        (
+            format!("{:.1} ns", mean_ns),
+            format!("{:.1} ns", std_dev_ns),
+        )
+    } else if mean_ns < 1_000_000.0 {
+        (
+            format!("{:.2} µs", mean_ns / 1000.0),
+            format!("{:.2} µs", std_dev_ns / 1000.0),
+        )
+    } else if mean_ns < 1_000_000_000.0 {
+        (
+            format!("{:.2} ms", mean_ns / 1_000_000.0),
+            format!("{:.2} ms", std_dev_ns / 1_000_000.0),
+        )
+    } else {
+        (
+            format!("{:.2} s", mean_ns / 1_000_000_000.0),
+            format!("{:.2} s", std_dev_ns / 1_000_000_000.0),
+        )
+    }
+}
+
+fn format_integer(mut n: u64) -> String {
+    if n == 0 {
+        return "0".to_string();
+    }
+    let mut s = String::new();
+    let mut count = 0;
+    while n > 0 {
+        if count > 0 && count % 3 == 0 {
+            s.insert(0, ',');
+        }
+        s.insert(0, (b'0' + (n % 10) as u8) as char);
+        n /= 10;
+        count += 1;
+    }
+    s
 }
 
 struct SplitOutput {
@@ -829,7 +1053,7 @@ fn is_rebinding_diagnostic(diag: &str) -> bool {
 /// process instead of predictably failing an expression compile first. A
 /// trailing `}` normally has the same property, except for C compound
 /// literals such as `(int){1}` or `x = (Point){1, 2}`.
-fn should_try_expr(input: &str) -> bool {
+pub(crate) fn should_try_expr(input: &str) -> bool {
     let scan = lex::scan(input);
     let Some(last) = input
         .as_bytes()
