@@ -5,7 +5,7 @@ behaves, skip the new-file / write-`main` / compile / run loop — just type it
 at the prompt.
 
 ```
-c-shell 0.2.2  ·  cc (GCC) 16.1.1 (default std gnu23)
+c-shell 0.2.4  ·  cc (GCC) 16.1.1 (default std gnu23)
 In [1]: int x = 41;
 In [2]: x + 1
 Out[2]: 42

@@ -9,10 +9,12 @@
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
+use crossterm::event::{Event, KeyEvent};
 use nu_ansi_term::{Color as NuColor, Style as NuStyle};
 use reedline::{
-    Completer, Highlighter, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus,
-    Span, StyledText, Suggestion, ValidationResult, Validator,
+    Completer, EditCommand, EditMode, Emacs, Highlighter, KeyCode, KeyModifiers, Prompt,
+    PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, ReedlineEvent,
+    ReedlineRawEvent, Span, StyledText, Suggestion, ValidationResult, Validator,
 };
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
@@ -127,10 +129,13 @@ pub struct CHighlighter {
     syntax: SyntaxReference,
     theme: Theme,
     color: bool,
+    /// Shared snapshot of the edit buffer, updated on every repaint so that
+    /// [`CEditMode`] can read it when deciding how to handle Enter.
+    buffer: Arc<Mutex<String>>,
 }
 
 impl CHighlighter {
-    pub fn new(color: bool) -> Self {
+    pub fn new(color: bool, buffer: Arc<Mutex<String>>) -> Self {
         // Loaded once: syntect's default sets are expensive enough that
         // rebuilding them per keystroke would be visible as input lag.
         let syntaxes = SyntaxSet::load_defaults_newlines();
@@ -144,6 +149,7 @@ impl CHighlighter {
             syntax,
             theme,
             color,
+            buffer,
         }
     }
 }
@@ -216,6 +222,13 @@ fn completion_candidates(line: &str, pos: usize, idents: &[String]) -> (usize, V
 
 impl Highlighter for CHighlighter {
     fn highlight(&self, line: &str, _cursor: usize) -> StyledText {
+        // Snapshot the buffer for CEditMode; highlight is called after every
+        // keystroke, so the edit mode always sees up-to-date content.
+        if let Ok(mut b) = self.buffer.lock() {
+            b.clear();
+            b.push_str(line);
+        }
+
         let mut styled = StyledText::new();
         // Without color, or for a magic line (which is not C), emit one flat
         // segment carrying the whole buffer, newlines included, so reedline
@@ -340,10 +353,11 @@ fn first_code_word(input: &str) -> Option<String> {
 /// though their parentheses are balanced. Without this check missing-semicolon
 /// repair can silently turn `if (x)` into the empty statement `if (x);`.
 fn control_header_awaits_body(input: &str) -> bool {
-    let Some(first) = first_code_word(input) else {
-        return false;
-    };
-    if !matches!(first.as_str(), "if" | "for" | "while" | "switch") {
+    let words = lex::identifiers(input);
+    let has_ctrl = words
+        .iter()
+        .any(|w| matches!(w.as_str(), "if" | "for" | "while" | "switch"));
+    if !has_ctrl {
         return false;
     }
     let sc = lex::scan(input);
@@ -508,6 +522,137 @@ impl Validator for CValidator {
         } else {
             ValidationResult::Complete
         }
+    }
+}
+
+/// Checks whether a single line is an unbraced control header (e.g. `if (...)`,
+/// `else if (...)`, `else`, `for (...)`, `while (...)`, `do`) or function signature
+/// that awaits a body without using `{`.
+fn is_dangling_header(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() || t.starts_with('%') || t.starts_with('#') {
+        return false;
+    }
+
+    let sc = lex::scan(line);
+    let bytes = line.as_bytes();
+    let last_code_idx = (0..bytes.len())
+        .rev()
+        .find(|&i| sc.code[i] && !bytes[i].is_ascii_whitespace());
+
+    let Some(last_idx) = last_code_idx else {
+        return false;
+    };
+
+    let last_char = bytes[last_idx];
+    if last_char == b';' || last_char == b'{' || last_char == b'}' {
+        return false;
+    }
+
+    if lex::awaits_body(line) {
+        return true;
+    }
+
+    if control_header_awaits_body(line) {
+        return true;
+    }
+
+    let words = lex::identifiers(line);
+    if let Some(last_word) = words.last()
+        && (last_word == "else" || last_word == "do")
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Calculates the auto-indent level (in 2-space units) for a continuation line.
+/// Combines `{}` brace nesting with unbraced control structures (like `if`,
+/// `else`, `for`, `while`, `do`, or function headers) that introduce an extra level of indentation.
+pub fn compute_indent_level(input: &str) -> usize {
+    let mut brace_depth = 0i32;
+    let mut dangling_depth = 0usize;
+
+    for line in input.lines() {
+        let sc = lex::scan(line);
+        let bytes = line.as_bytes();
+
+        let mut line_open_braces = 0i32;
+        let mut line_close_braces = 0i32;
+        let mut last_code_char = None;
+
+        for (i, &b) in bytes.iter().enumerate() {
+            if sc.code[i] {
+                if !b.is_ascii_whitespace() {
+                    last_code_char = Some(b);
+                }
+                match b {
+                    b'{' => line_open_braces += 1,
+                    b'}' => line_close_braces += 1,
+                    _ => {}
+                }
+            }
+        }
+
+        if line_open_braces > 0 || line_close_braces > 0 {
+            brace_depth = (brace_depth + line_open_braces - line_close_braces).max(0);
+            dangling_depth = 0;
+        } else if last_code_char == Some(b';') {
+            dangling_depth = 0;
+        } else if is_dangling_header(line) {
+            dangling_depth += 1;
+        }
+    }
+
+    (brace_depth.max(0) as usize) + dangling_depth
+}
+
+/// Wraps [`Emacs`] to auto-indent continuation lines: when Enter is pressed
+/// and the buffer is still incomplete, a newline plus `2 × compute_indent_level`
+/// spaces is inserted instead of a bare newline.
+pub struct CEditMode {
+    inner: Emacs,
+    /// Shared with [`CHighlighter`], which snapshots the buffer on every
+    /// repaint so we can read it here without access to reedline internals.
+    buffer: Arc<Mutex<String>>,
+}
+
+impl CEditMode {
+    pub fn new(inner: Emacs, buffer: Arc<Mutex<String>>) -> Self {
+        CEditMode { inner, buffer }
+    }
+}
+
+impl EditMode for CEditMode {
+    fn parse_event(&mut self, event: ReedlineRawEvent) -> ReedlineEvent {
+        let raw: Event = event.into();
+        if let Event::Key(KeyEvent {
+            code: KeyCode::Enter,
+            modifiers: KeyModifiers::NONE,
+            ..
+        }) = &raw
+        {
+            let buf = self
+                .buffer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if is_incomplete(&buf) {
+                let depth = compute_indent_level(&buf);
+                let indent = "  ".repeat(depth);
+                return ReedlineEvent::Edit(vec![EditCommand::InsertString(format!("\n{indent}"))]);
+            }
+        }
+        // Re-wrap and delegate to the inner Emacs mode for everything else.
+        // The TryFrom can only fail for KeyRelease, which reedline already
+        // filters out before calling parse_event.
+        let re_wrapped = ReedlineRawEvent::try_from(raw).expect("non-release event");
+        self.inner.parse_event(re_wrapped)
+    }
+
+    fn edit_mode(&self) -> PromptEditMode {
+        self.inner.edit_mode()
     }
 }
 
@@ -702,11 +847,33 @@ mod tests {
             suggestions.iter().map(|s| &s.value).collect::<Vec<_>>(),
             ["siz_total", "size_t", "sizeof"]
         );
-        // The replaced span is the whole word, so accepting any candidate
-        // overwrites `siz`, not just appends to it.
         assert!(
             suggestions.iter().all(|s| s.span == Span::new(4, 7)),
             "completion spans must cover the typed prefix: {suggestions:?}"
         );
+    }
+
+    #[test]
+    fn compute_indent_level_handles_braces_and_unbraced_control_headers() {
+        assert_eq!(compute_indent_level("int add(int a, int b) {"), 1);
+        assert_eq!(
+            compute_indent_level("int add(int a, int b) {\n  return a + b;"),
+            1
+        );
+        assert_eq!(
+            compute_indent_level("int add(int a, int b) {\n  return a + b;\n}"),
+            0
+        );
+
+        // Unbraced control statements & function signatures
+        assert_eq!(compute_indent_level("int add(int a, int b)"), 1);
+        assert_eq!(compute_indent_level("if (x > 0)"), 1);
+        assert_eq!(compute_indent_level("if (x > 0)\n  return 1;"), 0);
+        assert_eq!(compute_indent_level("if (x > 0)\n  if (y > 0)"), 2);
+        assert_eq!(compute_indent_level("else"), 1);
+        assert_eq!(compute_indent_level("else if (x > 0)"), 1);
+        assert_eq!(compute_indent_level("for (int i = 0; i < 10; ++i)"), 1);
+        assert_eq!(compute_indent_level("while (condition)"), 1);
+        assert_eq!(compute_indent_level("do"), 1);
     }
 }
