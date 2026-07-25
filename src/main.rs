@@ -17,11 +17,12 @@ mod ui;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use rustyline::error::ReadlineError;
-use rustyline::{EventHandler, KeyCode, KeyEvent, Modifiers};
+use reedline::{
+    EditCommand, Emacs, IdeMenu, KeyCode, KeyModifiers, MenuBuilder, Reedline, ReedlineEvent,
+    ReedlineMenu, Signal, default_emacs_keybindings,
+};
 use std::io::{BufRead, IsTerminal};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::codegen::Slot;
@@ -144,52 +145,54 @@ fn main() -> Result<()> {
         );
     }
 
-    let mut rl = rustyline::Editor::<editor::CHelper, _>::with_config(
-        rustyline::Config::builder()
-            .max_history_size(1000)?
-            .history_ignore_dups(true)?
-            .build(),
-    )?;
-    // Completion vocabulary, refreshed after every input.
+    // Completion vocabulary, refreshed after every input and shared with the
+    // completer.
     let idents = Arc::new(std::sync::Mutex::new(Vec::new()));
-    rl.set_helper(Some(editor::CHelper::new(color, Arc::clone(&idents))));
 
-    // Enter auto-indents continuation lines: padded to the prompt width so
-    // code aligns under code, plus two spaces per open bracket. `}` on a
-    // blank indent steps one level back out.
-    let prompt_base = Arc::new(AtomicUsize::new(Ui::prompt_width(1)));
-    rl.bind_sequence(
-        KeyEvent(KeyCode::Enter, Modifiers::NONE),
-        EventHandler::Conditional(Box::new(editor::EnterIndents(prompt_base.clone()))),
+    // Tab opens the IPython-style dropdown, then steps through it. reedline
+    // auto-saves submitted lines to an in-memory history (capacity 1000, no
+    // file), and the validator drives multi-line continuation.
+    let mut keybindings = default_emacs_keybindings();
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Tab,
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::Menu("completion_menu".to_string()),
+            ReedlineEvent::MenuNext,
+        ]),
     );
-    rl.bind_sequence(
-        KeyEvent::from('}'),
-        EventHandler::Conditional(Box::new(editor::BraceDedents)),
-    );
+    let menu = IdeMenu::default().with_name("completion_menu");
+    let mut rl = Reedline::create()
+        .with_completer(Box::new(editor::CCompleter::new(Arc::clone(&idents))))
+        .with_highlighter(Box::new(editor::CHighlighter::new(color)))
+        .with_validator(Box::new(editor::CValidator))
+        .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
+        .with_edit_mode(Box::new(Emacs::new(keybindings)))
+        .with_history(Box::new(reedline::FileBackedHistory::new(1000)?))
+        .with_ansi_colors(color);
 
     let mut edit_buffer: Option<String> = None;
     loop {
         let n = session.counter + 1;
-        prompt_base.store(Ui::prompt_width(n), Ordering::Relaxed);
-        let prompt = ui.prompt_in(n);
-        let line = match edit_buffer.take() {
-            Some(initial) => rl.readline_with_initial(&prompt, (&initial, "")),
-            None => rl.readline(&prompt),
-        };
-        let line = match line {
-            Ok(l) => l,
-            Err(ReadlineError::Interrupted) => continue,
-            Err(ReadlineError::Eof) => break,
-            Err(e) => return Err(e.into()),
+        let prompt = editor::CPrompt { n };
+        // `%edit` preloads the buffer: reedline clears it on submit, so the
+        // insert lands in an empty buffer that read_line then edits in place.
+        if let Some(initial) = edit_buffer.take() {
+            rl.run_edit_commands(&[EditCommand::InsertString(initial)]);
+        }
+        let line = match rl.read_line(&prompt)? {
+            Signal::Success(l) => l,
+            Signal::CtrlC => continue,
+            Signal::CtrlD => break,
+            _ => continue,
         };
         let raw = line.trim();
         if raw.is_empty() {
             continue;
         }
-        let _ = rl.add_history_entry(raw);
         let (_, quit, next_edit) = submit(raw, &mut session, &mut ev, &ui, Style::Repl, true)?;
         // `%edit` itself consumes no input number. Its selected text becomes
-        // the editable buffer at the same prompt on the next readline call.
+        // the editable buffer at the same prompt on the next read_line call.
         edit_buffer = next_edit;
         *idents.lock().expect("ident vocabulary") = session.identifiers();
         if quit {

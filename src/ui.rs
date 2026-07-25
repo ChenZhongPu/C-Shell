@@ -27,16 +27,18 @@ impl Ui {
         self.paint("1;36", BANNER)
     }
 
-    /// The `In [n]:` prompt.
-    pub fn prompt_in(&self, n: usize) -> String {
-        self.paint("1;32", &format!("In [{n}]: "))
+    /// The plain `In [n]:` prompt label, without the trailing space or color;
+    /// reedline draws it and supplies both. Single source of truth for the
+    /// prompt text, shared with [`Ui::prompt_width`].
+    pub fn prompt_label(n: usize) -> String {
+        format!("In [{n}]:")
     }
 
-    /// Printable width of that prompt, excluding color codes — the column
-    /// where the user's code starts, and the alignment base for
-    /// continuation-line auto-indent.
+    /// Printable width of the full prompt (`In [n]: `, label plus its trailing
+    /// space) — the column where the user's code starts, and the width the
+    /// continuation-line indicator is padded to.
     pub fn prompt_width(n: usize) -> usize {
-        format!("In [{n}]: ").len()
+        Self::prompt_label(n).len() + 1
     }
 
     pub fn out_label(&self, n: usize) -> String {

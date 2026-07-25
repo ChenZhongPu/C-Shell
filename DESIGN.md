@@ -4,7 +4,7 @@ Settled architecture decisions, the one big open problem, and the traps buried
 in the code that you must know about before changing it. README is for users;
 this file is for whoever develops the tool next.
 
-Status: v0.2.2 working. ~7100 lines of Rust, 107 tests (67 unit + 40
+Status: v0.2.2 working. ~7100 lines of Rust, 104 tests (64 unit + 40
 end-to-end smoke), clippy/fmt clean, English UI. Verified on Linux with gcc
 16.1.1 and clang 22.1.6. CI exercises the default macOS compiler and two
 Windows driver dialects (a GNU-style driver and MSVC); see
@@ -18,7 +18,7 @@ Windows driver dialects (a GNU-style driver and MSVC); see
 |---|---|
 | `toolchain.rs` | compiler detection, cached capability probing, GNU/Clang/MSVC flag dialects, default-std detection, `_Generic` floor |
 | `eval.rs` | trial-compile classification/rebinding, compile, run with timeout, crash diagnosis |
-| `editor.rs` | syntect highlighting, completion, multi-line input and indentation |
+| `editor.rs` | reedline integration: syntect highlighting, completion menu, multi-line validation, prompt |
 | `main.rs` | CLI, REPL, `-e`, script and piped-input modes |
 | `lex.rs` | byte-level scan: bracket balance, literals/comments, purity and identifier heuristics |
 | `errmap.rs` | diagnostic provenance/remapping, scaffolding removal, stale-warning filtering |
@@ -43,7 +43,7 @@ confirmation for a completed interactive `if`, `if`/`else` batch lookahead,
 control/do-while/preprocessor continuation, tab completion (magics, C keywords,
 retained session names), process-local Up/Down recall and numbered-input
 `%edit [n]`, `-e`/script/piped-input batch modes,
-`%help [--verbose] %quit %clear %reset %src %edit %type %cc %std`, deadlines and
+`%help [--verbose] %quit %clear %reset %src %header %edit %type %time %timeit %undo %cc %std`, deadlines and
 timeout-path tree cleanup for compiler/probe/user-program children, cached
 compiler capability probes, CI for 4 platform configs, and a tag-triggered release
 workflow.
@@ -152,9 +152,10 @@ statement/declaration and file-scope item is retained without purity analysis;
 notably, adding a trailing `;` turns an expression into a stored statement.
 
 **Keep recall/editing local and bounded; do not expose or persist history.**
-Rustyline keeps up to 1000 deduplicated entries in memory for Up/Down during
-one process, but c-shell never calls load/save-history and has no history file
-or `%history`. `Session::inputs` retains each numbered C input—including failed
+reedline's `FileBackedHistory::new(1000)` is in-memory only (the file-backed
+constructor is a different call), giving up to 1000 Up/Down entries for one
+process; c-shell never points it at a file and has no history file or
+`%history`. `Session::inputs` retains each numbered C input—including failed
 attempts and forgotten pure queries—for direct `%edit n` lookup; magic commands
 do not enter this archive, and `%reset` clears it. Completion remains
 independent, built from static C vocabulary plus identifiers in retained file
@@ -172,8 +173,9 @@ three-second `clang-format` deadline.
 **`%edit [n]` pre-fills the terminal prompt; it does not submit by itself.**
 With no argument it selects the latest input; an argument indexes the current
 session's one-based `In[n]` archive. `magic::Action::Prefill` returns a copy to
-the interactive loop, which calls Rustyline's `readline_with_initial` at the
-same `In[n]` number with the cursor at the end. Only the user's later Enter
+the interactive loop, which preloads it with `run_edit_commands(InsertString)`
+before the next `read_line` — reedline clears the buffer on submit, so the
+insert lands in an empty buffer — at the same `In[n]` number. Only the user's later Enter
 re-enters the normal submit/evaluate/commit path and receives a fresh number;
 even an unchanged buffer is not submitted by `%edit` itself, and the original
 archive entry is never mutated. Ctrl-C or an emptied buffer cancels through the
@@ -439,7 +441,7 @@ References: [crepl](https://l-m.dev/cs/crepl/)
   an extra replay is cheap, lost state is not. AST-level judgment arrives
   with tree-sitter in §3's staging.)
 - **Type-ahead at a real terminal is dropped between prompts** (pre-existing,
-  verified identical before/after the process-isolation work): rustyline
+  verified identical before/after the process-isolation work): the line editor
   flushes the tty queue when re-entering raw mode, so a line typed while a
   program is still running is lost. Piped input is unaffected, which is why
   the smoke tests never see it. Fix would mean patching or replacing the
@@ -521,6 +523,25 @@ holds a complete leading `if` for one physical line of lookahead and submits it
 before an unrelated next line. Reusing the
 interactive blank-line policy in scripts would accidentally merge the next C
 statement into the same input.
+
+**The line editor is reedline, for the IPython-style completion menu.**
+rustyline's completion is a flat readline list with no floating, selectable
+dropdown; that ceiling is why the editor was swapped. Completion becomes
+reedline's `IdeMenu` (Tab opens it, Tab/arrows move, Enter accepts);
+highlighting, completion and completeness map onto reedline's `Highlighter`,
+`Completer` and `Validator` traits; `%edit` preloads via
+`run_edit_commands(InsertString)`. One capability was lost in the move:
+rustyline's per-keystroke `ConditionalEventHandler` computed a structural
+continuation indent (prompt width + two spaces per open bracket) and a
+`}`-dedent, driven by live buffer state. reedline has no such hook — multi-line
+is validator-driven and it does not indent inserted newlines. Continuation
+lines instead align under the first line's code through the multiline prompt
+indicator (prompt-width spaces); the extra structural indent and the dedent are
+gone. This is cosmetic only: stored statements are re-indented by
+`Session::indent` and `%src` reflows through clang-format, so evaluation is
+unaffected. reedline also needs a genuine interactive terminal (it queries
+cursor position), so the interactive path cannot be exercised by the piped
+smoke tests; the batch/`-e`/pipe paths never touch it.
 
 **The validator must recognize syntax that is balanced but not complete.**
 `lex::awaits_body` catches `int fact(int n)`: without it, missing-semicolon

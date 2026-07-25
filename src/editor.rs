@@ -1,26 +1,30 @@
-//! The line editor: C syntax highlighting as you type, and deciding when a
-//! multi-line input is finished.
+//! The line editor: C syntax highlighting as you type, deciding when a
+//! multi-line input is finished, and the IPython-style completion menu.
+//!
+//! The editor integration is reedline: the completion dropdown is its
+//! `IdeMenu`, multi-line continuation is driven by the [`Validator`], and the
+//! prompt aligns wrapped lines under the first line's code. The C-specific
+//! completeness and completion logic below is plain, editor-agnostic code.
 
 use std::borrow::Cow;
-
-use rustyline::completion::Completer;
-use rustyline::highlight::Highlighter;
-use rustyline::hint::Hinter;
-use rustyline::validate::{ValidationContext, ValidationResult, Validator};
-use rustyline::{Cmd, ConditionalEventHandler, Event, EventContext, Helper, Movement, RepeatCount};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+use nu_ansi_term::{Color as NuColor, Style as NuStyle};
+use reedline::{
+    Completer, Highlighter, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus,
+    Span, StyledText, Suggestion, ValidationResult, Validator,
+};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
-use syntect::util::as_24_bit_terminal_escaped;
 
 use crate::lex;
+use crate::ui::Ui;
 
 /// The magic commands, for completion.
 const MAGICS: &[&str] = &[
-    "%help", "%quit", "%exit", "%clear", "%reset", "%src", "%edit", "%type", "%time", "%timeit",
-    "%undo", "%cc", "%std",
+    "%help", "%quit", "%exit", "%clear", "%reset", "%src", "%header", "%edit", "%type", "%time",
+    "%timeit", "%undo", "%cc", "%std",
 ];
 
 /// C keywords, common types and stdlib staples worth offering at a C prompt.
@@ -87,11 +91,28 @@ const C_WORDS: &[&str] = &[
     "realloc",
     "free",
     "memcpy",
+    "memmove",
     "memset",
+    "memcmp",
+    "memchr",
     "strlen",
     "strcmp",
+    "strncmp",
     "strcpy",
     "strncpy",
+    "strcat",
+    "strncat",
+    "strchr",
+    "strrchr",
+    "strstr",
+    "strtok",
+    "atoi",
+    "atof",
+    "strtol",
+    "strtod",
+    "abs",
+    "qsort",
+    "exit",
     "fopen",
     "fclose",
     "fread",
@@ -99,17 +120,17 @@ const C_WORDS: &[&str] = &[
     "fprintf",
 ];
 
-pub struct CHelper {
+/// Syntax highlighting for the edit buffer. Holds syntect's loaded sets so
+/// they are not rebuilt on every keystroke.
+pub struct CHighlighter {
     syntaxes: SyntaxSet,
     syntax: SyntaxReference,
     theme: Theme,
-    pub color: bool,
-    /// Session vocabulary, refreshed by the REPL loop after each input.
-    idents: Arc<Mutex<Vec<String>>>,
+    color: bool,
 }
 
-impl CHelper {
-    pub fn new(color: bool, idents: Arc<Mutex<Vec<String>>>) -> Self {
+impl CHighlighter {
+    pub fn new(color: bool) -> Self {
         // Loaded once: syntect's default sets are expensive enough that
         // rebuilding them per keystroke would be visible as input lag.
         let syntaxes = SyntaxSet::load_defaults_newlines();
@@ -118,14 +139,36 @@ impl CHelper {
             .unwrap_or_else(|| syntaxes.find_syntax_plain_text())
             .clone();
         let theme = ThemeSet::load_defaults().themes["base16-ocean.dark"].clone();
-        CHelper {
+        CHighlighter {
             syntaxes,
             syntax,
             theme,
             color,
-            idents,
         }
     }
+}
+
+/// Tab completion against magics, C vocabulary and session identifiers. The
+/// vocabulary is shared with the REPL loop, which refreshes it after each input.
+pub struct CCompleter {
+    idents: Arc<Mutex<Vec<String>>>,
+}
+
+impl CCompleter {
+    pub fn new(idents: Arc<Mutex<Vec<String>>>) -> Self {
+        CCompleter { idents }
+    }
+}
+
+/// Decides, through [`is_incomplete`], whether Enter submits the buffer or
+/// opens a continuation line.
+pub struct CValidator;
+
+/// The `In [n]:` prompt. reedline colors it, and for continuation lines
+/// substitutes the multiline indicator — spaces as wide as the prompt so that
+/// wrapped code aligns under the first line's code.
+pub struct CPrompt {
+    pub n: usize,
 }
 
 /// What Tab should offer at `pos`: `(replace_from, candidates)`.
@@ -154,6 +197,12 @@ fn completion_candidates(line: &str, pos: usize, idents: &[String]) -> (usize, V
     if word.is_empty() || word.as_bytes()[0].is_ascii_digit() {
         return (pos, Vec::new());
     }
+    // Only names in code position are worth completing. Characters inside a
+    // string or char literal, or a comment, are text — `str` typed in "..."
+    // is not the start of `strcat`. `lex::scan` marks each byte code-or-not.
+    if !lex::scan(line).code.get(start).copied().unwrap_or(true) {
+        return (pos, Vec::new());
+    }
     let mut out: Vec<String> = C_WORDS
         .iter()
         .filter(|k| k.starts_with(word))
@@ -165,28 +214,39 @@ fn completion_candidates(line: &str, pos: usize, idents: &[String]) -> (usize, V
     (start, out)
 }
 
-impl Highlighter for CHelper {
-    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
-        if !self.color || line.is_empty() {
-            return Cow::Borrowed(line);
+impl Highlighter for CHighlighter {
+    fn highlight(&self, line: &str, _cursor: usize) -> StyledText {
+        let mut styled = StyledText::new();
+        // Without color, or for a magic line (which is not C), emit one flat
+        // segment carrying the whole buffer, newlines included, so reedline
+        // can still weave the multiline indicator between continuation lines.
+        if !self.color {
+            styled.push((NuStyle::new(), line.to_string()));
+            return styled;
         }
-        // Magic commands are not C; highlighting them as C looks wrong.
         if line.trim_start().starts_with('%') {
-            return Cow::Owned(format!("\x1b[36m{line}\x1b[0m"));
+            styled.push((NuStyle::new().fg(NuColor::Cyan), line.to_string()));
+            return styled;
         }
-        let mut h = HighlightLines::new(&self.syntax, &self.theme);
-        match h.highlight_line(line, &self.syntaxes) {
-            Ok(ranges) => {
-                let mut s = as_24_bit_terminal_escaped(&ranges[..], false);
-                s.push_str("\x1b[0m");
-                Cow::Owned(s)
+        // syntect highlights one physical line at a time; rejoin the lines
+        // with explicit newline segments so the painter still sees them.
+        for (i, physical) in line.split('\n').enumerate() {
+            if i > 0 {
+                styled.push((NuStyle::new(), "\n".to_string()));
             }
-            Err(_) => Cow::Borrowed(line),
+            let mut h = HighlightLines::new(&self.syntax, &self.theme);
+            match h.highlight_line(physical, &self.syntaxes) {
+                Ok(ranges) => {
+                    for (syn, text) in ranges {
+                        let c = syn.foreground;
+                        let style = NuStyle::new().fg(NuColor::Rgb(c.r, c.g, c.b));
+                        styled.push((style, text.to_string()));
+                    }
+                }
+                Err(_) => styled.push((NuStyle::new(), physical.to_string())),
+            }
         }
-    }
-
-    fn highlight_char(&self, _line: &str, _pos: usize, _forced: bool) -> bool {
-        self.color
+        styled
     }
 }
 
@@ -441,96 +501,64 @@ fn code_identifier<'a>(input: &'a str, code: &[bool], start: usize) -> Option<(&
     Some((&input[start..end], end))
 }
 
-impl Validator for CHelper {
-    fn validate(&self, ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
-        if is_incomplete(ctx.input()) {
-            Ok(ValidationResult::Incomplete)
+impl Validator for CValidator {
+    fn validate(&self, line: &str) -> ValidationResult {
+        if is_incomplete(line) {
+            ValidationResult::Incomplete
         } else {
-            Ok(ValidationResult::Valid(None))
+            ValidationResult::Complete
         }
     }
 }
 
-/// What Enter should insert at `pos`, or `None` to let the default
-/// accept-or-insert behavior run (which submits complete input).
-///
-/// Continuation lines have no prompt in front of them, so without help they
-/// start at column 0 — visually *left* of the first line's code, which sits
-/// after `In [n]: `. `base` is that prompt's width: every continuation line
-/// is padded to it so code aligns under code, then indented two spaces per
-/// unclosed bracket. Inside an unterminated string or comment a bare
-/// newline is inserted instead: padding there would become literal content.
-fn continuation_insert(line: &str, pos: usize, base: usize) -> Option<String> {
-    if !is_incomplete(line) {
-        return None;
-    }
-    let before = lex::scan(&line[..pos]);
-    if before.unterminated {
-        return Some("\n".to_string());
-    }
-    let depth = before.depth.max(0) as usize;
-    Some(format!("\n{}", " ".repeat(base + 2 * depth)))
-}
-
-/// True when a `}` typed at `pos` should first remove one indent level:
-/// the cursor sits at the end of a line holding nothing but spaces, so the
-/// brace belongs one two-space level out from where auto-indent left it.
-fn brace_dedents(line: &str, pos: usize) -> bool {
-    let start = line[..pos].rfind('\n').map_or(0, |i| i + 1);
-    let cur = &line[start..pos];
-    cur.len() >= 2 && cur.bytes().all(|b| b == b' ')
-}
-
-/// Enter: submit when the input is complete, otherwise insert a newline
-/// followed by the right amount of indentation.
-///
-/// Holds the current prompt's width, updated by the REPL loop each
-/// iteration — `In [10]: ` is one column wider than `In [9]: `.
-pub struct EnterIndents(pub Arc<AtomicUsize>);
-
-impl ConditionalEventHandler for EnterIndents {
-    fn handle(&self, _: &Event, _: RepeatCount, _: bool, ctx: &EventContext) -> Option<Cmd> {
-        let base = self.0.load(Ordering::Relaxed);
-        continuation_insert(ctx.line(), ctx.pos(), base).map(|s| Cmd::Insert(1, s))
-    }
-}
-
-/// `}`: on a whitespace-only line, step back one indent level first, the
-/// way any code editor closes a block.
-pub struct BraceDedents;
-
-impl ConditionalEventHandler for BraceDedents {
-    fn handle(&self, _: &Event, _: RepeatCount, _: bool, ctx: &EventContext) -> Option<Cmd> {
-        if brace_dedents(ctx.line(), ctx.pos()) {
-            Some(Cmd::Replace(
-                Movement::BackwardChar(2),
-                Some("}".to_string()),
-            ))
-        } else {
-            None
-        }
-    }
-}
-
-impl Completer for CHelper {
-    type Candidate = String;
-
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _ctx: &rustyline::Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<String>)> {
+impl Completer for CCompleter {
+    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
         let idents = self.idents.lock().expect("ident vocabulary");
-        Ok(completion_candidates(line, pos, &idents))
+        let (start, candidates) = completion_candidates(line, pos, &idents);
+        candidates
+            .into_iter()
+            .map(|value| Suggestion {
+                value,
+                span: Span::new(start, pos),
+                ..Suggestion::default()
+            })
+            .collect()
     }
 }
 
-impl Hinter for CHelper {
-    type Hint = String;
-}
+impl Prompt for CPrompt {
+    fn render_prompt_left(&self) -> Cow<'_, str> {
+        Cow::Owned(Ui::prompt_label(self.n))
+    }
 
-impl Helper for CHelper {}
+    fn render_prompt_right(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+
+    fn render_prompt_indicator(&self, _mode: PromptEditMode) -> Cow<'_, str> {
+        Cow::Borrowed(" ")
+    }
+
+    /// Continuation lines carry no `In [n]:`; padding them to the prompt width
+    /// keeps wrapped code aligned under the first line's code.
+    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
+        Cow::Owned(" ".repeat(Ui::prompt_width(self.n)))
+    }
+
+    fn render_prompt_history_search_indicator(
+        &self,
+        history_search: PromptHistorySearch,
+    ) -> Cow<'_, str> {
+        let prefix = match history_search.status {
+            PromptHistorySearchStatus::Passing => "",
+            PromptHistorySearchStatus::Failing => "failing ",
+        };
+        Cow::Owned(format!(
+            "({prefix}reverse-search: {}) ",
+            history_search.term
+        ))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -538,9 +566,14 @@ mod tests {
 
     #[test]
     fn completes_magic_commands_at_line_start_only() {
+        // `%h` is an ambiguous prefix and must surface every match, not one.
         let (start, c) = completion_candidates("%h", 2, &[]);
         assert_eq!(start, 0);
-        assert_eq!(c, vec!["%help"]);
+        assert!(c.contains(&"%help".to_string()) && c.contains(&"%header".to_string()));
+        assert_eq!(
+            completion_candidates("%he", 3, &[]).1,
+            vec!["%help", "%header"]
+        );
         assert_eq!(completion_candidates("%cl", 3, &[]).1, vec!["%clear"]);
         assert_eq!(completion_candidates("%ed", 3, &[]).1, vec!["%edit"]);
         assert_eq!(completion_candidates("%ty", 3, &[]).1, vec!["%type"]);
@@ -558,16 +591,49 @@ mod tests {
     }
 
     #[test]
+    fn an_ambiguous_prefix_offers_every_match_not_just_the_first() {
+        // The gripe this addresses: `str` used to jump straight to one word.
+        // Every family member must be present so List completion can show them.
+        let (start, c) = completion_candidates("str", 3, &[]);
+        assert_eq!(start, 0);
+        for expected in ["strcat", "strcmp", "strcpy", "strlen", "strstr"] {
+            assert!(
+                c.contains(&expected.to_string()),
+                "{expected} missing: {c:?}"
+            );
+        }
+        assert!(
+            c.windows(2).all(|w| w[0] < w[1]),
+            "candidates not sorted: {c:?}"
+        );
+    }
+
+    #[test]
     fn no_candidates_inside_numbers_or_empty() {
         assert!(completion_candidates("x = 0x1", 7, &[]).1.is_empty());
         assert!(completion_candidates("", 0, &[]).1.is_empty());
     }
 
     #[test]
-    fn complete_input_falls_through_to_submit() {
-        assert_eq!(continuation_insert("int x = 1;", 10, 8), None);
-        assert_eq!(continuation_insert("x + 1", 5, 8), None);
-        assert_eq!(continuation_insert("%help", 5, 8), None);
+    fn completes_only_names_in_code_position() {
+        // Inside a string or char literal there is no name to complete.
+        assert!(
+            completion_candidates("printf(\"strc", 12, &[]).1.is_empty(),
+            "completed inside a string literal"
+        );
+        assert!(
+            completion_candidates("char c = 'a", 11, &[]).1.is_empty(),
+            "completed inside a char literal"
+        );
+        // Right after `strcat(` the word is empty: nothing to complete.
+        assert!(completion_candidates("strcat(", 7, &[]).1.is_empty());
+        // An identifier in argument position is still a name worth completing.
+        assert!(
+            completion_candidates("strcat(s, str", 13, &[])
+                .1
+                .contains(&"strcat".to_string()),
+            "suppressed a real identifier in argument position"
+        );
     }
 
     #[test]
@@ -629,41 +695,18 @@ mod tests {
     }
 
     #[test]
-    fn continuation_aligns_under_the_prompt_then_two_per_depth() {
-        // `In [1]: ` is 8 wide; body of one open brace = 8 + 2.
+    fn completer_maps_candidates_to_reedline_spans() {
+        let mut completer = CCompleter::new(Arc::new(Mutex::new(vec!["siz_total".to_string()])));
+        let suggestions = completer.complete("x = siz", 7);
         assert_eq!(
-            continuation_insert("struct P {", 10, 8).as_deref(),
-            Some("\n          ")
+            suggestions.iter().map(|s| &s.value).collect::<Vec<_>>(),
+            ["siz_total", "size_t", "sizeof"]
         );
-        let l = "int f(void) { if (x) {";
-        assert_eq!(
-            continuation_insert(l, l.len(), 8).as_deref(),
-            Some(format!("\n{}", " ".repeat(8 + 4)).as_str())
+        // The replaced span is the whole word, so accepting any candidate
+        // overwrites `siz`, not just appends to it.
+        assert!(
+            suggestions.iter().all(|s| s.span == Span::new(4, 7)),
+            "completion spans must cover the typed prefix: {suggestions:?}"
         );
-    }
-
-    #[test]
-    fn signature_awaiting_body_aligns_at_base() {
-        // Depth 0: the `{` line goes directly under the signature's start.
-        assert_eq!(
-            continuation_insert("int fact(int n)", 15, 8).as_deref(),
-            Some("\n        ")
-        );
-    }
-
-    #[test]
-    fn no_padding_inside_unterminated_literal() {
-        let l = "puts(\"abc";
-        assert_eq!(continuation_insert(l, l.len(), 8).as_deref(), Some("\n"));
-    }
-
-    #[test]
-    fn closing_brace_dedents_only_on_blank_indent() {
-        let l = "struct P {\n          ";
-        assert!(brace_dedents(l, l.len()));
-        assert!(!brace_dedents("int x", 5));
-        // Text already on the line: the brace is not closing an indent.
-        let l2 = "struct P {\n          int x;";
-        assert!(!brace_dedents(l2, l2.len()));
     }
 }

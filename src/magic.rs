@@ -87,6 +87,7 @@ const HELP: &str = "Commands:
   %clear             clear the screen without changing the session
   %reset             clear the session and start fresh
   %src [--raw]       show user C; --raw includes generated runtime/protocol
+  %header            list the headers included in every program
   %edit [n]          copy latest or In[n] into the prompt for editing
   %type <expression> query an expression's type without evaluating it
   %time <code...>    time the execution of a statement or expression once
@@ -171,6 +172,14 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
             } else {
                 println!("{}", ui.err("nothing to undo"));
             }
+        }
+
+        "header" | "headers" => {
+            println!(
+                "{}",
+                ui.dim("Included in every program (no #include needed):")
+            );
+            print!("{}", codegen::HEADERS);
         }
 
         "src" => match rest.as_slice() {

@@ -805,3 +805,12 @@ fn help_lists_commands_and_keeps_usage_notes_behind_verbose() {
 {verbose}"
     );
 }
+
+#[test]
+fn header_lists_the_default_includes() {
+    let out = run(&["%header"]);
+    assert!(
+        out.contains("#include <stdio.h>") && out.contains("#include <string.h>"),
+        "default headers were not listed:\n{out}"
+    );
+}

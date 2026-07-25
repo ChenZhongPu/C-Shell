@@ -117,8 +117,9 @@ GCC nested-function warning: enter the statements from the body directly and
 omit the final `return`.
 
 Common headers (`stdio`, `stdlib`, `string`, `math`, `stdbool`, `stdint`,
-`stddef`, `limits`, `ctype`) are pre-included. Unix builds link `-lm`; Windows
-math functions come from the C runtime. GNU-style GCC/Clang drivers use
+`inttypes`, `stddef`, `limits`, `ctype`, `stdarg`, `time`) are pre-included, so
+no `#include` is needed for the everyday library; `%header` lists them. Unix
+builds link `-lm`; Windows math functions come from the C runtime. GNU-style GCC/Clang drivers use
 `-Wall -Wextra`; MSVC-style `cl`/`clang-cl` drivers use `/W3`. The warning is
 often exactly the thing you came to check.
 
@@ -176,7 +177,8 @@ you are changing—`%reset` is the way out.
 
 ```
 %help      %quit      %clear     %reset     %edit [n]
-%src       %type      %cc        %std
+%src       %header    %type      %time      %timeit
+%undo      %cc        %std
 ```
 
 `%help` lists the commands and nothing else, so it stays a one-screen
@@ -244,9 +246,12 @@ anonymous aggregate typedef uses its typedef name. Truly anonymous aggregates
 and other types outside the table report `<unrecognized type>`.
 
 Tab completes `%` commands, C keywords, stdlib staples and retained session
-identifiers of at least two characters. Up/Down recalls up to 1000 inputs from
-the current process so multi-line blocks can be recovered, but nothing is
-loaded or saved across launches. There is no `%history` or history file. The
+identifiers of at least two characters. When a prefix is ambiguous, Tab opens a
+dropdown menu under the cursor listing every candidate, IPython-style; Tab and
+the arrow keys move through it and Enter accepts. Up/Down recalls up to 1000
+inputs from the current process so multi-line blocks can be recovered, but
+nothing is loaded or saved across launches. There is no `%history` or history
+file. The
 separate current-session input archive exists only for direct `%edit n` lookup
 and is cleared by `%reset`.
 
