@@ -7,14 +7,15 @@
 //! completeness and completion logic below is plain, editor-agnostic code.
 
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crossterm::event::{Event, KeyEvent};
 use nu_ansi_term::{Color as NuColor, Style as NuStyle};
 use reedline::{
-    Completer, EditCommand, EditMode, Emacs, Highlighter, KeyCode, KeyModifiers, Prompt,
-    PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, ReedlineEvent,
-    ReedlineRawEvent, Span, StyledText, Suggestion, ValidationResult, Validator,
+    Completer, EditCommand, EditMode, Editor, Emacs, Highlighter, KeyCode, KeyModifiers, Menu,
+    MenuEvent, Painter, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus,
+    ReedlineEvent, ReedlineRawEvent, Span, StyledText, Suggestion, ValidationResult, Validator,
 };
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
@@ -129,13 +130,13 @@ pub struct CHighlighter {
     syntax: SyntaxReference,
     theme: Theme,
     color: bool,
-    /// Shared snapshot of the edit buffer, updated on every repaint so that
-    /// [`CEditMode`] can read it when deciding how to handle Enter.
-    buffer: Arc<Mutex<String>>,
+    /// Shared edit-buffer snapshot, updated on every repaint so that
+    /// [`CEditMode`] can read both the text and cursor position.
+    state: Arc<Mutex<EditState>>,
 }
 
 impl CHighlighter {
-    pub fn new(color: bool, buffer: Arc<Mutex<String>>) -> Self {
+    pub fn new(color: bool, state: Arc<Mutex<EditState>>) -> Self {
         // Loaded once: syntect's default sets are expensive enough that
         // rebuilding them per keystroke would be visible as input lag.
         let syntaxes = SyntaxSet::load_defaults_newlines();
@@ -149,9 +150,20 @@ impl CHighlighter {
             syntax,
             theme,
             color,
-            buffer,
+            state,
         }
     }
+}
+
+/// The editor information exposed to [`CEditMode`] by the highlighter.
+///
+/// Reedline's `EditMode` receives only key events, not the current buffer or
+/// cursor. The highlighter receives both immediately before each input event,
+/// so it keeps this small shared snapshot for the custom indentation handler.
+#[derive(Default)]
+pub struct EditState {
+    buffer: String,
+    cursor: usize,
 }
 
 /// Tab completion against magics, C vocabulary and session identifiers. The
@@ -221,13 +233,13 @@ fn completion_candidates(line: &str, pos: usize, idents: &[String]) -> (usize, V
 }
 
 impl Highlighter for CHighlighter {
-    fn highlight(&self, line: &str, _cursor: usize) -> StyledText {
+    fn highlight(&self, line: &str, cursor: usize) -> StyledText {
         // Snapshot the buffer for CEditMode; highlight is called after every
         // keystroke, so the edit mode always sees up-to-date content.
-        if let Ok(mut b) = self.buffer.lock() {
-            b.clear();
-            b.push_str(line);
-        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.buffer.clear();
+        state.buffer.push_str(line);
+        state.cursor = cursor;
 
         let mut styled = StyledText::new();
         // Without color, or for a magic line (which is not C), emit one flat
@@ -366,22 +378,44 @@ fn first_code_word(input: &str) -> Option<String> {
 /// though their parentheses are balanced. Without this check missing-semicolon
 /// repair can silently turn `if (x)` into the empty statement `if (x);`.
 fn control_header_awaits_body(input: &str) -> bool {
-    let words = lex::identifiers(input);
-    let has_ctrl = words
-        .iter()
-        .any(|w| matches!(w.as_str(), "if" | "for" | "while" | "switch"));
-    if !has_ctrl {
-        return false;
-    }
     let sc = lex::scan(input);
     let b = input.as_bytes();
-    let Some(open) = (0..b.len()).find(|&i| sc.code[i] && b[i] == b'(') else {
+
+    // Find the last control keyword in code position
+    let mut last_ctrl_end = None;
+    let mut i = 0;
+    while i < b.len() {
+        if !sc.code[i] {
+            i += 1;
+            continue;
+        }
+        if b[i] == b'_' || b[i].is_ascii_alphabetic() {
+            let start = i;
+            while i < b.len() && sc.code[i] && (b[i] == b'_' || b[i].is_ascii_alphanumeric()) {
+                i += 1;
+            }
+            let word = &input[start..i];
+            if matches!(word, "if" | "for" | "while" | "switch") {
+                last_ctrl_end = Some(i);
+            }
+            continue;
+        }
+        i += 1;
+    }
+
+    let Some(ctrl_end) = last_ctrl_end else {
+        return false;
+    };
+
+    // Find the first '(' at or after the last control keyword
+    let Some(open) = (ctrl_end..b.len()).find(|&idx| sc.code[idx] && b[idx] == b'(') else {
         return true;
     };
+
     let mut depth = 0i32;
     let mut close = None;
-    for (i, &byte) in b.iter().enumerate().skip(open) {
-        if !sc.code[i] {
+    for (idx, &byte) in b.iter().enumerate().skip(open) {
+        if !sc.code[idx] {
             continue;
         }
         match byte {
@@ -389,7 +423,7 @@ fn control_header_awaits_body(input: &str) -> bool {
             b')' => {
                 depth -= 1;
                 if depth == 0 {
-                    close = Some(i);
+                    close = Some(idx);
                     break;
                 }
             }
@@ -397,7 +431,7 @@ fn control_header_awaits_body(input: &str) -> bool {
         }
     }
     let Some(close) = close else { return true };
-    !(close + 1..b.len()).any(|i| sc.code[i] && !b[i].is_ascii_whitespace())
+    !(close + 1..b.len()).any(|idx| sc.code[idx] && !b[idx].is_ascii_whitespace())
 }
 
 /// A `do` statement is not complete at its closing body brace; its trailing
@@ -580,45 +614,200 @@ fn is_dangling_header(line: &str) -> bool {
     false
 }
 
+/// Replaces comment/literal bytes with spaces using a code mask obtained from
+/// scanning the complete buffer. This lets the line-oriented header heuristic
+/// retain lexical state across physical lines.
+fn code_only_line(line: &str, code: &[bool]) -> String {
+    let mut bytes = line.as_bytes().to_vec();
+    for (byte, &is_code) in bytes.iter_mut().zip(code) {
+        if !is_code && !byte.is_ascii_whitespace() {
+            *byte = b' ';
+        }
+    }
+    String::from_utf8(bytes).expect("masking bytes with ASCII spaces preserves UTF-8")
+}
+
 /// Calculates the auto-indent level (in 2-space units) for a continuation line.
 /// Combines `{}` brace nesting with unbraced control structures (like `if`,
 /// `else`, `for`, `while`, `do`, or function headers) that introduce an extra level of indentation.
 pub fn compute_indent_level(input: &str) -> usize {
+    let scan = lex::scan(input);
     let mut brace_depth = 0i32;
     let mut dangling_depth = 0usize;
+    // `(brace depth, dangling floor)`: an outer unbraced statement remains
+    // active while the inner braced statement serving as its body is open.
+    let mut protected_dangling = Vec::<(i32, usize)>::new();
+    let starts_with_do = first_code_word(input).as_deref() == Some("do");
+    let mut offset = 0usize;
 
-    for line in input.lines() {
-        let sc = lex::scan(line);
+    for segment in input.split_inclusive('\n') {
+        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        let line_code = &scan.code[offset..offset + line.len()];
+        let code_line = code_only_line(line, line_code);
         let bytes = line.as_bytes();
 
-        let mut line_open_braces = 0i32;
-        let mut line_close_braces = 0i32;
         let mut last_code_char = None;
+        let mut code_nonspace_count = 0usize;
+        let mut has_brace = false;
 
         for (i, &b) in bytes.iter().enumerate() {
-            if sc.code[i] {
+            if line_code[i] {
                 if !b.is_ascii_whitespace() {
                     last_code_char = Some(b);
+                    code_nonspace_count += 1;
+                }
+                if b == b'{' || b == b'}' {
+                    has_brace = true;
+                }
+            }
+        }
+
+        let bare_open_brace = code_nonspace_count == 1 && last_code_char == Some(b'{');
+        if has_brace {
+            for (i, &b) in bytes.iter().enumerate() {
+                if !line_code[i] {
+                    continue;
                 }
                 match b {
-                    b'{' => line_open_braces += 1,
-                    b'}' => line_close_braces += 1,
+                    b'{' => {
+                        let floor = protected_dangling.last().map_or(0, |&(_, floor)| floor);
+                        if bare_open_brace && dangling_depth > floor {
+                            // In `if (x)\n{`, the brace replaces the pending
+                            // unbraced indentation level.
+                            dangling_depth -= 1;
+                        }
+                        brace_depth += 1;
+                        if !bare_open_brace && dangling_depth > floor {
+                            // In `if (x)\n  if (y) {`, retain the outer level
+                            // until the inner compound statement closes.
+                            protected_dangling.push((brace_depth, dangling_depth));
+                        }
+                    }
+                    b'}' => {
+                        brace_depth = (brace_depth - 1).max(0);
+                        protected_dangling.retain(|&(depth, _)| depth <= brace_depth);
+                        dangling_depth = protected_dangling.last().map_or(0, |&(_, floor)| floor);
+                    }
                     _ => {}
                 }
             }
         }
 
-        if line_open_braces > 0 || line_close_braces > 0 {
-            brace_depth = (brace_depth + line_open_braces - line_close_braces).max(0);
-            dangling_depth = 0;
-        } else if last_code_char == Some(b';') {
-            dangling_depth = 0;
-        } else if is_dangling_header(line) {
-            dangling_depth += 1;
+        let floor = protected_dangling.last().map_or(0, |&(_, floor)| floor);
+        if last_code_char == Some(b';') {
+            dangling_depth = floor;
+        } else if (!has_brace || first_code_word(&code_line).as_deref() == Some("else"))
+            && is_dangling_header(&code_line)
+        {
+            // A top-level `while (...)` after a completed `do` body is waiting
+            // for its mandatory semicolon, not for another statement body.
+            let is_do_while_tail = starts_with_do
+                && brace_depth == 0
+                && dangling_depth == 0
+                && first_code_word(&code_line).as_deref() == Some("while");
+            if !is_do_while_tail {
+                dangling_depth += 1;
+            }
         }
+
+        offset += segment.len();
+    }
+
+    // `split_inclusive` yields no segment for an empty buffer.
+    if input.is_empty() {
+        return 0;
     }
 
     (brace_depth.max(0) as usize) + dangling_depth
+}
+
+/// Menu proxy that exposes whether completion is active to [`CEditMode`].
+///
+/// An active menu must receive Enter itself so Reedline can accept the selected
+/// completion. Without this proxy the custom newline event would bypass that
+/// higher-priority menu behavior.
+pub struct TrackingMenu<M> {
+    inner: M,
+    active: Arc<AtomicBool>,
+}
+
+impl<M: Menu> TrackingMenu<M> {
+    pub fn new(inner: M, active: Arc<AtomicBool>) -> Self {
+        active.store(inner.is_active(), Ordering::Relaxed);
+        Self { inner, active }
+    }
+}
+
+impl<M: Menu> Menu for TrackingMenu<M> {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn indicator(&self) -> &str {
+        self.inner.indicator()
+    }
+
+    fn is_active(&self) -> bool {
+        self.inner.is_active()
+    }
+
+    fn menu_event(&mut self, event: MenuEvent) {
+        self.inner.menu_event(event);
+        self.active.store(self.inner.is_active(), Ordering::Relaxed);
+    }
+
+    fn can_quick_complete(&self) -> bool {
+        self.inner.can_quick_complete()
+    }
+
+    fn can_partially_complete(
+        &mut self,
+        values_updated: bool,
+        editor: &mut Editor,
+        completer: &mut dyn Completer,
+    ) -> bool {
+        self.inner
+            .can_partially_complete(values_updated, editor, completer)
+    }
+
+    fn update_values(&mut self, editor: &mut Editor, completer: &mut dyn Completer) {
+        self.inner.update_values(editor, completer);
+    }
+
+    fn update_working_details(
+        &mut self,
+        editor: &mut Editor,
+        completer: &mut dyn Completer,
+        painter: &Painter,
+    ) {
+        self.inner
+            .update_working_details(editor, completer, painter);
+    }
+
+    fn replace_in_buffer(&self, editor: &mut Editor) {
+        self.inner.replace_in_buffer(editor);
+    }
+
+    fn menu_required_lines(&self, terminal_columns: u16) -> u16 {
+        self.inner.menu_required_lines(terminal_columns)
+    }
+
+    fn menu_string(&self, available_lines: u16, use_ansi_coloring: bool) -> String {
+        self.inner.menu_string(available_lines, use_ansi_coloring)
+    }
+
+    fn min_rows(&self) -> u16 {
+        self.inner.min_rows()
+    }
+
+    fn get_values(&self) -> &[Suggestion] {
+        self.inner.get_values()
+    }
+
+    fn set_cursor_pos(&mut self, pos: (u16, u16)) {
+        self.inner.set_cursor_pos(pos);
+        self.active.store(self.inner.is_active(), Ordering::Relaxed);
+    }
 }
 
 /// Wraps [`Emacs`] to auto-indent continuation lines: when Enter is pressed
@@ -626,14 +815,21 @@ pub fn compute_indent_level(input: &str) -> usize {
 /// spaces is inserted instead of a bare newline.
 pub struct CEditMode {
     inner: Emacs,
-    /// Shared with [`CHighlighter`], which snapshots the buffer on every
-    /// repaint so we can read it here without access to reedline internals.
-    buffer: Arc<Mutex<String>>,
+    /// Shared with [`CHighlighter`], which snapshots the buffer and cursor on
+    /// every repaint.
+    state: Arc<Mutex<EditState>>,
+    /// Shared with [`TrackingMenu`] so Enter can retain Reedline's normal
+    /// completion-accept behavior while a menu is active.
+    menu_active: Arc<AtomicBool>,
 }
 
 impl CEditMode {
-    pub fn new(inner: Emacs, buffer: Arc<Mutex<String>>) -> Self {
-        CEditMode { inner, buffer }
+    pub fn new(inner: Emacs, state: Arc<Mutex<EditState>>, menu_active: Arc<AtomicBool>) -> Self {
+        CEditMode {
+            inner,
+            state,
+            menu_active,
+        }
     }
 }
 
@@ -647,33 +843,33 @@ impl EditMode for CEditMode {
         }) = &raw
         {
             if *code == KeyCode::Enter {
-                let buf = self
-                    .buffer
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
-                if is_incomplete(&buf) {
-                    let depth = compute_indent_level(&buf);
+                // Reedline gives active completion menus first refusal on
+                // Enter; preserve that behavior instead of inserting a line.
+                if self.menu_active.load(Ordering::Relaxed) {
+                    return ReedlineEvent::Enter;
+                }
+
+                let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if is_incomplete(&state.buffer) {
+                    let cursor = state.cursor.min(state.buffer.len());
+                    let depth = compute_indent_level(&state.buffer[..cursor]);
                     let indent = "  ".repeat(depth);
                     return ReedlineEvent::Edit(vec![EditCommand::InsertString(format!(
                         "\n{indent}"
                     ))]);
                 }
             } else if *code == KeyCode::Char('}') {
-                let buf = self
-                    .buffer
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
-                let current_line = buf.lines().last().unwrap_or("");
-                if !current_line.is_empty() && current_line.chars().all(|c| c.is_whitespace()) {
-                    let k = current_line.len();
-                    let prefix_len = buf.len().saturating_sub(k);
-                    let prefix_buf = &buf[..prefix_len];
-                    let target_depth = compute_indent_level(prefix_buf).saturating_sub(1);
+                let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let cursor = state.cursor.min(state.buffer.len());
+                let before_cursor = &state.buffer[..cursor];
+                let line_start = before_cursor.rfind('\n').map_or(0, |i| i + 1);
+                let current_prefix = &before_cursor[line_start..];
+                if !current_prefix.is_empty() && current_prefix.chars().all(char::is_whitespace) {
+                    let target_depth =
+                        compute_indent_level(&state.buffer[..line_start]).saturating_sub(1);
                     let indent = "  ".repeat(target_depth);
 
-                    let mut edits = vec![EditCommand::Backspace; k];
+                    let mut edits = vec![EditCommand::Backspace; current_prefix.chars().count()];
                     edits.push(EditCommand::InsertString(format!("{indent}}}")));
                     return ReedlineEvent::Edit(edits);
                 }
@@ -743,6 +939,7 @@ impl Prompt for CPrompt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reedline::IdeMenu;
 
     #[test]
     fn completes_magic_commands_at_line_start_only() {
@@ -913,11 +1110,48 @@ mod tests {
     }
 
     #[test]
+    fn compute_indent_level_preserves_cross_line_lexical_and_control_state() {
+        assert_eq!(
+            compute_indent_level("int f(void) {\n  /*\n   * }\n   */"),
+            1,
+            "a brace inside a multiline comment is not code"
+        );
+        assert_eq!(
+            compute_indent_level("if (x)\n  if (y) {"),
+            2,
+            "an inner braced statement must retain its unbraced parent"
+        );
+        assert_eq!(
+            compute_indent_level("if (x)\n  if (y) {\n    f();"),
+            2,
+            "a statement inside the block must not consume its unbraced parent"
+        );
+        assert_eq!(
+            compute_indent_level("if (x)\n  if (y) {\n    f();\n  }"),
+            0,
+            "closing the inner statement also completes the unbraced parent"
+        );
+        assert_eq!(
+            compute_indent_level("if (x)\n{"),
+            1,
+            "a brace on its own line replaces the pending control indent"
+        );
+        assert_eq!(
+            compute_indent_level("do\n  f();\nwhile (x)"),
+            0,
+            "the trailing while awaits a semicolon, not another body"
+        );
+    }
+
+    #[test]
     fn c_edit_mode_auto_dedents_closing_brace_on_blank_line() {
-        let buffer = Arc::new(Mutex::new(
-            "if (4 > 3) {\n  puts(\"4 > 3\");\n  ".to_string(),
-        ));
-        let mut mode = CEditMode::new(Emacs::default(), Arc::clone(&buffer));
+        let text = "if (4 > 3) {\n  puts(\"4 > 3\");\n  ";
+        let state = Arc::new(Mutex::new(EditState {
+            buffer: text.to_string(),
+            cursor: text.len(),
+        }));
+        let menu_active = Arc::new(AtomicBool::new(false));
+        let mut mode = CEditMode::new(Emacs::default(), state, menu_active);
 
         let event = ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(
             KeyCode::Char('}'),
@@ -935,5 +1169,118 @@ mod tests {
             }
             other => panic!("expected ReedlineEvent::Edit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn c_edit_mode_uses_the_line_at_the_cursor() {
+        let text = "if (x) {\n  \n  puts(\"x\");\n}";
+        let cursor = text.find("\n  \n").expect("blank line") + 3;
+        let state = Arc::new(Mutex::new(EditState {
+            buffer: text.to_string(),
+            cursor,
+        }));
+        let menu_active = Arc::new(AtomicBool::new(false));
+        let mut mode = CEditMode::new(Emacs::default(), state, menu_active);
+        let event = ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(
+            KeyCode::Char('}'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+
+        match mode.parse_event(event) {
+            ReedlineEvent::Edit(edits) => {
+                assert_eq!(
+                    edits,
+                    [
+                        EditCommand::Backspace,
+                        EditCommand::Backspace,
+                        EditCommand::InsertString("}".to_string())
+                    ]
+                );
+            }
+            other => panic!("expected ReedlineEvent::Edit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn c_edit_mode_never_dedents_from_trailing_whitespace_after_the_cursor() {
+        let text = "if (x) {\n  puts(\"x\");\n  ";
+        let state = Arc::new(Mutex::new(EditState {
+            buffer: text.to_string(),
+            cursor: 2,
+        }));
+        let menu_active = Arc::new(AtomicBool::new(false));
+        let mut mode = CEditMode::new(Emacs::default(), state, menu_active);
+        let event = ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(
+            KeyCode::Char('}'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+
+        assert_eq!(
+            mode.parse_event(event),
+            ReedlineEvent::Edit(vec![EditCommand::InsertChar('}')])
+        );
+    }
+
+    #[test]
+    fn c_edit_mode_computes_enter_indent_from_the_cursor_prefix() {
+        let text = "if (x) {\n  puts(\"x\");\n}";
+        let cursor = text.find('\n').expect("multiline buffer") + 1;
+        let state = Arc::new(Mutex::new(EditState {
+            buffer: text.to_string(),
+            cursor,
+        }));
+        let menu_active = Arc::new(AtomicBool::new(false));
+        let mut mode = CEditMode::new(Emacs::default(), state, menu_active);
+        let event = ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+
+        assert_eq!(
+            mode.parse_event(event),
+            ReedlineEvent::Edit(vec![EditCommand::InsertString("\n  ".to_string())])
+        );
+    }
+
+    #[test]
+    fn c_edit_mode_leaves_enter_to_an_active_completion_menu() {
+        let text = "if (x) {\n  ret";
+        let state = Arc::new(Mutex::new(EditState {
+            buffer: text.to_string(),
+            cursor: text.len(),
+        }));
+        let menu_active = Arc::new(AtomicBool::new(true));
+        let mut mode = CEditMode::new(Emacs::default(), state, menu_active);
+        let event = ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+
+        assert_eq!(mode.parse_event(event), ReedlineEvent::Enter);
+    }
+
+    #[test]
+    fn tracking_menu_reports_activation_and_deactivation() {
+        let active = Arc::new(AtomicBool::new(false));
+        let mut menu = TrackingMenu::new(IdeMenu::default(), Arc::clone(&active));
+
+        menu.menu_event(MenuEvent::Activate(false));
+        assert!(active.load(Ordering::Relaxed));
+        menu.menu_event(MenuEvent::Deactivate);
+        assert!(!active.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn control_header_awaits_body_handles_multi_statement_and_embedded_keywords() {
+        // Multi-statement line where the last control header is incomplete
+        assert!(control_header_awaits_body("do_something(); if (x)"));
+        // Complete control statement on the same line
+        assert!(!control_header_awaits_body("if (x) puts(\"hi\");"));
+        // String literal containing keyword 'if' shouldn't confuse control header detection
+        assert!(!control_header_awaits_body("printf(\"if (x)\");"));
     }
 }

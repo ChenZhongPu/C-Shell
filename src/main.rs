@@ -22,6 +22,7 @@ use reedline::{
     ReedlineMenu, Signal, default_emacs_keybindings,
 };
 use std::io::{BufRead, IsTerminal};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -149,9 +150,10 @@ fn main() -> Result<()> {
     // completer.
     let idents = Arc::new(Mutex::new(Vec::new()));
 
-    // Shared buffer snapshot: the highlighter stores the current edit buffer
-    // on every repaint, and the edit mode reads it to calculate indentation.
-    let buffer_state = Arc::new(Mutex::new(String::new()));
+    // Shared editor state: the highlighter stores the current buffer and cursor
+    // on every repaint, and the edit mode reads them to calculate indentation.
+    let edit_state = Arc::new(Mutex::new(editor::EditState::default()));
+    let completion_active = Arc::new(AtomicBool::new(false));
 
     // Tab opens the IPython-style dropdown, then steps through it. reedline
     // auto-saves submitted lines to an in-memory history (capacity 1000, no
@@ -165,13 +167,20 @@ fn main() -> Result<()> {
             ReedlineEvent::MenuNext,
         ]),
     );
-    let edit_mode = editor::CEditMode::new(Emacs::new(keybindings), Arc::clone(&buffer_state));
-    let menu = IdeMenu::default().with_name("completion_menu");
+    let edit_mode = editor::CEditMode::new(
+        Emacs::new(keybindings),
+        Arc::clone(&edit_state),
+        Arc::clone(&completion_active),
+    );
+    let menu = editor::TrackingMenu::new(
+        IdeMenu::default().with_name("completion_menu"),
+        completion_active,
+    );
     let mut rl = Reedline::create()
         .with_completer(Box::new(editor::CCompleter::new(Arc::clone(&idents))))
         .with_highlighter(Box::new(editor::CHighlighter::new(
             color,
-            Arc::clone(&buffer_state),
+            Arc::clone(&edit_state),
         )))
         .with_validator(Box::new(editor::CValidator))
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))

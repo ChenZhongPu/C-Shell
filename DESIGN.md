@@ -4,7 +4,7 @@ Settled architecture decisions, the one big open problem, and the traps buried
 in the code that you must know about before changing it. README is for users;
 this file is for whoever develops the tool next.
 
-Status: v0.2.4 working. ~7100 lines of Rust, 106 tests (66 unit + 40
+Status: v0.2.4 working. ~7100 lines of Rust, 114 tests (74 unit + 40
 end-to-end smoke), clippy/fmt clean, English UI. Verified on Linux with gcc
 16.1.1 and clang 22.1.6. CI exercises the default macOS compiler and two
 Windows driver dialects (a GNU-style driver and MSVC); see
@@ -530,18 +530,19 @@ dropdown; that ceiling is why the editor was swapped. Completion becomes
 reedline's `IdeMenu` (Tab opens it, Tab/arrows move, Enter accepts);
 highlighting, completion and completeness map onto reedline's `Highlighter`,
 `Completer` and `Validator` traits; `%edit` preloads via
-`run_edit_commands(InsertString)`. One capability was lost in the move:
-rustyline's per-keystroke `ConditionalEventHandler` computed a structural
-continuation indent (prompt width + two spaces per open bracket) and a
-`}`-dedent, driven by live buffer state. reedline has no such hook — multi-line
-is validator-driven and it does not indent inserted newlines. Continuation
-lines instead align under the first line's code through the multiline prompt
-indicator (prompt-width spaces); the extra structural indent and the dedent are
-gone. This is cosmetic only: stored statements are re-indented by
-`Session::indent` and `%src` reflows through clang-format, so evaluation is
-unaffected. reedline also needs a genuine interactive terminal (it queries
-cursor position), so the interactive path cannot be exercised by the piped
-smoke tests; the batch/`-e`/pipe paths never touch it.
+`run_edit_commands(InsertString)`. Reedline does not expose the live buffer to
+`EditMode`, so `CHighlighter` snapshots the buffer and byte cursor before each
+key event. `CEditMode` uses that snapshot to insert two-space structural
+indentation and dedent a closing `}` on a whitespace-only prefix.
+`TrackingMenu` separately exposes completion-menu activation so Enter still
+accepts a selected candidate before the indentation handler runs. The
+indentation scan preserves comment/literal state across physical lines and
+tracks unbraced control headers that enclose braced statements. This remains
+cosmetic only: stored statements are re-indented by `Session::indent` and
+`%src` reflows through clang-format, so evaluation is unaffected. Reedline
+also needs a genuine interactive terminal (it queries cursor position), so the
+interactive path cannot be exercised by the piped smoke tests; the
+batch/`-e`/pipe paths never touch it.
 
 **The validator must recognize syntax that is balanced but not complete.**
 `lex::awaits_body` catches `int fact(int n)`: without it, missing-semicolon

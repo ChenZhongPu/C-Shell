@@ -251,179 +251,24 @@ dropdown menu under the cursor listing every candidate, IPython-style; Tab and
 the arrow keys move through it and Enter accepts. Up/Down recalls up to 1000
 inputs from the current process so multi-line blocks can be recovered, but
 nothing is loaded or saved across launches. There is no `%history` or history
-file. The
-separate current-session input archive exists only for direct `%edit n` lookup
+file. The separate current-session input archive exists only for direct `%edit n` lookup
 and is cleared by `%reset`.
+
+### Editor & Interactive Features
+
+- **Smart Auto-Indentation**: Multi-line continuation lines automatically indent by 2 spaces based on brace nesting levels and unbraced control headers (`if`, `else`, `for`, `while`, `do`, function signatures).
+- **Auto-Dedent Closing Braces**: Typing `}` on a whitespace-only line automatically aligns it with its matching outer scope level.
+- **High-Contrast Syntax Highlighting**: Brackets, punctuation, and low-contrast token colors are brightened to `RGB(220, 224, 230)` for optimal legibility in all terminal color schemes.
 
 ## How it works
 
-**Accumulate and replay.** Every evaluation reassembles and reruns the whole
-session. Block-scope declarations become ordinary locals in `main`; a
-compiler-approved redeclaration starts a nested shadowing scope that encloses
-later statements. Items recognized as file-scope code are emitted above
-`main`, and approved redefinitions replace an older item in place. There is
-no separate symbol table or declaration/initializer state store.
+c-shell works by re-assembling your session and passing complete C files to your real host compiler (`gcc`, `clang`, `cl`, or `tcc`).
 
-**`scanf` uses a session-local stdin tape.** Direct calls are routed through a
-small `vscanf` wrapper. Each dynamic call in the newest input requests one
-fresh line, which is retained only in memory; historical calls receive those
-recorded lines and never reconnect to the terminal. Calls inside functions,
-recursion and loops therefore replay in their original order. `%src` annotates
-the associated statement with only a request count—the bytes remain hidden.
-`%reset` discards the tape, and no tape is written to a history file. If function replacement or changed control flow consumes a
-different number of requests, evaluation stops with an explicit stdin-tape
-divergence instead of silently prompting or waiting for the normal timeout.
-
-**Classification uses a small heuristic plus trial compilation.** A lexical
-heuristic routes function definitions, preprocessor directives, typedefs and
-tag definitions to file scope; these inputs are never demoted into `main`,
-which prevents GCC from silently accepting a nested function that Clang/MSVC
-reject. The compiler arbitrates expression-versus-statement cases, but an
-input whose final code token is `;` goes directly to the statement slot rather
-than launching an expression compile that cannot succeed. Clearly braced
-statements ending in `}` do the same; possible compound literals such as
-`(int){7}` retain expression classification. After a redeclaration diagnostic,
-alternate nested-scope or in-place replacement assemblies must compile as
-complete programs before c-shell accepts them. File scope remains unavailable
-as a general fallback.
-
-**Value printing.** `_Generic` selects a print _function_, which is then
-called — selecting a call expression instead would type-check every
-unselected branch against the wrong argument type and fail to compile.
-Session-visible named structs and simple anonymous struct typedefs get
-recursive printers whose output uses designated-initializer form:
-
-```text
-Out[5]: {
-    .name = (void *)0x7f068cbbac1b,
-    .age = 30,
-    .scores = {0, 7, 0},
-    .next = NULL
-}
-```
-
-An array is a harder case than it looks, because C converts one to a pointer
-before `_Generic` can see its type — the printer is handed an address and has
-no way to ask how many elements it addresses. So when a value does print as a
-bare address, c-shell re-prints it through an array-aware wrapper that settles
-the question with the real object at run time: an array begins at its own
-first element, a pointer variable does not.
-
-```text
-In [1]: int values[4] = {3, 1, 4, 1};
-In [2]: values
-Out[2]: {3, 1, 4, 1}
-In [3]: int grid[2][2] = {{1, 2}, {3, 4}};
-In [4]: grid
-Out[4]: {{1, 2}, {3, 4}}
-In [5]: int *ptr = values;
-In [6]: ptr
-Out[6]: 0x7ffd2f8c4a10
-```
-
-Element counts come from `sizeof`, so no declarator is parsed and a genuine
-pointer keeps printing as an address. `char text[] = "hi"` still prints
-`"hi"`: it reaches the string printer directly and never looks like an
-address. Beyond 100 elements the rest are summarized as `... (n more)`.
-Nesting is the one static property this cannot recover at run time, so arrays
-deeper than two dimensions, and arrays whose elements have no printer of their
-own (an array of pointers, for instance), show `<unprintable>` elements rather
-than a guess.
-
-Struct-member formatting never treats `char *` as a string: every pointer
-member is `NULL` or an address, fixed arrays are traversed structurally with
-the same 100-element bound, and a known nested struct calls its own printer. A top-level `struct P *` likewise
-prints only its address; explicit `*ptr` requests expansion. This differs
-intentionally from a top-level `char *` expression, where the user explicitly
-asked for the existing string dereference. Small flat structs stay on one
-line; larger, nested or array-bearing structs use indented multiline output.
-Multi-declarator fields, function-pointer declarators, bit-fields, flexible
-arrays, C11 anonymous members and unions conservatively produce a labelled raw
-byte dump instead of guessed member names.
-
-**Bare expressions judged pure are forgotten.** A bare expression at the
-prompt is usually a question (`x + 1`, `sizeof(int)`), so it is answered and
-forgotten. Bare expressions that may have effects — assignments, `++`/`--`
-or calls — are retained. Successfully evaluated statements/declarations
-(including an expression with a trailing `;`) and file-scope items are
-retained without purity analysis. `%src` shows
-what will actually be replayed.
-
-**Diagnostics are remapped and sanitized.** The compiler sees a generated file
-with a prelude and all earlier statements above your input, so its line numbers
-are meaningless at the prompt. Locations attributable to the newest input —
-including GCC source-excerpt gutters — are rewritten to input-relative lines.
-Code generation records which other lines came from retained user inputs;
-source excerpts from `CS_PRINT`, `_Generic`, marker calls and wrapper code are
-removed while genuine earlier-input cross-references remain. Parser fallout
-that names the marker macro's internal `do` token is removed; an incomplete
-expression reports `expected expression at end of input` instead of blaming
-the wrapper's closing `)`.
-
-**Compiler capabilities are cached.** Successful startup probes are cached
-for seven days under the platform cache directory
-(`$XDG_CACHE_HOME/c-shell`, falling back to `~/.cache/c-shell`, on Unix;
-`%LOCALAPPDATA%\c-shell` on Windows). The cache key changes with compiler file
-metadata, requested standard, relevant toolchain environment, or c-shell
-version. Expired or malformed entries simply cause fresh probes.
+For full technical details on accumulation & replay, the `scanf` stdin tape mechanism, `_Generic` value printers, diagnostic remapping, and capability caching, see **[HOW_IT_WORKS.md](HOW_IT_WORKS.md)**.
 
 ## Known limitations
 
-- **Execution is not sandboxed.** Compilers and generated programs run with
-  c-shell's user permissions and working directory. Do not evaluate untrusted
-  code.
-- **Most external side effects still replay.** Direct standard `scanf` calls
-  use the stdin tape above, but file and process changes still repeat. Calls to
-  known APIs such as `fopen`, `fprintf`, `remove`, `rename` and `system`
-  produce a one-time English warning before execution. Detection is lexical
-  and finite: wrappers and application-defined effects can still escape it.
-- **The stdin tape currently wraps `scanf`, not every input API.** `fscanf`,
-  `fgets`, `getchar`, raw `read(0, ...)`, an explicit `#undef scanf`, and code
-  inside a precompiled library are not captured yet. One line is supplied per
-  dynamic `scanf` request; programs that require multiple interactive lines in
-  a single call should put the values on one line. In piped-REPL mode stdin is
-  carrying C source, so a current `scanf` receives EOF; use `-e`, `--script`,
-  or an interactive terminal when the evaluated program needs stdin.
-- **Rebinding is C shadowing, not assignment.** A redeclared local lives in a
-  nested block. Its declarator is already in scope during its initializer, so
-  `int x = x + 1;` does not read the outer `x`. File-scope replacement also
-  makes retained earlier calls use the new function when the session replays.
-- **The purity heuristic is conservative.** Any expression containing a
-  function call is kept, even if the function happens to be pure.
-- **Indeterminate values remain undefined C.** Address-only struct-member
-  formatting prevents c-shell from adding a `%s` memory dereference, but it
-  cannot make `struct P p; p` well-defined when members were never initialized;
-  reading an indeterminate pointer or scalar is itself not portable. Initialize
-  structs (for example with `{0}`) when the value matters.
-- **Not every C value is printable.** The `_Generic` runtime covers the
-  standard boolean/integer/real-floating types, top-level `char` strings,
-  common object pointers and session-visible structs as described above.
-  Header-only/anonymous aggregate types that have no reusable C spelling,
-  complex and `void` values are evaluated without `Out[n]` and receive an
-  explanatory note. A member whose type is not in the scalar or generated
-  aggregate table is shown as `<unprintable>` rather than being coerced.
-- **Program output is bounded.** When stdin is a real terminal, output from
-  the newest input is streamed immediately, so a prompt before `scanf` is
-  visible. If the program leaves a partial line, c-shell appends a dim `↵`
-  marker and the protective newline it inserted; a real `\n` needs no marker.
-  With non-terminal stdin output remains buffered for deterministic transcripts
-  and receives no marker. Capture is limited to 8 MiB per stream; an overflow
-  is reported and the input is not committed.
-- **Timeout cleanup follows the launched process tree.** On Unix the process
-  group is killed when the direct child times out, but a child that detaches
-  or outlives a parent that exits successfully can escape cleanup. Windows
-  `taskkill /T` has similar orphan limitations.
-- **Incomplete inputs are not committed.** Besides crashes and timeouts, a
-  successful early `exit(0)`, `_Exit` or top-level `return` is detected by a
-  missing completion marker; committing it would terminate every later
-  replay before the new input runs.
-- No session save/load.
-- `cl.exe` needs an MSVC build environment with `INCLUDE`/`LIB` configured;
-  a Developer Command Prompt is the usual way to obtain one.
-- **Windows testing is still limited.** CI covers GNU-style and MSVC compiler
-  drivers, but interactive behavior has not been extensively tested on real
-  Windows installations. Windows feedback and bug reports are very welcome;
-  please open an issue with the terminal and compiler details.
+For a complete breakdown of design boundaries, non-sandboxed execution, stdin replay scope, and platform behaviors, see **[LIMITATIONS.md](LIMITATIONS.md)**.
 
 ## Development
 
