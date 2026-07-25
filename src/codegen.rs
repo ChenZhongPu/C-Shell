@@ -23,7 +23,9 @@ pub const M_DONE: &str = "\x01\x02c-shell/done\x02\x01";
 /// A wrapped stdin call requests one recorded or live line from the parent.
 pub const M_STDIN: &str = "\x01\x02c-shell/stdin\x02\x01";
 
-const HEADERS: &str = "\
+/// Headers every generated program includes before any user code, so beginners
+/// need no `#include` for the common library. `%header` shows this list.
+pub const HEADERS: &str = "\
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,8 +56,8 @@ static inline void cs_p_b (_Bool v)              { CS_VAL(); printf("%s\n", v ? 
 static inline void cs_p_c (char v)               { CS_VAL(); printf("'%c' (%d)\n", (v >= 32 && v < 127) ? v : '?', (int)v); }
 static inline void cs_p_i (long long v)          { CS_VAL(); printf("%lld\n", v); }
 static inline void cs_p_u (unsigned long long v) { CS_VAL(); printf("%llu\n", v); }
-static inline void cs_p_d (double v)             { CS_VAL(); printf("%g\n", v); }
-static inline void cs_p_ld(long double v)        { CS_VAL(); printf("%Lg\n", v); }
+static inline void cs_p_d (double v)             { CS_VAL(); printf("%.17g\n", v); }
+static inline void cs_p_ld(long double v)        { CS_VAL(); printf("%.21Lg\n", v); }
 static inline void cs_p_s (const char *v)        { CS_VAL(); if (v) printf("\"%s\"\n", v); else printf("NULL\n"); }
 static inline void cs_p_p (const void *v)        { CS_VAL(); if (v) printf("0x%" PRIxPTR "\n", (uintptr_t)v); else printf("NULL\n"); }
 
@@ -75,9 +77,9 @@ static inline void cs_m_l (const volatile long *v)               { printf("%lld"
 static inline void cs_m_ul(const volatile unsigned long *v)      { printf("%llu", (unsigned long long)*v); }
 static inline void cs_m_ll(const volatile long long *v)          { printf("%lld", (long long)*v); }
 static inline void cs_m_ull(const volatile unsigned long long *v){ printf("%llu", (unsigned long long)*v); }
-static inline void cs_m_f (const volatile float *v)              { printf("%g", (double)*v); }
-static inline void cs_m_d (const volatile double *v)             { printf("%g", *v); }
-static inline void cs_m_ld(const volatile long double *v)        { printf("%Lg", *v); }
+static inline void cs_m_f (const volatile float *v)              { printf("%.17g", (double)*v); }
+static inline void cs_m_d (const volatile double *v)             { printf("%.17g", *v); }
+static inline void cs_m_ld(const volatile long double *v)        { printf("%.21Lg", *v); }
 static inline void cs_m_unknown(const volatile void *v)          { (void)v; fputs("<unprintable>", stdout); }
 
 #define CS_MEMBER_REF_TYPES(T, F)                                        \
