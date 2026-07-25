@@ -628,20 +628,42 @@ impl EditMode for CEditMode {
     fn parse_event(&mut self, event: ReedlineRawEvent) -> ReedlineEvent {
         let raw: Event = event.into();
         if let Event::Key(KeyEvent {
-            code: KeyCode::Enter,
+            code,
             modifiers: KeyModifiers::NONE,
             ..
         }) = &raw
         {
-            let buf = self
-                .buffer
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            if is_incomplete(&buf) {
-                let depth = compute_indent_level(&buf);
-                let indent = "  ".repeat(depth);
-                return ReedlineEvent::Edit(vec![EditCommand::InsertString(format!("\n{indent}"))]);
+            if *code == KeyCode::Enter {
+                let buf = self
+                    .buffer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if is_incomplete(&buf) {
+                    let depth = compute_indent_level(&buf);
+                    let indent = "  ".repeat(depth);
+                    return ReedlineEvent::Edit(vec![EditCommand::InsertString(format!(
+                        "\n{indent}"
+                    ))]);
+                }
+            } else if *code == KeyCode::Char('}') {
+                let buf = self
+                    .buffer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let current_line = buf.lines().last().unwrap_or("");
+                if !current_line.is_empty() && current_line.chars().all(|c| c.is_whitespace()) {
+                    let k = current_line.len();
+                    let prefix_len = buf.len().saturating_sub(k);
+                    let prefix_buf = &buf[..prefix_len];
+                    let target_depth = compute_indent_level(prefix_buf).saturating_sub(1);
+                    let indent = "  ".repeat(target_depth);
+
+                    let mut edits = vec![EditCommand::Backspace; k];
+                    edits.push(EditCommand::InsertString(format!("{indent}}}")));
+                    return ReedlineEvent::Edit(edits);
+                }
             }
         }
         // Re-wrap and delegate to the inner Emacs mode for everything else.
@@ -875,5 +897,30 @@ mod tests {
         assert_eq!(compute_indent_level("for (int i = 0; i < 10; ++i)"), 1);
         assert_eq!(compute_indent_level("while (condition)"), 1);
         assert_eq!(compute_indent_level("do"), 1);
+    }
+
+    #[test]
+    fn c_edit_mode_auto_dedents_closing_brace_on_blank_line() {
+        let buffer = Arc::new(Mutex::new(
+            "if (4 > 3) {\n  puts(\"4 > 3\");\n  ".to_string(),
+        ));
+        let mut mode = CEditMode::new(Emacs::default(), Arc::clone(&buffer));
+
+        let event = ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(
+            KeyCode::Char('}'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+
+        match mode.parse_event(event) {
+            ReedlineEvent::Edit(edits) => {
+                // Should backspace the 2 leading spaces of the current line, then insert "}"
+                assert_eq!(edits.len(), 3);
+                assert_eq!(edits[0], EditCommand::Backspace);
+                assert_eq!(edits[1], EditCommand::Backspace);
+                assert_eq!(edits[2], EditCommand::InsertString("}".to_string()));
+            }
+            other => panic!("expected ReedlineEvent::Edit, got {other:?}"),
+        }
     }
 }
