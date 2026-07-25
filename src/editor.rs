@@ -252,7 +252,20 @@ impl Highlighter for CHighlighter {
                 Ok(ranges) => {
                     for (syn, text) in ranges {
                         let c = syn.foreground;
-                        let style = NuStyle::new().fg(NuColor::Rgb(c.r, c.g, c.b));
+                        let r = c.r;
+                        let g = c.g;
+                        let b = c.b;
+                        let is_bracket_or_punct = text
+                            .chars()
+                            .any(|ch| matches!(ch, '{' | '}' | '(' | ')' | '[' | ']' | ';' | ','));
+                        let brightness =
+                            (299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b)) / 1000;
+
+                        let style = if is_bracket_or_punct || brightness < 150 {
+                            NuStyle::new().fg(NuColor::Rgb(220, 224, 230))
+                        } else {
+                            NuStyle::new().fg(NuColor::Rgb(r, g, b))
+                        };
                         styled.push((style, text.to_string()));
                     }
                 }
