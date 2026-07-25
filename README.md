@@ -1,11 +1,43 @@
-# c-shell
+<h1 align="center">c-shell</h1>
 
-An interactive shell for the C language. To check how a piece of syntax
-behaves, skip the new-file / write-`main` / compile / run loop — just type it
-at the prompt.
+<p align="center">
+  <strong>A compiler-backed interactive shell for C.</strong>
+  <br>
+  Explore syntax, types, diagnostics, and implementation behavior without writing a temporary <code>main</code>.
+</p>
 
-```
-c-shell 0.2.4  ·  cc (GCC) 16.1.1 (default std gnu23)
+<p align="center">
+  <a href="https://crates.io/crates/c-shell"><img alt="crates.io version" src="https://img.shields.io/crates/v/c-shell?style=flat-square&logo=rust&label=crates.io"></a>
+  <a href="https://github.com/ChenZhongPu/C-Shell/actions/workflows/ci.yml"><img alt="CI status" src="https://img.shields.io/github/actions/workflow/status/ChenZhongPu/C-Shell/ci.yml?branch=main&style=flat-square&logo=githubactions&logoColor=white&label=CI"></a>
+  <a href="https://www.rust-lang.org/"><img alt="Rust 1.96 or newer" src="https://img.shields.io/badge/Rust-1.96%2B-000000?style=flat-square&logo=rust"></a>
+  <a href="https://github.com/ChenZhongPu/C-Shell/releases"><img alt="Linux, macOS, and Windows" src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-4C566A?style=flat-square"></a>
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-2F80ED?style=flat-square"></a>
+</p>
+
+<p align="center">
+  <a href="#try-it">Try it</a>
+  ·
+  <a href="#installation">Installation</a>
+  ·
+  <a href="#usage">Usage</a>
+  ·
+  <a href="#commands">Commands</a>
+  ·
+  <a href="#how-it-works">How it works</a>
+  ·
+  <a href="#known-limitations">Limitations</a>
+</p>
+
+<p align="center">
+  <img src="demo.gif" alt="c-shell interactive session demo" width="900">
+</p>
+
+## Try it
+
+Start `c-shell` and type C directly at the prompt:
+
+```text
+c-shell 0.2.5  ·  cc (GCC) 16.1.1 (default std gnu23)
 In [1]: int x = 41;
 In [2]: x + 1
 Out[2]: 42
@@ -20,7 +52,24 @@ In [5]: -1 > 0u
 Out[5]: 1
 ```
 
-## Not an interpreter
+## Highlights
+
+- **Your compiler, your answers.** GCC, Clang, MSVC, and tcc determine the
+  language rules, ABI behavior, warnings, and errors.
+- **A stateful C session.** Declarations, statements, functions, and types
+  remain available to later inputs without replacing C's normal scope rules.
+- **Interactive editing.** Syntax highlighting, completion, history, smart
+  continuation indentation, closing-brace dedent, and editable prior inputs
+  make multi-line C comfortable at a terminal.
+- **Useful values, not just exit codes.** Scalar values, strings, arrays, and
+  supported structs are printed automatically; `%type` inspects expressions
+  without evaluating them.
+- **Interactive or scriptable.** Use the REPL, `-e`, script files, or piped
+  input with deterministic exit status and diagnostics.
+- **Cross-platform compiler drivers.** GNU-style and MSVC-style command lines
+  are detected by capability probes rather than executable names.
+
+## Why a real compiler?
 
 c-shell assembles your input into a complete C program and hands it to the
 **real compiler on your machine**. That is deliberate: integer promotions,
@@ -56,8 +105,9 @@ PATH (`cc`, `gcc`, `clang`, `tcc`; on Windows `gcc`, `clang`, `cc`,
 shell command containing flags. The first candidate that passes every check
 wins. Capabilities are probed by trial compilation, never derived from version
 strings — executable names can be aliases, and distros backport features. For
-example, Apple Command Line Tools may provide `/usr/bin/gcc` as an Apple Clang driver, while
-GNU GCC installed separately through Homebrew or MacPorts is genuine GCC.
+example, Apple Command Line Tools may provide `/usr/bin/gcc` as an Apple Clang
+driver, while GNU GCC installed separately through Homebrew or MacPorts is
+genuine GCC.
 
 ```sh
 c-shell                              # auto-detect a compiler
@@ -119,9 +169,9 @@ omit the final `return`.
 Common headers (`stdio`, `stdlib`, `string`, `math`, `stdbool`, `stdint`,
 `inttypes`, `stddef`, `limits`, `ctype`, `stdarg`, `time`) are pre-included, so
 no `#include` is needed for the everyday library; `%header` lists them. Unix
-builds link `-lm`; Windows math functions come from the C runtime. GNU-style GCC/Clang drivers use
-`-Wall -Wextra`; MSVC-style `cl`/`clang-cl` drivers use `/W3`. The warning is
-often exactly the thing you came to check.
+builds link `-lm`; Windows math functions come from the C runtime. GNU-style
+GCC/Clang drivers use `-Wall -Wextra`; MSVC-style `cl`/`clang-cl` drivers use
+`/W3`. The warning is often exactly the thing you came to check.
 
 ### Rebinding declarations and definitions
 
@@ -164,12 +214,11 @@ order. A function-shaped input is never retried inside `main`; this prevents
 GCC nested-function extensions from creating a session that Clang or MSVC
 interprets differently.
 
-Both forms only ever move forward: there is no undo. A binding is corrected by
-declaring or assigning it again, and a definition by defining it again. When a
-retained statement blocks a replacement—say it calls a function whose signature
-you are changing—`%reset` is the way out.
-
-![demo](demo.gif)
+Both forms are recorded in the session journal. `%undo` reverses the most
+recent retained state change, including an appended statement, a newly opened
+shadowing scope, or a file-scope replacement. Failed inputs and pure value
+queries do not change retained state and therefore create nothing to undo.
+`%reset` clears the complete session.
 
 ### Commands
 
@@ -188,6 +237,10 @@ retained, how continuation and rebinding behave, what the value printer and
 
 `%clear` erases the terminal display and returns the cursor to the top without
 changing variables, retained C code or the input counter.
+
+`%undo` reverses the most recent retained state change. It does not rewind the
+visible `In[n]` counter or remove failed and forgotten pure inputs from the
+numbered `%edit` archive.
 
 `%src` defaults to the user-facing program: current file-scope definitions and
 retained statements inside a clean `main`, including any rebinding braces, but
@@ -251,24 +304,23 @@ dropdown menu under the cursor listing every candidate, IPython-style; Tab and
 the arrow keys move through it and Enter accepts. Up/Down recalls up to 1000
 inputs from the current process so multi-line blocks can be recovered, but
 nothing is loaded or saved across launches. There is no `%history` or history
-file. The separate current-session input archive exists only for direct `%edit n` lookup
-and is cleared by `%reset`.
-
-### Editor & Interactive Features
-
-- **Smart Auto-Indentation**: Multi-line continuation lines automatically indent by 2 spaces based on brace nesting levels and unbraced control headers (`if`, `else`, `for`, `while`, `do`, function signatures).
-- **Auto-Dedent Closing Braces**: Typing `}` on a whitespace-only line automatically aligns it with its matching outer scope level.
-- **High-Contrast Syntax Highlighting**: Brackets, punctuation, and low-contrast token colors are brightened to `RGB(220, 224, 230)` for optimal legibility in all terminal color schemes.
+file. The separate current-session input archive exists only for direct
+`%edit n` lookup and is cleared by `%reset`.
 
 ## How it works
 
-c-shell works by re-assembling your session and passing complete C files to your real host compiler (`gcc`, `clang`, `cl`, or `tcc`).
+c-shell works by reassembling your session and passing complete C files to your
+real host compiler (`gcc`, `clang`, `cl`, or `tcc`).
 
-For full technical details on accumulation & replay, the `scanf` stdin tape mechanism, `_Generic` value printers, diagnostic remapping, and capability caching, see **[HOW_IT_WORKS.md](HOW_IT_WORKS.md)**.
+For full technical details on accumulation and replay, the `scanf` stdin tape,
+`_Generic` value printers, diagnostic remapping, and capability caching, see
+**[HOW_IT_WORKS.md](HOW_IT_WORKS.md)**.
 
 ## Known limitations
 
-For a complete breakdown of design boundaries, non-sandboxed execution, stdin replay scope, and platform behaviors, see **[LIMITATIONS.md](LIMITATIONS.md)**.
+For a complete breakdown of design boundaries, non-sandboxed execution, stdin
+replay scope, and platform behavior, see
+**[LIMITATIONS.md](LIMITATIONS.md)**.
 
 ## Development
 
