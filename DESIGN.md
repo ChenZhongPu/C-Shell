@@ -4,7 +4,7 @@ Settled architecture decisions, the one big open problem, and the traps buried
 in the code that you must know about before changing it. README is for users;
 this file is for whoever develops the tool next.
 
-Status: v0.2.5 working. ~7100 lines of Rust, 114 tests (74 unit + 40
+Status: v0.2.6 working. ~7300 lines of Rust, 116 tests (75 unit + 41
 end-to-end smoke), clippy/fmt clean, English UI. Verified on Linux with gcc
 16.1.1 and clang 22.1.6. CI exercises the default macOS compiler and two
 Windows driver dialects (a GNU-style driver and MSVC); see
@@ -43,7 +43,7 @@ confirmation for a completed interactive `if`, `if`/`else` batch lookahead,
 control/do-while/preprocessor continuation, tab completion (magics, C keywords,
 retained session names), process-local Up/Down recall and numbered-input
 `%edit [n]`, `-e`/script/piped-input batch modes,
-`%help [--verbose] %quit %clear %reset %src %header %edit %type %time %timeit %undo %cc %std`, deadlines and
+`%help [--verbose] %quit %clear %reset %src %header %edit %type %bits %Bits %time %timeit %undo %cc %std`, deadlines and
 timeout-path tree cleanup for compiler/probe/user-program children, cached
 compiler capability probes, CI for 4 platform configs, and a tag-triggered release
 workflow.
@@ -245,6 +245,21 @@ finite table deliberately return `<unrecognized type>` rather than relying on
 GCC `typeof`, compiler diagnostic wording or debug-info formats unavailable on
 other toolchains.
 
+**`%bits`/`%Bits` report the target's representation, not a language
+guarantee.**
+The generated `_Generic` dispatch selects a standard scalar helper without
+evaluating its controlling expression; only the selected function argument
+evaluates the expression, exactly once. That helper prints the value and reads
+its temporary parameter through `unsigned char`, which C permits for examining
+object representation. Hexadecimal and binary output use significance order,
+while the memory line preserves increasing-address order. IEEE-754 field
+decoding is enabled only when `<float.h>` describes binary32/binary64
+`float`/`double`; `long double` remains a raw representation because its ABI
+formats vary substantially.
+The two commands share the same probe and differ only in hexadecimal
+formatting: `%bits` uses lowercase, while the deliberately case-sensitive
+`%Bits` spelling uses uppercase digits and prefixes.
+
 **Diagnostics must be remapped.** The compiler sees a generated file with a
 prelude and all earlier inputs above the new text; its line numbers are
 meaningless at the prompt. `errmap` rewrites locations attributable to the
@@ -384,7 +399,8 @@ References: [crepl](https://l-m.dev/cs/crepl/)
 ## 4. Known gaps
 
 - **Limited introspection commands**: `%type` covers scalar expressions and
-  session-visible named aggregate categories, but `%layout` (struct
+  session-visible named aggregate categories, and `%bits`/`%Bits` cover scalar
+  object representations, but `%layout` (struct
   offsets/padding), `%expand` (preprocessor-only view of a macro), `%asm`,
   exact anonymous-aggregate/type-alias reflection and multi-compiler
   comparison remain open. These, not the REPL loop, are what would set the

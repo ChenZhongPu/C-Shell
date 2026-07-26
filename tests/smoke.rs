@@ -575,6 +575,58 @@ fn type_magic_recognizes_named_and_typedef_aggregates() {
 }
 
 #[test]
+fn bits_magic_inspects_object_representations_and_evaluates_once() {
+    let out = run(&[
+        "int n = 0;",
+        "%bits ++n",
+        "%bits 0.1f",
+        "%bits (unsigned char)255",
+        "%Bits 0.1f",
+        "%Bits (unsigned char)255",
+        "%BITS 1",
+        "%bits (struct { int x; }){1}",
+        "n",
+    ]);
+    assert!(
+        out.contains("type: int\nsize: 4 bytes\nvalue: 1\nhex: 0x00000001\nbinary: 00000000"),
+        "integer representation missing:\n{out}"
+    );
+    assert!(
+        out.contains("type: float")
+            && out.contains("hex: 0x3dcccccd")
+            && out.contains("sign: 0")
+            && out.contains("exponent: 123 (-4)")
+            && out.contains("fraction: 0x4ccccd"),
+        "IEEE-754 fields missing:\n{out}"
+    );
+    assert!(
+        out.contains("type: unsigned char")
+            && out.contains("binary: 11111111")
+            && out.contains("memory: ff"),
+        "byte representation missing:\n{out}"
+    );
+    assert!(
+        out.contains("hex: 0X3DCCCCCD")
+            && out.contains("memory: CD CC CC 3D")
+            && out.contains("fraction: 0X4CCCCD")
+            && out.contains("hex: 0XFF"),
+        "uppercase hexadecimal representation missing:\n{out}"
+    );
+    assert!(
+        out.contains("unknown command %BITS"),
+        "unexpected case-insensitive magic matching:\n{out}"
+    );
+    assert!(
+        out.contains("byte order: ") && out.contains("Out[2]: 0"),
+        "%bits evaluated its expression more than once, retained it, or consumed an input number:\n{out}"
+    );
+    assert!(
+        out.contains("%bits supports standard scalar values and pointers to scalar types"),
+        "unsupported type diagnostic missing:\n{out}"
+    );
+}
+
+#[test]
 fn src_defaults_to_user_view_and_raw_keeps_scaffolding() {
     let user = run(&["int source_value = 7;", "%src"]);
     assert!(user.contains("int main(void)"), "main missing:\n{user}");

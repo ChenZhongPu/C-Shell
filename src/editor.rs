@@ -26,8 +26,8 @@ use crate::ui::Ui;
 
 /// The magic commands, for completion.
 const MAGICS: &[&str] = &[
-    "%help", "%quit", "%exit", "%clear", "%reset", "%src", "%header", "%edit", "%type", "%time",
-    "%timeit", "%undo", "%cc", "%std",
+    "%help", "%quit", "%exit", "%clear", "%reset", "%src", "%header", "%edit", "%type", "%bits",
+    "%Bits", "%time", "%timeit", "%undo", "%cc", "%std",
 ];
 
 /// C keywords, common types and stdlib staples worth offering at a C prompt.
@@ -954,6 +954,9 @@ mod tests {
         assert_eq!(completion_candidates("%cl", 3, &[]).1, vec!["%clear"]);
         assert_eq!(completion_candidates("%ed", 3, &[]).1, vec!["%edit"]);
         assert_eq!(completion_candidates("%ty", 3, &[]).1, vec!["%type"]);
+        assert_eq!(completion_candidates("%bi", 3, &[]).1, vec!["%bits"]);
+        assert_eq!(completion_candidates("%Bi", 3, &[]).1, vec!["%Bits"]);
+        assert!(completion_candidates("%BI", 3, &[]).1.is_empty());
         // Mid-line `%` is the modulo operator.
         let (_, c) = completion_candidates("a %h", 4, &[]);
         assert!(c.is_empty());

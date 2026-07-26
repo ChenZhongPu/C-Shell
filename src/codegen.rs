@@ -35,6 +35,7 @@ pub const HEADERS: &str = "\
 #include <inttypes.h>
 #include <stddef.h>
 #include <limits.h>
+#include <float.h>
 #include <ctype.h>
 #include <stdarg.h>
 #include <time.h>
@@ -60,6 +61,216 @@ static inline void cs_p_d (double v)             { CS_VAL(); printf("%.17g\n", v
 static inline void cs_p_ld(long double v)        { CS_VAL(); printf("%.21Lg\n", v); }
 static inline void cs_p_s (const char *v)        { CS_VAL(); if (v) printf("\"%s\"\n", v); else printf("NULL\n"); }
 static inline void cs_p_p (const void *v)        { CS_VAL(); if (v) printf("0x%" PRIxPTR "\n", (uintptr_t)v); else printf("NULL\n"); }
+
+#ifdef CS_ENABLE_BITS
+static inline int cs_bits_little_endian(void)
+{
+    const uint16_t one = 1;
+    return *(const unsigned char *)&one == 1;
+}
+
+static inline void cs_bits_dump(const void *object, size_t size, int uppercase)
+{
+    const unsigned char *bytes = (const unsigned char *)object;
+    const int little = cs_bits_little_endian();
+    size_t i;
+    int bit;
+
+    fputs(uppercase ? "hex: 0X" : "hex: 0x", stdout);
+    for (i = 0; i < size; ++i) {
+        const size_t index = little ? size - i - 1 : i;
+        printf(uppercase ? "%02X" : "%02x", (unsigned)bytes[index]);
+    }
+    fputs("\nbinary: ", stdout);
+    for (i = 0; i < size; ++i) {
+        const size_t index = little ? size - i - 1 : i;
+        if (i) fputc(' ', stdout);
+        for (bit = 7; bit >= 0; --bit)
+            fputc((bytes[index] & (1u << bit)) ? '1' : '0', stdout);
+    }
+    fputs("\nmemory:", stdout);
+    for (i = 0; i < size; ++i)
+        printf(uppercase ? " %02X" : " %02x", (unsigned)bytes[i]);
+    printf("\nbyte order: %s-endian\n", little ? "little" : "big");
+}
+
+#define CS_BITS_SIGNED_FN(F, T)                                         \
+    static inline void F(T value, const char *name, int uppercase)      \
+    {                                                                    \
+        CS_VAL();                                                        \
+        printf("type: %s\nsize: %llu byte%s\nvalue: %lld\n", name,      \
+               (unsigned long long)sizeof(value),                        \
+               sizeof(value) == 1 ? "" : "s", (long long)value);        \
+        cs_bits_dump(&value, sizeof(value), uppercase);                  \
+    }
+#define CS_BITS_UNSIGNED_FN(F, T)                                       \
+    static inline void F(T value, const char *name, int uppercase)      \
+    {                                                                    \
+        CS_VAL();                                                        \
+        printf("type: %s\nsize: %llu byte%s\nvalue: %llu\n", name,      \
+               (unsigned long long)sizeof(value),                        \
+               sizeof(value) == 1 ? "" : "s",                           \
+               (unsigned long long)value);                              \
+        cs_bits_dump(&value, sizeof(value), uppercase);                  \
+    }
+
+CS_BITS_SIGNED_FN(cs_bits_sc, signed char)
+CS_BITS_UNSIGNED_FN(cs_bits_uc, unsigned char)
+CS_BITS_SIGNED_FN(cs_bits_s, short)
+CS_BITS_UNSIGNED_FN(cs_bits_us, unsigned short)
+CS_BITS_SIGNED_FN(cs_bits_i, int)
+CS_BITS_UNSIGNED_FN(cs_bits_ui, unsigned int)
+CS_BITS_SIGNED_FN(cs_bits_l, long)
+CS_BITS_UNSIGNED_FN(cs_bits_ul, unsigned long)
+CS_BITS_SIGNED_FN(cs_bits_ll, long long)
+CS_BITS_UNSIGNED_FN(cs_bits_ull, unsigned long long)
+
+#undef CS_BITS_SIGNED_FN
+#undef CS_BITS_UNSIGNED_FN
+
+static inline void cs_bits_b(_Bool value, const char *name, int uppercase)
+{
+    CS_VAL();
+    printf("type: %s\nsize: %llu byte%s\nvalue: %s\n", name,
+           (unsigned long long)sizeof(value), sizeof(value) == 1 ? "" : "s",
+           value ? "true" : "false");
+    cs_bits_dump(&value, sizeof(value), uppercase);
+}
+
+static inline void cs_bits_c(char value, const char *name, int uppercase)
+{
+    CS_VAL();
+    printf("type: %s\nsize: %llu byte%s\nvalue: %d", name,
+           (unsigned long long)sizeof(value), sizeof(value) == 1 ? "" : "s",
+           (int)value);
+    if ((unsigned char)value >= 32 && (unsigned char)value < 127)
+        printf(" ('%c')", value);
+    fputc('\n', stdout);
+    cs_bits_dump(&value, sizeof(value), uppercase);
+}
+
+static inline void cs_bits_f(float value, const char *name, int uppercase)
+{
+    CS_VAL();
+    printf("type: %s\nsize: %llu byte%s\nvalue: %.9g\n", name,
+           (unsigned long long)sizeof(value), sizeof(value) == 1 ? "" : "s",
+           (double)value);
+    cs_bits_dump(&value, sizeof(value), uppercase);
+#if FLT_RADIX == 2 && FLT_MANT_DIG == 24 && FLT_MAX_EXP == 128
+    if (sizeof(value) == sizeof(uint32_t)) {
+        uint32_t raw;
+        unsigned exponent;
+        memcpy(&raw, &value, sizeof(raw));
+        exponent = (unsigned)((raw >> 23) & UINT32_C(0xff));
+        printf("sign: %u\n", (unsigned)(raw >> 31));
+        if (exponent == 0)
+            fputs("exponent: 0 (zero/subnormal)\n", stdout);
+        else if (exponent == 0xff)
+            fputs("exponent: 255 (infinity/NaN)\n", stdout);
+        else
+            printf("exponent: %u (%d)\n", exponent, (int)exponent - 127);
+        printf(uppercase ? "fraction: 0X%06" PRIX32 "\n"
+                         : "fraction: 0x%06" PRIx32 "\n",
+               raw & UINT32_C(0x7fffff));
+    }
+#endif
+}
+
+static inline void cs_bits_d(double value, const char *name, int uppercase)
+{
+    CS_VAL();
+    printf("type: %s\nsize: %llu byte%s\nvalue: %.17g\n", name,
+           (unsigned long long)sizeof(value), sizeof(value) == 1 ? "" : "s",
+           value);
+    cs_bits_dump(&value, sizeof(value), uppercase);
+#if FLT_RADIX == 2 && DBL_MANT_DIG == 53 && DBL_MAX_EXP == 1024
+    if (sizeof(value) == sizeof(uint64_t)) {
+        uint64_t raw;
+        unsigned exponent;
+        memcpy(&raw, &value, sizeof(raw));
+        exponent = (unsigned)((raw >> 52) & UINT64_C(0x7ff));
+        printf("sign: %u\n", (unsigned)(raw >> 63));
+        if (exponent == 0)
+            fputs("exponent: 0 (zero/subnormal)\n", stdout);
+        else if (exponent == 0x7ff)
+            fputs("exponent: 2047 (infinity/NaN)\n", stdout);
+        else
+            printf("exponent: %u (%d)\n", exponent, (int)exponent - 1023);
+        printf(uppercase ? "fraction: 0X%013" PRIX64 "\n"
+                         : "fraction: 0x%013" PRIx64 "\n",
+               raw & UINT64_C(0xfffffffffffff));
+    }
+#endif
+}
+
+static inline void cs_bits_ld(long double value, const char *name, int uppercase)
+{
+    CS_VAL();
+    printf("type: %s\nsize: %llu byte%s\nvalue: %.21Lg\n", name,
+           (unsigned long long)sizeof(value), sizeof(value) == 1 ? "" : "s",
+           value);
+    cs_bits_dump(&value, sizeof(value), uppercase);
+}
+
+static inline void cs_bits_pointer(const void *object, size_t size,
+                                   uintptr_t address, const char *name,
+                                   int uppercase)
+{
+    CS_VAL();
+    printf("type: %s\nsize: %llu byte%s\nvalue: ", name,
+           (unsigned long long)size, size == 1 ? "" : "s");
+    if (address)
+        printf(uppercase ? "0X%" PRIXPTR "\n" : "0x%" PRIxPTR "\n",
+               address);
+    else
+        fputs("NULL\n", stdout);
+    cs_bits_dump(object, size, uppercase);
+}
+
+#define CS_BITS_POINTER_FNS(F, T)                                       \
+    static inline void F(T *value, const char *name, int uppercase)     \
+    {                                                                    \
+        cs_bits_pointer(&value, sizeof(value), (uintptr_t)value, name,   \
+                        uppercase);                                      \
+    }                                                                    \
+    static inline void F##_c(const T *value, const char *name,           \
+                             int uppercase)                              \
+    {                                                                    \
+        cs_bits_pointer(&value, sizeof(value), (uintptr_t)value, name,   \
+                        uppercase);                                      \
+    }                                                                    \
+    static inline void F##_v(volatile T *value, const char *name,        \
+                             int uppercase)                              \
+    {                                                                    \
+        cs_bits_pointer(&value, sizeof(value), (uintptr_t)value, name,   \
+                        uppercase);                                      \
+    }                                                                    \
+    static inline void F##_cv(const volatile T *value, const char *name, \
+                              int uppercase)                             \
+    {                                                                    \
+        cs_bits_pointer(&value, sizeof(value), (uintptr_t)value, name,   \
+                        uppercase);                                      \
+    }
+
+CS_BITS_POINTER_FNS(cs_bits_p_void, void)
+CS_BITS_POINTER_FNS(cs_bits_p_b, _Bool)
+CS_BITS_POINTER_FNS(cs_bits_p_c, char)
+CS_BITS_POINTER_FNS(cs_bits_p_sc, signed char)
+CS_BITS_POINTER_FNS(cs_bits_p_uc, unsigned char)
+CS_BITS_POINTER_FNS(cs_bits_p_s, short)
+CS_BITS_POINTER_FNS(cs_bits_p_us, unsigned short)
+CS_BITS_POINTER_FNS(cs_bits_p_i, int)
+CS_BITS_POINTER_FNS(cs_bits_p_ui, unsigned int)
+CS_BITS_POINTER_FNS(cs_bits_p_l, long)
+CS_BITS_POINTER_FNS(cs_bits_p_ul, unsigned long)
+CS_BITS_POINTER_FNS(cs_bits_p_ll, long long)
+CS_BITS_POINTER_FNS(cs_bits_p_ull, unsigned long long)
+CS_BITS_POINTER_FNS(cs_bits_p_f, float)
+CS_BITS_POINTER_FNS(cs_bits_p_d, double)
+CS_BITS_POINTER_FNS(cs_bits_p_ld, long double)
+
+#undef CS_BITS_POINTER_FNS
+#endif
 
 /* Struct-member formatting is deliberately different from top-level value
    formatting: a char pointer member is an address, never an implicit %s
@@ -210,6 +421,45 @@ static inline void cs_m_unknown(const volatile void *v)          { (void)v; fput
 #define CS_TYPE_NAME(x) _Generic((x), CS_TYPE_ASSOCIATIONS,              \
     default: "<unrecognized type>")
 
+#ifdef CS_ENABLE_BITS
+#define CS_BITS_PTR_TYPES(T, F)                                          \
+    T *: F, const T *: F##_c, volatile T *: F##_v,                      \
+    const volatile T *: F##_cv
+
+/* The first occurrence of x is _Generic's unevaluated controlling
+   expression. The selected function receives x exactly once, so side effects
+   happen once while the temporary parameter preserves the scalar object's
+   representation for inspection. */
+#define CS_BITS_WITH_CASE(x, uppercase) _Generic((x),                    \
+    _Bool: cs_bits_b,             char: cs_bits_c,                       \
+    signed char: cs_bits_sc,      unsigned char: cs_bits_uc,             \
+    short: cs_bits_s,             unsigned short: cs_bits_us,            \
+    int: cs_bits_i,               unsigned int: cs_bits_ui,              \
+    long: cs_bits_l,              unsigned long: cs_bits_ul,             \
+    long long: cs_bits_ll,        unsigned long long: cs_bits_ull,        \
+    float: cs_bits_f,             double: cs_bits_d,                     \
+    long double: cs_bits_ld,                                             \
+    CS_BITS_PTR_TYPES(void, cs_bits_p_void),                             \
+    CS_BITS_PTR_TYPES(_Bool, cs_bits_p_b),                               \
+    CS_BITS_PTR_TYPES(char, cs_bits_p_c),                                \
+    CS_BITS_PTR_TYPES(signed char, cs_bits_p_sc),                        \
+    CS_BITS_PTR_TYPES(unsigned char, cs_bits_p_uc),                      \
+    CS_BITS_PTR_TYPES(short, cs_bits_p_s),                               \
+    CS_BITS_PTR_TYPES(unsigned short, cs_bits_p_us),                     \
+    CS_BITS_PTR_TYPES(int, cs_bits_p_i),                                 \
+    CS_BITS_PTR_TYPES(unsigned int, cs_bits_p_ui),                       \
+    CS_BITS_PTR_TYPES(long, cs_bits_p_l),                                \
+    CS_BITS_PTR_TYPES(unsigned long, cs_bits_p_ul),                      \
+    CS_BITS_PTR_TYPES(long long, cs_bits_p_ll),                          \
+    CS_BITS_PTR_TYPES(unsigned long long, cs_bits_p_ull),                \
+    CS_BITS_PTR_TYPES(float, cs_bits_p_f),                               \
+    CS_BITS_PTR_TYPES(double, cs_bits_p_d),                              \
+    CS_BITS_PTR_TYPES(long double, cs_bits_p_ld))                        \
+    ((x), CS_TYPE_NAME(x), (uppercase))
+#define CS_BITS(x) CS_BITS_WITH_CASE((x), 0)
+#define CS_BITS_UPPER(x) CS_BITS_WITH_CASE((x), 1)
+#endif
+
 #define CS_MARK(m) do { \
     fputs(m, stdout); fflush(stdout); \
     fputs(m, stderr); fflush(stderr); \
@@ -279,8 +529,8 @@ pub struct Program {
     /// Whether retained/current source contains a direct `scanf` token and
     /// therefore needs the request-driven stdin tape transport.
     pub uses_stdin_tape: bool,
-    /// True when the input sits inside a `CS_PRINT((` or `CS_TYPE_NAME((`
-    /// wrapper. MSVC's traditional preprocessor attributes diagnostics from a
+    /// True when the input sits inside a generated expression macro wrapper.
+    /// MSVC's traditional preprocessor attributes diagnostics from a
     /// multi-line macro invocation to the invocation's *first* line — the
     /// wrapper line just above the input — so the remapper must know it may
     /// pull those anchors back into the input.
@@ -292,6 +542,7 @@ enum BuildFlavor {
     Normal(Slot),
     SilentExpr,
     TypeProbe,
+    BitsProbe(bool),
     TimeitProbe(u64),
     /// Print an expression through the array-aware printer, indexing to the
     /// given nesting depth.
@@ -304,9 +555,11 @@ impl BuildFlavor {
     fn slot(self) -> Slot {
         match self {
             Self::Normal(slot) => slot,
-            Self::SilentExpr | Self::TypeProbe | Self::TimeitProbe(_) | Self::ArrayExpr(_) => {
-                Slot::Expr
-            }
+            Self::SilentExpr
+            | Self::TypeProbe
+            | Self::BitsProbe(_)
+            | Self::TimeitProbe(_)
+            | Self::ArrayExpr(_) => Slot::Expr,
             Self::ScopedStmt => Slot::Stmt,
             Self::ReplaceFile(_) => Slot::FileScope,
         }
@@ -376,6 +629,13 @@ pub fn build_type_probe(session: &Session, input: &str) -> Program {
     build_inner(session, input, BuildFlavor::TypeProbe)
 }
 
+/// Build a non-mutating `%bits` query. `_Generic` selects a scalar helper
+/// without evaluating its controlling expression; the selected helper then
+/// receives and inspects the expression value exactly once.
+pub fn build_bits_probe(session: &Session, input: &str, uppercase: bool) -> Program {
+    build_inner(session, input, BuildFlavor::BitsProbe(uppercase))
+}
+
 /// Build a program that prints an expression as an array of `depth`
 /// dimensions. Used only after the ordinary printer reported a bare address,
 /// which is all `_Generic` can say once an array has decayed to a pointer.
@@ -395,6 +655,10 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor) -> Program {
     let slot = flavor.slot();
     let silent_expr = matches!(flavor, BuildFlavor::SilentExpr);
     let type_probe = matches!(flavor, BuildFlavor::TypeProbe);
+    let bits_uppercase = match flavor {
+        BuildFlavor::BitsProbe(uppercase) => Some(uppercase),
+        _ => None,
+    };
     let scoped_stmt = matches!(flavor, BuildFlavor::ScopedStmt);
     let array_depth = match flavor {
         BuildFlavor::ArrayExpr(depth) => Some(depth),
@@ -425,6 +689,9 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor) -> Program {
     src.push_str(&format!("#define CS_M_VAL \"{}\"\n", escape(M_VAL)));
     src.push_str(&format!("#define CS_M_DONE \"{}\"\n", escape(M_DONE)));
     src.push_str(&format!("#define CS_M_STDIN \"{}\"\n", escape(M_STDIN)));
+    if bits_uppercase.is_some() {
+        src.push_str("#define CS_ENABLE_BITS 1\n");
+    }
     src.push_str(RUNTIME);
 
     for (index, item) in session.file_items.iter().enumerate() {
@@ -487,6 +754,13 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor) -> Program {
                     }
                     src.push_str("        default: \"<unrecognized type>\"));\n");
                 }
+            } else if let Some(uppercase) = bits_uppercase {
+                let macro_name = if uppercase {
+                    "CS_BITS_UPPER"
+                } else {
+                    "CS_BITS"
+                };
+                src.push_str(&format!("    {macro_name}((\n{input}\n    ));\n"));
             } else if let Some(loops) = timeit_loops {
                 src.push_str("    CS_VAL();\n");
                 src.push_str("    {\n");
@@ -1222,6 +1496,21 @@ mod tests {
         session.stmts.push("struct Pair pair = { 1, 2 };".into());
         let program = build_type_probe(&session, "pair");
         assert!(program.src.contains("struct Pair: \"Struct Pair\""));
+    }
+
+    #[test]
+    fn bits_probe_uses_the_single_evaluation_wrapper() {
+        let program = build_bits_probe(&Session::default(), "counter++", false);
+        assert!(program.src.contains("CS_BITS((\ncounter++\n    ));"));
+        assert_eq!(
+            program.src.matches("counter++").count(),
+            1,
+            "code generation must not duplicate a side-effecting expression"
+        );
+        assert!(program.wrapped);
+
+        let uppercase = build_bits_probe(&Session::default(), "value", true);
+        assert!(uppercase.src.contains("CS_BITS_UPPER((\nvalue\n    ));"));
     }
 
     #[test]

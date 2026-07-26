@@ -81,6 +81,36 @@ fn edit_input(args: &[&str], session: &Session) -> std::result::Result<Option<St
     }
 }
 
+fn render_probe(result: Eval, ui: &Ui, missing: &str) {
+    match result {
+        Eval::CompileError(diag) => println!("{}", ui.err(diag.trim_end())),
+        Eval::Done(o) => {
+            if o.streamed_output_needs_newline {
+                println!();
+            }
+            if !o.warnings.trim().is_empty() {
+                println!("{}", ui.warn(o.warnings.trim_end()));
+            }
+            if !o.output.is_empty() {
+                print!("{}", o.output);
+                if !o.output.ends_with('\n') {
+                    println!();
+                }
+            }
+            if !o.errors.is_empty() {
+                print!("{}", ui.err(&o.errors));
+            }
+            if let Some(msg) = o.abnormal {
+                println!("{}", ui.err(&msg));
+            } else if let Some(value) = o.value {
+                println!("{value}");
+            } else {
+                println!("{}", ui.err(missing));
+            }
+        }
+    }
+}
+
 const HELP: &str = "Commands:
   %help [--verbose]  show commands; --verbose adds usage notes
   %quit / %exit      quit (Ctrl-D works too)
@@ -90,6 +120,8 @@ const HELP: &str = "Commands:
   %header            list the headers included in every program
   %edit [n]          copy latest or In[n] into the prompt for editing
   %type <expression> query an expression's type without evaluating it
+  %bits <expression> inspect a scalar value using lowercase hexadecimal
+  %Bits <expression> same as %bits, with uppercase hexadecimal
   %time <code...>    time the execution of a statement or expression once
   %timeit <code...>  benchmark a statement or expression over multiple loops
   %undo              undo the most recent retained state change
@@ -117,6 +149,11 @@ const HELP_NOTES: &str = "Notes:
   simple anonymous typedefs use the typedef name. Other aliases and top-level
   qualifiers are canonicalized, and arrays/functions undergo their normal
   expression conversions.
+  %bits/%Bits evaluate a scalar expression once, then show its type, value,
+  size, hexadecimal and binary representation, memory bytes and byte order.
+  Command spelling is case-sensitive; only %Bits selects uppercase hex.
+  IEEE-754 float/double values also show sign, exponent and fraction fields;
+  aggregates, arrays and function pointers are not supported.
   %time evaluates an expression or statement once, displays its output/value,
   and reports wall-clock execution time. Side effects are retained in session.
   %timeit benchmarks an expression or statement in an auto-ranged loop over
@@ -201,32 +238,33 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
             if tail.is_empty() {
                 println!("{}", ui.err("usage: %type <expression>"));
             } else {
-                match ev.type_of(session, tail)? {
-                    Eval::CompileError(diag) => println!("{}", ui.err(diag.trim_end())),
-                    Eval::Done(o) => {
-                        if o.streamed_output_needs_newline {
-                            println!();
-                        }
-                        if !o.warnings.trim().is_empty() {
-                            println!("{}", ui.warn(o.warnings.trim_end()));
-                        }
-                        if !o.output.is_empty() {
-                            print!("{}", o.output);
-                            if !o.output.ends_with('\n') {
-                                println!();
-                            }
-                        }
-                        if !o.errors.is_empty() {
-                            print!("{}", ui.err(&o.errors));
-                        }
-                        if let Some(msg) = o.abnormal {
-                            println!("{}", ui.err(&msg));
-                        } else if let Some(name) = o.value {
-                            println!("{name}");
-                        } else {
-                            println!("{}", ui.err("type query produced no result"));
-                        }
+                render_probe(
+                    ev.type_of(session, tail)?,
+                    ui,
+                    "type query produced no result",
+                );
+            }
+        }
+
+        bits_command @ ("bits" | "Bits") => {
+            let uppercase = bits_command == "Bits";
+            if tail.is_empty() {
+                println!(
+                    "{}",
+                    ui.err(&format!("usage: %{bits_command} <expression>"))
+                );
+            } else {
+                let result = ev.bits_of(session, tail, uppercase)?;
+                match result {
+                    Eval::CompileError(diag) if !diag.to_ascii_lowercase().contains("error") => {
+                        println!(
+                            "{}",
+                            ui.err(&format!(
+                                "%{bits_command} supports standard scalar values and pointers to scalar types"
+                            ))
+                        );
                     }
+                    result => render_probe(result, ui, "bits query produced no result"),
                 }
             }
         }

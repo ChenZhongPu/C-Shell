@@ -32,12 +32,16 @@
   <img src="demo.gif" alt="c-shell interactive session demo" width="900">
 </p>
 
+> [!WARNING]
+> This project is a REPL for the C programming language. It is unrelated to
+> [C shell (`csh`)](https://en.wikipedia.org/wiki/C_shell), the Unix shell.
+
 ## Try it
 
 Start `c-shell` and type C directly at the prompt:
 
 ```text
-c-shell 0.2.5  ·  cc (GCC) 16.1.1 (default std gnu23)
+c-shell 0.2.6  ·  cc (GCC) 16.1.1 (default std gnu23)
 In [1]: int x = 41;
 In [2]: x + 1
 Out[2]: 42
@@ -63,7 +67,8 @@ Out[5]: 1
   make multi-line C comfortable at a terminal.
 - **Useful values, not just exit codes.** Scalar values, strings, arrays, and
   supported structs are printed automatically; `%type` inspects expressions
-  without evaluating them.
+  without evaluating them, while `%bits`/`%Bits` expose scalar object
+  representations and IEEE-754 fields.
 - **Interactive or scriptable.** Use the REPL, `-e`, script files, or piped
   input with deterministic exit status and diagnostics.
 - **Cross-platform compiler drivers.** GNU-style and MSVC-style command lines
@@ -226,14 +231,14 @@ queries do not change retained state and therefore create nothing to undo.
 
 ```
 %help      %quit      %clear     %reset     %edit [n]
-%src       %header    %type      %time      %timeit
+%src       %header    %type      %bits/%Bits %time     %timeit
 %undo      %cc        %std
 ```
 
 `%help` lists the commands and nothing else, so it stays a one-screen
 reference. `%help --verbose` appends the usage notes: which inputs are
 retained, how continuation and rebinding behave, what the value printer and
-`%type` cover, and how the `scanf` tape replays.
+`%type` and `%bits`/`%Bits` cover, and how the `scanf` tape replays.
 
 `%clear` erases the terminal display and returns the cursor to the top without
 changing variables, retained C code or the input counter.
@@ -297,6 +302,54 @@ aggregate definitions visible in the session, plus simple `typedef struct {
 dynamically. A typedef of a named tag uses the tag's canonical name; an
 anonymous aggregate typedef uses its typedef name. Truly anonymous aggregates
 and other types outside the table report `<unrecognized type>`.
+
+`%bits <expression>` evaluates a scalar expression exactly once and exposes
+the object representation produced by the selected compiler and target:
+
+```text
+In [1]: %bits -1
+type: int
+size: 4 bytes
+value: -1
+hex: 0xffffffff
+binary: 11111111 11111111 11111111 11111111
+memory: ff ff ff ff
+byte order: little-endian
+
+In [1]: %bits 0.1f
+type: float
+size: 4 bytes
+value: 0.100000001
+hex: 0x3dcccccd
+binary: 00111101 11001100 11001100 11001101
+memory: cd cc cc 3d
+byte order: little-endian
+sign: 0
+exponent: 123 (-4)
+fraction: 0x4ccccd
+```
+
+`%Bits` runs the same inspection with uppercase hexadecimal digits and
+prefixes:
+
+```text
+In [1]: %Bits 0.1f
+hex: 0X3DCCCCCD
+memory: CD CC CC 3D
+fraction: 0X4CCCCD
+```
+
+Magic command names are case-sensitive: only `%bits` and `%Bits` are
+recognized; spellings such as `%BITS` remain invalid. Decimal values, binary
+output and labels are identical in both modes.
+
+It supports the standard integer, Boolean, character and floating types,
+enums through their compatible integer type, and pointers to scalar types.
+The `hex` and `binary` lines use significance order, while `memory` keeps
+increasing-address order so endianness is visible directly. On targets with
+the usual IEEE-754 binary32/binary64 formats, `float` and `double` also show
+their sign, biased and unbiased exponent, and fraction fields. The query does
+not retain the expression or consume an `In[n]` number.
 
 Tab completes `%` commands, C keywords, stdlib staples and retained session
 identifiers of at least two characters. When a prefix is ambiguous, Tab opens a

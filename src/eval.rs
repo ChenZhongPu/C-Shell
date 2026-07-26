@@ -144,6 +144,18 @@ impl Evaluator {
     /// committed to the replay journal.
     pub fn type_of(&self, session: &Session, input: &str) -> Result<Eval> {
         let prog = codegen::build_type_probe(session, input);
+        self.run_probe(session, prog)
+    }
+
+    /// Inspect a scalar expression's object representation without retaining
+    /// it in the replay journal. The generated `_Generic` dispatch evaluates
+    /// the expression once, as the selected helper's function argument.
+    pub fn bits_of(&self, session: &Session, input: &str, uppercase: bool) -> Result<Eval> {
+        let prog = codegen::build_bits_probe(session, input, uppercase);
+        self.run_probe(session, prog)
+    }
+
+    fn run_probe(&self, session: &Session, prog: codegen::Program) -> Result<Eval> {
         let src = self.src_path().display().to_string();
         let (start, count) = (prog.new_start_line, prog.new_line_count);
         match self.compile_text(&prog.src) {
