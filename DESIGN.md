@@ -4,7 +4,7 @@ Settled architecture decisions, the one big open problem, and the traps buried
 in the code that you must know about before changing it. README is for users;
 this file is for whoever develops the tool next.
 
-Status: v0.2.6 working. ~7300 lines of Rust, 116 tests (75 unit + 41
+Status: v0.2.6 working. ~7300 lines of Rust, 117 tests (76 unit + 41
 end-to-end smoke), clippy/fmt clean, English UI. Verified on Linux with gcc
 16.1.1 and clang 22.1.6. CI exercises the default macOS compiler and two
 Windows driver dialects (a GNU-style driver and MSVC); see

@@ -586,7 +586,8 @@ fn bits_magic_inspects_object_representations_and_evaluates_once() {
         "%BITS 1",
         "%bits (struct { int x; }){1}",
         "n",
-    ]);
+    ])
+    .replace("\r\n", "\n");
     assert!(
         out.contains("type: int\nsize: 4 bytes\nvalue: 1\nhex: 0x00000001\nbinary: 00000000"),
         "integer representation missing:\n{out}"

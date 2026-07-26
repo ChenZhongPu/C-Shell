@@ -111,6 +111,23 @@ fn render_probe(result: Eval, ui: &Ui, missing: &str) {
     }
 }
 
+/// Compilers anchor an unsupported `_Generic` selection differently. Clang
+/// keeps the primary error on the user expression, while GCC/MSVC may leave
+/// only a macro-expansion note after generated diagnostics are removed.
+fn unsupported_bits_type(diag: &str) -> bool {
+    if diag.trim().is_empty() {
+        return true;
+    }
+    let lower = diag.to_ascii_lowercase();
+    let names_dispatch = lower.contains("_generic")
+        || lower.contains("generic association")
+        || lower.contains("cs_bits");
+    let reports_mismatch = lower.contains("not compatible")
+        || lower.contains("no compatible")
+        || lower.contains("expansion of macro");
+    names_dispatch && reports_mismatch
+}
+
 const HELP: &str = "Commands:
   %help [--verbose]  show commands; --verbose adds usage notes
   %quit / %exit      quit (Ctrl-D works too)
@@ -256,7 +273,7 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
             } else {
                 let result = ev.bits_of(session, tail, uppercase)?;
                 match result {
-                    Eval::CompileError(diag) if !diag.to_ascii_lowercase().contains("error") => {
+                    Eval::CompileError(diag) if unsupported_bits_type(&diag) => {
                         println!(
                             "{}",
                             ui.err(&format!(
@@ -419,5 +436,21 @@ mod tests {
             edit_input(&["7"], &session).expect_err("missing lookup"),
             "no C input In[7]"
         );
+    }
+
+    #[test]
+    fn recognizes_cross_compiler_bits_type_mismatches() {
+        assert!(unsupported_bits_type(
+            "error: controlling expression type 'struct Pair' not compatible with any generic association type"
+        ));
+        assert!(unsupported_bits_type(
+            "note: in expansion of macro ‘CS_BITS’"
+        ));
+        assert!(!unsupported_bits_type(
+            "error: use of undeclared identifier 'missing_name'"
+        ));
+        assert!(!unsupported_bits_type(
+            "compiler timed out after 10s and was killed"
+        ));
     }
 }
