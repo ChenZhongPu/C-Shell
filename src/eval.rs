@@ -1688,6 +1688,11 @@ mod tests {
 
         let invalid = format!("{M_UTF8}2:ff00");
         assert_eq!(render_utf8_payload(&invalid).as_deref(), Some("{255, 0}"));
+        let malformed_sequence = format!("{M_UTF8}3:c32800");
+        assert_eq!(
+            render_utf8_payload(&malformed_sequence).as_deref(),
+            Some("{195, 40, 0}")
+        );
         assert!(render_utf8_payload("not an internal payload").is_none());
     }
 

@@ -125,12 +125,10 @@ fn explicit_u8_literals_get_a_safe_utf8_preview_only() {
     // Before C23 a u8 literal has char elements and initially goes through the
     // ordinary string printer. The explicit-source probe must still refine it
     // into validated UTF-8 rather than depending on an address-shaped result.
-    // Exercise the compiler's real default mode. The invalid sample uses
-    // individually representable bytes whose sequence is not valid UTF-8,
-    // avoiding vendor-specific handling of an isolated \xff escape.
+    // Invalid UTF-8 payload fallback is tested below the C compiler boundary:
+    // Clang/MSVC may reject deliberately malformed u8 literals as source.
     let out = run(&[
         r#"u8"\xF0\x9F\x99\x82""#,
-        r#"u8"\xC3\x28""#,
         "unsigned char bytes[] = { 240, 159, 153, 130, 0 };",
         "bytes",
     ]);
@@ -139,11 +137,7 @@ fn explicit_u8_literals_get_a_safe_utf8_preview_only() {
         "valid explicit UTF-8 literal was not rendered as text:\n{out}"
     );
     assert!(
-        out.contains("Out[2]: {195, 40, 0}"),
-        "invalid UTF-8 must fall back to numeric code units:\n{out}"
-    );
-    assert!(
-        out.contains("Out[4]: {240, 159, 153, 130, 0}"),
+        out.contains("Out[3]: {240, 159, 153, 130, 0}"),
         "ordinary unsigned char array must stay numeric:\n{out}"
     );
     assert_eq!(
