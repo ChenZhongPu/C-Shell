@@ -422,6 +422,8 @@ impl Evaluator {
         // it as a C string instead of the address that normally triggers array
         // refinement. Source spelling gives us stronger evidence here, so run
         // the bounded raw-byte probe before applying the address heuristic.
+        // The generated probe trusts this conservative source classification
+        // instead of repeating a compiler-sensitive address comparison.
         if session.is_explicit_utf8_array_expr(input) {
             let prog = codegen::build_utf8_array_expr(session, input);
             if let Ok(mut candidate) = self.try_program(prog, Slot::Expr, session.stdin_tape())?

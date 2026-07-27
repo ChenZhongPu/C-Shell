@@ -362,7 +362,6 @@ static inline void cs_p_utf8_bytes(const void *object, size_t size)
 }
 
 #define CS_PRINT_UTF8_ARRAY(x) do {                                      \
-    if (!CS_IS_ARRAY(x)) { CS_PRINT(x); break; }                         \
     cs_p_utf8_bytes((const void *)(x), sizeof(x));                       \
 } while (0)
 
@@ -1692,6 +1691,15 @@ mod tests {
         let program = build_utf8_array_expr(&Session::default(), "text");
         assert!(program.src.contains("CS_PRINT_UTF8_ARRAY((\ntext\n    ));"));
         assert!(program.src.contains("#define CS_M_UTF8"));
+        let utf8_macro = program
+            .src
+            .split_once("#define CS_PRINT_UTF8_ARRAY")
+            .expect("UTF-8 macro")
+            .1
+            .split_once("static inline uint32_t cs_unicode_unit")
+            .expect("following Unicode helper")
+            .0;
+        assert!(!utf8_macro.contains("CS_IS_ARRAY"));
         assert!(program.wrapped);
     }
 

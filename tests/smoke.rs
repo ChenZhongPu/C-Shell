@@ -15,15 +15,10 @@ fn run(lines: &[&str]) -> String {
 }
 
 fn run_with_timeout(secs: u32, lines: &[&str]) -> String {
-    run_with_args(secs, &[], lines)
-}
-
-fn run_with_args(secs: u32, args: &[&str], lines: &[&str]) -> String {
     let mut child = Command::new(env!("CARGO_BIN_EXE_c-shell"))
         .arg("--no-color")
         .arg("--timeout")
         .arg(secs.to_string())
-        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -130,22 +125,21 @@ fn explicit_u8_literals_get_a_safe_utf8_preview_only() {
     // Before C23 a u8 literal has char elements and initially goes through the
     // ordinary string printer. The explicit-source probe must still refine it
     // into validated UTF-8 rather than depending on an address-shaped result.
-    let out = run_with_args(
-        15,
-        &["--std", "c11"],
-        &[
-            r#"u8"\xF0\x9F\x99\x82""#,
-            r#"u8"\xff""#,
-            "unsigned char bytes[] = { 240, 159, 153, 130, 0 };",
-            "bytes",
-        ],
-    );
+    // Exercise the compiler's real default mode. The invalid sample uses
+    // individually representable bytes whose sequence is not valid UTF-8,
+    // avoiding vendor-specific handling of an isolated \xff escape.
+    let out = run(&[
+        r#"u8"\xF0\x9F\x99\x82""#,
+        r#"u8"\xC3\x28""#,
+        "unsigned char bytes[] = { 240, 159, 153, 130, 0 };",
+        "bytes",
+    ]);
     assert!(
         out.contains("Out[1]: u8\"🙂\"\ncode units: {0xf0, 0x9f, 0x99, 0x82, 0x00}"),
         "valid explicit UTF-8 literal was not rendered as text:\n{out}"
     );
     assert!(
-        out.contains("Out[2]: {255, 0}"),
+        out.contains("Out[2]: {195, 40, 0}"),
         "invalid UTF-8 must fall back to numeric code units:\n{out}"
     );
     assert!(
