@@ -127,8 +127,10 @@ fn explicit_u8_literals_get_a_safe_utf8_preview_only() {
     // into validated UTF-8 rather than depending on an address-shaped result.
     // Invalid UTF-8 payload fallback is tested below the C compiler boundary:
     // Clang/MSVC may reject deliberately malformed u8 literals as source.
+    // A universal character name asks every compiler to encode the character;
+    // spelling its UTF-8 bytes as \xF0... is not portable before C23.
     let out = run(&[
-        r#"u8"\xF0\x9F\x99\x82""#,
+        r#"u8"\U0001F642""#,
         "unsigned char bytes[] = { 240, 159, 153, 130, 0 };",
         "bytes",
     ]);
