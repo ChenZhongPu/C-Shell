@@ -411,15 +411,17 @@ impl Evaluator {
     /// is tried first — it is both the common case and the cheap one — and a
     /// deeper pass runs only when the elements themselves had no printer.
     fn refine_array(&self, session: &Session, input: &str, outcome: Outcome) -> Result<Outcome> {
-        let addressed = outcome
-            .value
-            .as_deref()
-            .is_some_and(|v| v.starts_with("0x"));
         // Re-running the whole session must stay free of consequences.
-        if !addressed || lex::may_have_side_effects(input) {
+        if lex::may_have_side_effects(input) {
             return Ok(outcome);
         }
 
+        // An explicit u8 literal is an array regardless of the language mode,
+        // but its element type changed from char before C23 to unsigned char
+        // in C23. In the older modes the ordinary printer therefore renders
+        // it as a C string instead of the address that normally triggers array
+        // refinement. Source spelling gives us stronger evidence here, so run
+        // the bounded raw-byte probe before applying the address heuristic.
         if session.is_explicit_utf8_array_expr(input) {
             let prog = codegen::build_utf8_array_expr(session, input);
             if let Ok(mut candidate) = self.try_program(prog, Slot::Expr, session.stdin_tape())?
@@ -428,6 +430,14 @@ impl Evaluator {
                 candidate.value = Some(rendered);
                 return Ok(candidate);
             }
+        }
+
+        let addressed = outcome
+            .value
+            .as_deref()
+            .is_some_and(|v| v.starts_with("0x"));
+        if !addressed {
+            return Ok(outcome);
         }
 
         let mut best = outcome;
