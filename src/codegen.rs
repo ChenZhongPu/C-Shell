@@ -44,6 +44,8 @@ pub const HEADERS: &str = "\
 #include <ctype.h>
 #include <stdarg.h>
 #include <time.h>
+#include <uchar.h>
+#include <wchar.h>
 ";
 
 /// Value printing dispatches through `_Generic` on the *function*, not on the

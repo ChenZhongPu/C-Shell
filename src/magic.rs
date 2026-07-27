@@ -192,6 +192,64 @@ fn auto_included(header: &str) -> bool {
     codegen::HEADERS.lines().any(|line| line.trim() == include)
 }
 
+fn cppreference_header_url(header: &str) -> Option<String> {
+    let stem = header.strip_prefix('<')?.strip_suffix(".h>")?;
+    stem.bytes()
+        .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+        .then(|| format!("https://en.cppreference.com/c/header/{stem}"))
+}
+
+fn render_where_header_table(headers: &[&str], ui: &Ui) {
+    const HEADER_LABEL: &str = "header";
+    const DOCUMENTATION_LABEL: &str = "documentation";
+
+    let rows = headers
+        .iter()
+        .map(|header| {
+            (
+                *header,
+                cppreference_header_url(header).unwrap_or_else(|| "-".to_string()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let header_width = rows
+        .iter()
+        .map(|(header, _)| header.len())
+        .max()
+        .unwrap_or(0)
+        .max(HEADER_LABEL.len());
+    let documentation_width = rows
+        .iter()
+        .map(|(_, url)| url.len())
+        .max()
+        .unwrap_or(0)
+        .max(DOCUMENTATION_LABEL.len());
+    let border = format!(
+        "+-{}-+-{}-+",
+        "-".repeat(header_width),
+        "-".repeat(documentation_width)
+    );
+
+    println!("headers:");
+    println!("{border}");
+    println!("| {HEADER_LABEL:<header_width$} | {DOCUMENTATION_LABEL:<documentation_width$} |");
+    println!("{border}");
+    for (header, url) in rows {
+        let documentation = if url == "-" {
+            url.clone()
+        } else {
+            ui.hyperlink(&url)
+        };
+        // Pad from the visible URL width, not from the OSC 8-wrapped string:
+        // hyperlink control bytes occupy no terminal columns.
+        println!(
+            "| {header:<header_width$} | {documentation}{} |",
+            " ".repeat(documentation_width - url.len())
+        );
+    }
+    println!("{border}");
+}
+
 fn render_where(name: &str, ev: &Evaluator, ui: &Ui) {
     let Some(found) = std_index::lookup(name) else {
         println!(
@@ -213,15 +271,7 @@ fn render_where(name: &str, ev: &Evaluator, ui: &Ui) {
     println!("kind: {kinds}");
 
     let headers = found.headers();
-    println!(
-        "{}: {}",
-        if headers.len() == 1 {
-            "header"
-        } else {
-            "headers"
-        },
-        headers.join(", ")
-    );
+    render_where_header_table(&headers, ui);
     if let Some(signature) = found.signature {
         println!("signature: {signature}");
     }
@@ -326,7 +376,8 @@ const HELP_NOTES: &str = "Notes:
   4096. Invalid Unicode is reported without replacement characters. Pointer
   reads are explicit but still require the addressed memory to be valid.
   %where uses a built-in ISO C89-C23 index, not the host's transitive header
-  visibility. POSIX, platform/compiler extensions and user names are excluded.
+  visibility. It also links each matching header to cppreference. POSIX,
+  platform/compiler extensions and user names are excluded.
   %time evaluates an expression or statement once, displays its output/value,
   and reports wall-clock execution time. Side effects are retained in session.
   %timeit benchmarks an expression or statement in an auto-ranged loop over
@@ -682,5 +733,19 @@ mod tests {
         assert!(!is_c_identifier(""));
         assert!(!is_c_identifier("printf()"));
         assert!(!is_c_identifier("struct tm"));
+    }
+
+    #[test]
+    fn maps_standard_headers_to_cppreference_pages() {
+        assert_eq!(
+            cppreference_header_url("<uchar.h>").as_deref(),
+            Some("https://en.cppreference.com/c/header/uchar")
+        );
+        assert_eq!(
+            cppreference_header_url("<stdckdint.h>").as_deref(),
+            Some("https://en.cppreference.com/c/header/stdckdint")
+        );
+        assert_eq!(cppreference_header_url("stdio.h"), None);
+        assert_eq!(cppreference_header_url("<../stdio.h>"), None);
     }
 }

@@ -85,11 +85,19 @@ fn main() -> Result<()> {
     let args = Args::parse();
     // Auto-detect: no colors when redirected, explicitly opted out, or on a
     // terminal that declared itself unable (TERM=dumb).
+    let stdout_is_terminal = std::io::stdout().is_terminal();
+    let terminal_is_usable = std::env::var("TERM").map_or(true, |t| t != "dumb");
     let color = !args.no_color
         && std::env::var_os("NO_COLOR").is_none()
-        && std::io::stdout().is_terminal()
-        && std::env::var("TERM").map_or(true, |t| t != "dumb");
-    let ui = Ui { color };
+        && stdout_is_terminal
+        && terminal_is_usable;
+    // Hyperlinks are independent of color: --no-color/NO_COLOR disable
+    // styling, not navigation. Unknown OSC sequences are safely ignored, and
+    // the URL remains the visible label.
+    let ui = Ui {
+        color,
+        hyperlinks: stdout_is_terminal && terminal_is_usable,
+    };
 
     let tc = toolchain::Toolchain::detect(args.cc.as_deref(), args.std.as_deref())?;
     let mut ev = Evaluator::new(tc, Duration::from_secs(args.timeout))?;

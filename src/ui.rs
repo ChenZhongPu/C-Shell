@@ -2,6 +2,10 @@
 
 pub struct Ui {
     pub color: bool,
+    /// Whether stdout is an interactive terminal that can consume terminal
+    /// control sequences. OSC 8 is ignored by terminals that do not implement
+    /// hyperlinks, while the linked URL remains visible as ordinary text.
+    pub hyperlinks: bool,
 }
 
 /// Startup banner, slant style. Kept under 60 columns so it survives
@@ -65,5 +69,41 @@ impl Ui {
 
     pub fn bold(&self, s: &str) -> String {
         self.paint("1", s)
+    }
+
+    /// Make a visible URL clickable in terminals that implement OSC 8.
+    ///
+    /// Keeping the URL itself as the label means transcripts and terminals
+    /// without hyperlink support still expose a useful address.
+    pub fn hyperlink(&self, url: &str) -> String {
+        if self.hyperlinks {
+            format!("\x1b]8;;{url}\x1b\\{url}\x1b]8;;\x1b\\")
+        } else {
+            url.to_string()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Ui;
+
+    #[test]
+    fn hyperlinks_keep_the_url_visible_in_both_rendering_modes() {
+        let url = "https://en.cppreference.com/c/header/stdio";
+        let plain = Ui {
+            color: false,
+            hyperlinks: false,
+        };
+        assert_eq!(plain.hyperlink(url), url);
+
+        let interactive = Ui {
+            color: false,
+            hyperlinks: true,
+        };
+        assert_eq!(
+            interactive.hyperlink(url),
+            format!("\x1b]8;;{url}\x1b\\{url}\x1b]8;;\x1b\\")
+        );
     }
 }

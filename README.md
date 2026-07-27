@@ -174,11 +174,12 @@ GCC nested-function warning: enter the statements from the body directly and
 omit the final `return`.
 
 Common headers (`stdio`, `stdlib`, `string`, `math`, `stdbool`, `stdint`,
-`inttypes`, `stddef`, `limits`, `ctype`, `stdarg`, `time`) are pre-included, so
-no `#include` is needed for the everyday library; `%header` lists them. Unix
-builds link `-lm`; Windows math functions come from the C runtime. GNU-style
-GCC/Clang drivers use `-Wall -Wextra`; MSVC-style `cl`/`clang-cl` drivers use
-`/W3`. The warning is often exactly the thing you came to check.
+`inttypes`, `stddef`, `limits`, `ctype`, `stdarg`, `time`, `uchar`, `wchar`)
+are pre-included, so no `#include` is needed for the everyday library;
+`%header` lists them. Unix builds link `-lm`; Windows math functions come from
+the C runtime. GNU-style GCC/Clang drivers use `-Wall -Wextra`; MSVC-style
+`cl`/`clang-cl` drivers use `/W3`. The warning is often exactly the thing you
+came to check.
 
 ### Rebinding declarations and definitions
 
@@ -254,11 +255,9 @@ Direct `u8"..."` literals and bare identifiers explicitly declared as
 one-dimensional `char8_t` arrays receive a validated UTF-8 preview:
 
 ```text
-In [1]: #include <uchar.h>
-(added at file scope)
-In [2]: const char8_t smiley[] = u8"\xF0\x9F\x99\x82";
-In [3]: smiley
-Out[3]: u8"🙂"
+In [1]: const char8_t smiley[] = u8"\xF0\x9F\x99\x82";
+In [2]: smiley
+Out[2]: u8"🙂"
 code units: {0xf0, 0x9f, 0x99, 0x82, 0x00}
 ```
 
@@ -425,7 +424,12 @@ session:
 In [1]: %where gets
 name: gets
 kind: function
-header: <stdio.h>
+headers:
++-----------+--------------------------------------------+
+| header    | documentation                              |
++-----------+--------------------------------------------+
+| <stdio.h> | https://en.cppreference.com/c/header/stdio |
++-----------+--------------------------------------------+
 signature: char *gets(char *s)
 ISO C availability: C89–C99; removed in C11
 selected mode: gnu23 (not available as an ISO C library identifier)
@@ -436,6 +440,9 @@ note: deprecated; removed from ISO C in C11 because it cannot perform bounded in
 The built-in index covers commonly queried portable public names from ISO C89
 through C23. It does not infer ownership from whatever headers happen to be
 installed, because transitive includes and extensions differ by platform.
+Each matching header includes its cppreference URL. Supporting terminals make
+the URL clickable through an OSC 8 hyperlink; the complete URL remains visible
+in terminals and captured output that do not support it.
 POSIX names such as `getline`, compiler/platform extensions, optional
 bounds-checking interfaces, and user declarations are deliberately excluded.
 A local `man 3` page remains useful for implementation-specific availability,

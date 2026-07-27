@@ -735,13 +735,15 @@ fn where_magic_uses_the_iso_index_without_consuming_input_number() {
     .replace("\r\n", "\n");
     assert!(
         out.contains("name: printf")
-            && out.contains("header: <stdio.h>")
+            && out.contains("| header    | documentation")
+            && out.contains("| <stdio.h> | https://en.cppreference.com/c/header/stdio")
             && out.contains("signature: int printf("),
         "stdio lookup missing:\n{out}"
     );
     assert!(
         out.contains("name: sqrt")
-            && out.contains("headers: <math.h>, <tgmath.h>")
+            && out.contains("| <math.h>   | https://en.cppreference.com/c/header/math")
+            && out.contains("| <tgmath.h> | https://en.cppreference.com/c/header/tgmath")
             && out.contains("kind: function / type-generic macro"),
         "multi-header lookup missing:\n{out}"
     );
@@ -753,7 +755,7 @@ fn where_magic_uses_the_iso_index_without_consuming_input_number() {
     );
     assert!(
         out.contains("name: ckd_add")
-            && out.contains("header: <stdckdint.h>")
+            && out.contains("| <stdckdint.h> | https://en.cppreference.com/c/header/stdckdint")
             && out.contains("ISO C availability: C23 and later"),
         "C23 lookup missing:\n{out}"
     );
@@ -1017,7 +1019,10 @@ fn help_lists_commands_and_keeps_usage_notes_behind_verbose() {
 fn header_lists_the_default_includes() {
     let out = run(&["%header"]);
     assert!(
-        out.contains("#include <stdio.h>") && out.contains("#include <string.h>"),
+        out.contains("#include <stdio.h>")
+            && out.contains("#include <string.h>")
+            && out.contains("#include <uchar.h>")
+            && out.contains("#include <wchar.h>"),
         "default headers were not listed:\n{out}"
     );
 }
