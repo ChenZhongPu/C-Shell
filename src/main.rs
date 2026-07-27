@@ -12,6 +12,7 @@ mod lex;
 mod magic;
 mod proc;
 mod session;
+mod std_index;
 mod toolchain;
 mod ui;
 

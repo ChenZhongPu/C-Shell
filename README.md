@@ -41,7 +41,7 @@
 Start `c-shell` and type C directly at the prompt:
 
 ```text
-c-shell 0.2.6  ·  cc (GCC) 16.1.1 (default std gnu23)
+c-shell 0.2.7  ·  cc (GCC) 16.1.1 (default std gnu23)
 In [1]: int x = 41;
 In [2]: x + 1
 Out[2]: 42
@@ -68,7 +68,9 @@ Out[5]: 1
 - **Useful values, not just exit codes.** Scalar values, strings, arrays, and
   supported structs are printed automatically; `%type` inspects expressions
   without evaluating them, while `%bits`/`%Bits` expose scalar object
-  representations and IEEE-754 fields.
+  representations and IEEE-754 fields. `%utf8`/`%utf16`/`%utf32` explicitly
+  decode Unicode code units, and `%where` identifies the portable standard
+  header for an ISO C library name.
 - **Interactive or scriptable.** Use the REPL, `-e`, script files, or piped
   input with deterministic exit status and diagnostics.
 - **Cross-platform compiler drivers.** GNU-style and MSVC-style command lines
@@ -231,7 +233,8 @@ queries do not change retained state and therefore create nothing to undo.
 
 ```
 %help      %quit      %clear     %reset     %edit [n]
-%src       %header    %type      %bits/%Bits %time     %timeit
+%src       %header    %where     %type      %bits/%Bits
+%utf8      %utf16     %utf32     %time      %timeit
 %undo      %cc        %std
 ```
 
@@ -246,6 +249,69 @@ changing variables, retained C code or the input counter.
 `%undo` reverses the most recent retained state change. It does not rewind the
 visible `In[n]` counter or remove failed and forgotten pure inputs from the
 numbered `%edit` archive.
+
+Direct `u8"..."` literals and bare identifiers explicitly declared as
+one-dimensional `char8_t` arrays receive a validated UTF-8 preview:
+
+```text
+In [1]: #include <uchar.h>
+(added at file scope)
+In [2]: const char8_t smiley[] = u8"\xF0\x9F\x99\x82";
+In [3]: smiley
+Out[3]: u8"🙂"
+code units: {0xf0, 0x9f, 0x99, 0x82, 0x00}
+```
+
+The trailing zero remains visible in `code units` but is omitted from the
+quoted text. C23 defines `char8_t` as the same type as `unsigned char`, so the
+runtime type system alone cannot distinguish their source spelling. c-shell
+therefore requires the explicit `u8` prefix or retained `char8_t[]`
+declaration; an ordinary `unsigned char[]`, a pointer, a multidimensional
+array, or a more complex expression remains numeric. Invalid or incomplete
+UTF-8 also falls back to numeric code units rather than printing replacement
+characters.
+
+`%utf8`, `%utf16` and `%utf32` explicitly interpret an integer array or
+pointer as Unicode code units:
+
+```text
+In [4]: const char8_t *message = u8"A好😀";
+In [5]: %utf8 message
+encoding: UTF-8
+address: 0x55ee74fe4032
+text: u8"A好😀"
+code units: {0x41, 0xe5, 0xa5, 0xbd, 0xf0, 0x9f, 0x98, 0x80, 0x00}
+
+In [5]: %utf16 u"A\u597D\U0001F600"
+encoding: UTF-16
+address: 0x55ee74fe4070
+text: u"A好😀"
+code units: {0x0041, 0x597d, 0xd83d, 0xde00, 0x0000}
+```
+
+The default form stops at NUL and reads at most 100 code units. `-n N` reads
+exactly `N` units—including embedded zeros—and accepts at most 4096:
+
+```text
+In [5]: %utf8 -n 3 (unsigned char[]){'A', 0, 'B'}
+encoding: UTF-8
+address: 0x7ffd12345678
+text: u8"A\0B"
+code units: {0x41, 0x00, 0x42}
+```
+
+Here `N` counts code units, so it counts bytes for UTF-8, 16-bit units for
+UTF-16 and 32-bit units for UTF-32. The pointed-to integer element width must
+match the selected encoding. UTF-8 is validated strictly, UTF-16 surrogate
+pairs are checked, and UTF-32 accepts only Unicode scalar values; invalid data
+is reported at its code-unit index and is never replaced with `�`. Because
+the command itself supplies the decoding intent, byte buffers do not need a
+`char8_t` spelling. Expressions are evaluated once, are not retained and do
+not consume an `In[n]` number.
+
+Pointer inspection necessarily reads the addressed memory. The limit bounds
+the scan and output but cannot make a dangling, undersized or otherwise
+invalid pointer safe; use `-n` only when that many code units are readable.
 
 `%src` defaults to the user-facing program: current file-scope definitions and
 retained statements inside a clean `main`, including any rebinding braces, but
@@ -350,6 +416,31 @@ increasing-address order so endianness is visible directly. On targets with
 the usual IEEE-754 binary32/binary64 formats, `float` and `double` also show
 their sign, biased and unbiased exponent, and fraction fields. The query does
 not retain the expression or consume an `In[n]` number.
+
+`%where <identifier>` looks up the ISO C header, identifier kind, standard
+availability, and selected-mode status without compiling or changing the
+session:
+
+```text
+In [1]: %where gets
+name: gets
+kind: function
+header: <stdio.h>
+signature: char *gets(char *s)
+ISO C availability: C89–C99; removed in C11
+selected mode: gnu23 (not available as an ISO C library identifier)
+auto-included by c-shell: yes (<stdio.h>)
+note: deprecated; removed from ISO C in C11 because it cannot perform bounded input
+```
+
+The built-in index covers commonly queried portable public names from ISO C89
+through C23. It does not infer ownership from whatever headers happen to be
+installed, because transitive includes and extensions differ by platform.
+POSIX names such as `getline`, compiler/platform extensions, optional
+bounds-checking interfaces, and user declarations are deliberately excluded.
+A local `man 3` page remains useful for implementation-specific availability,
+feature-test macros and additional warnings; for example, `man 3 gets`
+explicitly marks `gets` as deprecated.
 
 Tab completes `%` commands, C keywords, stdlib staples and retained session
 identifiers of at least two characters. When a prefix is ambiguous, Tab opens a

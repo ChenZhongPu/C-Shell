@@ -22,6 +22,11 @@ pub const M_VAL: &str = "\x01\x02c-shell/val\x02\x01";
 pub const M_DONE: &str = "\x01\x02c-shell/done\x02\x01";
 /// A wrapped stdin call requests one recorded or live line from the parent.
 pub const M_STDIN: &str = "\x01\x02c-shell/stdin\x02\x01";
+/// Prefix for a bounded hexadecimal byte payload returned by the explicit
+/// UTF-8 array probe. Rust validates and renders it before it reaches the UI.
+pub const M_UTF8: &str = "\x01\x02c-shell/utf8\x02\x01";
+/// Prefix for `%utf8`/`%utf16`/`%utf32` code-unit probe payloads.
+pub const M_UNICODE: &str = "\x01\x02c-shell/unicode\x02\x01";
 
 /// Headers every generated program includes before any user code, so beginners
 /// need no `#include` for the common library. `%header` shows this list.
@@ -343,6 +348,86 @@ static inline void cs_m_unknown(const volatile void *v)          { (void)v; fput
     ((const volatile void *)&(x) == (const volatile void *)&(x)[0])
 #define CS_ARRAY_ELIDE(n) printf("... (%llu more)", (unsigned long long)(n))
 
+static inline void cs_p_utf8_bytes(const void *object, size_t size)
+{
+    const unsigned char *bytes = (const unsigned char *)object;
+    size_t i, shown = size < CS_ARRAY_LIMIT ? size : CS_ARRAY_LIMIT;
+    CS_VAL();
+    fputs(CS_M_UTF8, stdout);
+    printf("%llu:", (unsigned long long)size);
+    for (i = 0; i < shown; ++i) printf("%02x", (unsigned)bytes[i]);
+    putchar('\n');
+}
+
+#define CS_PRINT_UTF8_ARRAY(x) do {                                      \
+    if (!CS_IS_ARRAY(x)) { CS_PRINT(x); break; }                         \
+    cs_p_utf8_bytes((const void *)(x), sizeof(x));                       \
+} while (0)
+
+static inline uint32_t cs_unicode_unit(const unsigned char *bytes, size_t width)
+{
+    if (width == 1) {
+        return bytes[0];
+    } else if (width == 2) {
+        uint16_t value;
+        memcpy(&value, bytes, sizeof(value));
+        return value;
+    } else {
+        uint32_t value;
+        memcpy(&value, bytes, sizeof(value));
+        return value;
+    }
+}
+
+static inline void cs_p_unicode(const void *object, size_t actual_width,
+                                size_t expected_width, size_t limit, int exact)
+{
+    const unsigned char *bytes = (const unsigned char *)object;
+    size_t i;
+    char status = exact ? 'E' : 'L';
+
+    CS_VAL();
+    fputs(CS_M_UNICODE, stdout);
+    printf("%llu:%" PRIxPTR ":", (unsigned long long)actual_width,
+           (uintptr_t)object);
+    if (!object) {
+        fputs(":N:0\n", stdout);
+        return;
+    }
+    if (actual_width != expected_width) {
+        fputs(":M:0\n", stdout);
+        return;
+    }
+
+    for (i = 0; i < limit; ++i) {
+        uint32_t unit = cs_unicode_unit(bytes + i * actual_width, actual_width);
+        if (i) fputc(',', stdout);
+        printf("%08" PRIx32, unit);
+        if (!exact && unit == 0) {
+            status = 'T';
+            ++i;
+            break;
+        }
+    }
+    printf(":%c:%llu\n", status, (unsigned long long)i);
+}
+
+#define CS_UNICODE_PTR_TYPES(T) T *: cs_p_unicode, const T *: cs_p_unicode
+#define CS_PRINT_UNICODE(x, expected_width, limit, exact)                 \
+    _Generic((x),                                                         \
+        CS_UNICODE_PTR_TYPES(char),                                       \
+        CS_UNICODE_PTR_TYPES(signed char),                                \
+        CS_UNICODE_PTR_TYPES(unsigned char),                              \
+        CS_UNICODE_PTR_TYPES(short),                                      \
+        CS_UNICODE_PTR_TYPES(unsigned short),                             \
+        CS_UNICODE_PTR_TYPES(int),                                        \
+        CS_UNICODE_PTR_TYPES(unsigned int),                               \
+        CS_UNICODE_PTR_TYPES(long),                                       \
+        CS_UNICODE_PTR_TYPES(unsigned long),                              \
+        CS_UNICODE_PTR_TYPES(long long),                                  \
+        CS_UNICODE_PTR_TYPES(unsigned long long))                         \
+        ((x), sizeof(*(x)), (expected_width), (limit), (exact))
+
 #define CS_PRINT_ARRAY1(x) do {                                          \
     if (!CS_IS_ARRAY(x)) { CS_PRINT(x); break; }                         \
     CS_VAL();                                                            \
@@ -487,9 +572,13 @@ static int cs_taped_scanf(const char *format, ...)
 static inline uint64_t cs_timeit_now_ns(void) {
 #if defined(_WIN32)
     return (uint64_t)clock() * 1000000ULL;
-#else
+#elif defined(CLOCK_MONOTONIC)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#else
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 #endif
 }
@@ -547,6 +636,16 @@ enum BuildFlavor {
     /// Print an expression through the array-aware printer, indexing to the
     /// given nesting depth.
     ArrayExpr(usize),
+    /// Return bounded raw code units for an expression whose source spelling
+    /// explicitly identifies a one-dimensional UTF-8 array.
+    Utf8ArrayExpr,
+    /// Decode an explicitly requested sequence of 1-, 2- or 4-byte code
+    /// units. `exact` controls whether NUL terminates the scan.
+    UnicodeProbe {
+        expected_width: usize,
+        limit: usize,
+        exact: bool,
+    },
     ScopedStmt,
     ReplaceFile(usize),
 }
@@ -559,7 +658,9 @@ impl BuildFlavor {
             | Self::TypeProbe
             | Self::BitsProbe(_)
             | Self::TimeitProbe(_)
-            | Self::ArrayExpr(_) => Slot::Expr,
+            | Self::ArrayExpr(_)
+            | Self::Utf8ArrayExpr
+            | Self::UnicodeProbe { .. } => Slot::Expr,
             Self::ScopedStmt => Slot::Stmt,
             Self::ReplaceFile(_) => Slot::FileScope,
         }
@@ -646,6 +747,31 @@ pub fn build_array_expr(session: &Session, input: &str, depth: usize) -> Program
     build_inner(session, input, BuildFlavor::ArrayExpr(depth))
 }
 
+/// Build a bounded raw-code-unit probe for an expression that Rust has
+/// conservatively identified as an explicit `char8_t[]` or `u8"..."` array.
+pub fn build_utf8_array_expr(session: &Session, input: &str) -> Program {
+    build_inner(session, input, BuildFlavor::Utf8ArrayExpr)
+}
+
+/// Build a non-mutating, single-evaluation Unicode code-unit probe.
+pub fn build_unicode_probe(
+    session: &Session,
+    input: &str,
+    expected_width: usize,
+    limit: usize,
+    exact: bool,
+) -> Program {
+    build_inner(
+        session,
+        input,
+        BuildFlavor::UnicodeProbe {
+            expected_width,
+            limit,
+            exact,
+        },
+    )
+}
+
 /// Build a program that benchmarks an expression or statement over `loops` iterations.
 pub fn build_timeit_probe(session: &Session, input: &str, loops: u64) -> Program {
     build_inner(session, input, BuildFlavor::TimeitProbe(loops))
@@ -662,6 +788,15 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor) -> Program {
     let scoped_stmt = matches!(flavor, BuildFlavor::ScopedStmt);
     let array_depth = match flavor {
         BuildFlavor::ArrayExpr(depth) => Some(depth),
+        _ => None,
+    };
+    let utf8_array = matches!(flavor, BuildFlavor::Utf8ArrayExpr);
+    let unicode_probe = match flavor {
+        BuildFlavor::UnicodeProbe {
+            expected_width,
+            limit,
+            exact,
+        } => Some((expected_width, limit, exact)),
         _ => None,
     };
     let timeit_loops = match flavor {
@@ -689,6 +824,8 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor) -> Program {
     src.push_str(&format!("#define CS_M_VAL \"{}\"\n", escape(M_VAL)));
     src.push_str(&format!("#define CS_M_DONE \"{}\"\n", escape(M_DONE)));
     src.push_str(&format!("#define CS_M_STDIN \"{}\"\n", escape(M_STDIN)));
+    src.push_str(&format!("#define CS_M_UTF8 \"{}\"\n", escape(M_UTF8)));
+    src.push_str(&format!("#define CS_M_UNICODE \"{}\"\n", escape(M_UNICODE)));
     if bits_uppercase.is_some() {
         src.push_str("#define CS_ENABLE_BITS 1\n");
     }
@@ -780,6 +917,13 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor) -> Program {
                 src.push_str("    }\n");
             } else if silent_expr {
                 src.push_str(&format!("    (void)(\n{input}\n    );\n"));
+            } else if utf8_array {
+                src.push_str(&format!("    CS_PRINT_UTF8_ARRAY((\n{input}\n    ));\n"));
+            } else if let Some((expected_width, limit, exact)) = unicode_probe {
+                src.push_str(&format!(
+                    "    CS_PRINT_UNICODE((\n{input}\n    ), {expected_width}, {limit}, {});\n",
+                    usize::from(exact)
+                ));
             } else if let Some(depth) = array_depth {
                 src.push_str(&format!("    CS_PRINT_ARRAY{depth}((\n{input}\n    ));\n"));
             } else {
@@ -1539,6 +1683,32 @@ mod tests {
         assert!(one.wrapped, "the array wrapper must remap like CS_PRINT");
         let two = build_array_expr(&session, "grid", 2);
         assert!(two.src.contains("CS_PRINT_ARRAY2((\ngrid\n    ));"));
+    }
+
+    #[test]
+    fn utf8_array_expression_uses_the_bounded_raw_probe() {
+        let program = build_utf8_array_expr(&Session::default(), "text");
+        assert!(program.src.contains("CS_PRINT_UTF8_ARRAY((\ntext\n    ));"));
+        assert!(program.src.contains("#define CS_M_UTF8"));
+        assert!(program.wrapped);
+    }
+
+    #[test]
+    fn unicode_probe_evaluates_the_pointer_expression_once() {
+        let expression = "choose_pointer(++calls)";
+        let program = build_unicode_probe(&Session::default(), expression, 2, 17, true);
+        assert!(
+            program
+                .src
+                .contains("CS_PRINT_UNICODE((\nchoose_pointer(++calls)\n    ), 2, 17, 1);")
+        );
+        assert_eq!(
+            program.src.matches(expression).count(),
+            1,
+            "generated source duplicated a side-effecting pointer expression"
+        );
+        assert!(program.src.contains("#define CS_M_UNICODE"));
+        assert!(program.wrapped);
     }
 
     #[test]

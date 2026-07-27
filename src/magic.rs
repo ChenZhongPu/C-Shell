@@ -10,9 +10,10 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::codegen::{self, Slot};
-use crate::eval::{Eval, Evaluator};
+use crate::eval::{Eval, Evaluator, UnicodeEncoding};
 use crate::proc;
 use crate::session::Session;
+use crate::std_index;
 use crate::ui::Ui;
 
 pub enum Action {
@@ -128,6 +129,153 @@ fn unsupported_bits_type(diag: &str) -> bool {
     names_dispatch && reports_mismatch
 }
 
+fn unsupported_unicode_type(diag: &str) -> bool {
+    if diag.trim().is_empty() {
+        return true;
+    }
+    let lower = diag.to_ascii_lowercase();
+    let names_dispatch = lower.contains("_generic")
+        || lower.contains("generic association")
+        || lower.contains("cs_print_unicode");
+    let reports_mismatch = lower.contains("not compatible")
+        || lower.contains("no compatible")
+        || lower.contains("expansion of macro");
+    names_dispatch && reports_mismatch
+}
+
+fn unicode_query(tail: &str) -> std::result::Result<(Option<usize>, &str), String> {
+    const MAX_EXPLICIT_UNITS: usize = 4096;
+
+    let tail = tail.trim();
+    if tail.is_empty() {
+        return Err("missing expression".to_string());
+    }
+    let Some(after_flag) = tail.strip_prefix("-n") else {
+        return Ok((None, tail));
+    };
+    if after_flag
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| !byte.is_ascii_whitespace())
+    {
+        return Ok((None, tail));
+    }
+
+    let after_flag = after_flag.trim_start();
+    let count_end = after_flag
+        .find(char::is_whitespace)
+        .unwrap_or(after_flag.len());
+    let count_text = &after_flag[..count_end];
+    let expression = after_flag[count_end..].trim();
+    let count = count_text
+        .parse::<usize>()
+        .map_err(|_| "-n requires a non-negative code-unit count".to_string())?;
+    if count > MAX_EXPLICIT_UNITS {
+        return Err(format!("-n is limited to {MAX_EXPLICIT_UNITS} code units"));
+    }
+    if expression.is_empty() {
+        return Err("missing expression after -n <count>".to_string());
+    }
+    Ok((Some(count), expression))
+}
+
+fn is_c_identifier(text: &str) -> bool {
+    let mut bytes = text.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+}
+
+fn auto_included(header: &str) -> bool {
+    let include = format!("#include {header}");
+    codegen::HEADERS.lines().any(|line| line.trim() == include)
+}
+
+fn render_where(name: &str, ev: &Evaluator, ui: &Ui) {
+    let Some(found) = std_index::lookup(name) else {
+        println!(
+            "{}",
+            ui.err(&format!(
+                "{name} was not found in c-shell's ISO C standard library index"
+            ))
+        );
+        return;
+    };
+
+    println!("name: {}", found.name);
+    let kinds = found
+        .kinds()
+        .into_iter()
+        .map(std_index::Kind::label)
+        .collect::<Vec<_>>()
+        .join(" / ");
+    println!("kind: {kinds}");
+
+    let headers = found.headers();
+    println!(
+        "{}: {}",
+        if headers.len() == 1 {
+            "header"
+        } else {
+            "headers"
+        },
+        headers.join(", ")
+    );
+    if let Some(signature) = found.signature {
+        println!("signature: {signature}");
+    }
+
+    let since = found.since();
+    if let Some(removed) = found.removed() {
+        let last = removed
+            .previous()
+            .expect("no indexed identifier is removed in C89");
+        println!(
+            "ISO C availability: {}–{}; removed in {}",
+            since.label(),
+            last.label(),
+            removed.label()
+        );
+    } else {
+        println!("ISO C availability: {} and later", since.label());
+    }
+
+    let mode = if ev.tc.std.is_empty() {
+        ev.tc.default_std.as_deref()
+    } else {
+        Some(ev.tc.std.as_str())
+    };
+    if let Some(mode) = mode {
+        if let Some(standard) = std_index::CStandard::from_mode(mode) {
+            println!(
+                "selected mode: {mode} ({})",
+                if found.available_in(standard) {
+                    "available"
+                } else {
+                    "not available as an ISO C library identifier"
+                }
+            );
+        } else {
+            println!("selected mode: {mode}");
+        }
+    }
+
+    let included = headers
+        .iter()
+        .copied()
+        .filter(|header| auto_included(header))
+        .collect::<Vec<_>>();
+    if included.is_empty() {
+        println!("auto-included by c-shell: no");
+    } else {
+        println!("auto-included by c-shell: yes ({})", included.join(", "));
+    }
+    if let Some(note) = found.note {
+        println!("note: {note}");
+    }
+}
+
 const HELP: &str = "Commands:
   %help [--verbose]  show commands; --verbose adds usage notes
   %quit / %exit      quit (Ctrl-D works too)
@@ -139,6 +287,8 @@ const HELP: &str = "Commands:
   %type <expression> query an expression's type without evaluating it
   %bits <expression> inspect a scalar value using lowercase hexadecimal
   %Bits <expression> same as %bits, with uppercase hexadecimal
+  %utf8/%utf16/%utf32 [-n N] <expression> decode Unicode code units
+  %where <identifier> find an ISO C library identifier's standard header
   %time <code...>    time the execution of a statement or expression once
   %timeit <code...>  benchmark a statement or expression over multiple loops
   %undo              undo the most recent retained state change
@@ -171,6 +321,12 @@ const HELP_NOTES: &str = "Notes:
   Command spelling is case-sensitive; only %Bits selects uppercase hex.
   IEEE-754 float/double values also show sign, exponent and fraction fields;
   aggregates, arrays and function pointers are not supported.
+  %utf8/%utf16/%utf32 read integer arrays or pointers as Unicode code units.
+  By default they stop at NUL or 100 units; -n N reads exactly N units, up to
+  4096. Invalid Unicode is reported without replacement characters. Pointer
+  reads are explicit but still require the addressed memory to be valid.
+  %where uses a built-in ISO C89-C23 index, not the host's transitive header
+  visibility. POSIX, platform/compiler extensions and user names are excluded.
   %time evaluates an expression or statement once, displays its output/value,
   and reports wall-clock execution time. Side effects are retained in session.
   %timeit benchmarks an expression or statement in an auto-ranged loop over
@@ -285,6 +441,44 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
                 }
             }
         }
+
+        unicode_command @ ("utf8" | "utf16" | "utf32") => {
+            let encoding = match unicode_command {
+                "utf8" => UnicodeEncoding::Utf8,
+                "utf16" => UnicodeEncoding::Utf16,
+                "utf32" => UnicodeEncoding::Utf32,
+                _ => unreachable!(),
+            };
+            match unicode_query(tail) {
+                Err(message) => println!(
+                    "{}",
+                    ui.err(&format!(
+                        "usage: %{unicode_command} [-n code-units] <expression> ({message})"
+                    ))
+                ),
+                Ok((count, expression)) => {
+                    let result = ev.unicode_of(session, expression, encoding, count)?;
+                    match result {
+                        Eval::CompileError(diag) if unsupported_unicode_type(&diag) => {
+                            println!(
+                                "{}",
+                                ui.err(&format!(
+                                    "%{unicode_command} supports pointers and arrays of integer code-unit types"
+                                ))
+                            );
+                        }
+                        result => {
+                            render_probe(result, ui, "Unicode query produced no result");
+                        }
+                    }
+                }
+            }
+        }
+
+        "where" => match rest.as_slice() {
+            [name] if is_c_identifier(name) => render_where(name, ev, ui),
+            _ => println!("{}", ui.err("usage: %where <identifier>")),
+        },
 
         "time" => {
             if tail.is_empty() {
@@ -452,5 +646,41 @@ mod tests {
         assert!(!unsupported_bits_type(
             "compiler timed out after 10s and was killed"
         ));
+    }
+
+    #[test]
+    fn parses_bounded_unicode_queries_without_rebuilding_expressions() {
+        assert_eq!(unicode_query("text").unwrap(), (None, "text"));
+        assert_eq!(
+            unicode_query("-n 7 pointer + offset").unwrap(),
+            (Some(7), "pointer + offset")
+        );
+        assert_eq!(unicode_query("-number").unwrap(), (None, "-number"));
+        assert!(unicode_query("").is_err());
+        assert!(unicode_query("-n nope text").is_err());
+        assert!(unicode_query("-n 4097 text").is_err());
+        assert!(unicode_query("-n 2").is_err());
+    }
+
+    #[test]
+    fn recognizes_cross_compiler_unicode_type_mismatches() {
+        assert!(unsupported_unicode_type(
+            "error: controlling expression type 'struct Pair *' not compatible with any generic association type"
+        ));
+        assert!(unsupported_unicode_type(
+            "note: in expansion of macro ‘CS_PRINT_UNICODE’"
+        ));
+        assert!(!unsupported_unicode_type(
+            "error: use of undeclared identifier 'missing_name'"
+        ));
+    }
+
+    #[test]
+    fn recognizes_c_identifiers_for_where_queries() {
+        assert!(is_c_identifier("printf"));
+        assert!(is_c_identifier("_Exit"));
+        assert!(!is_c_identifier(""));
+        assert!(!is_c_identifier("printf()"));
+        assert!(!is_c_identifier("struct tm"));
     }
 }

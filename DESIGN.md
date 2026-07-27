@@ -4,7 +4,7 @@ Settled architecture decisions, the one big open problem, and the traps buried
 in the code that you must know about before changing it. README is for users;
 this file is for whoever develops the tool next.
 
-Status: v0.2.6 working. ~7300 lines of Rust, 117 tests (76 unit + 41
+Status: v0.2.7 working. ~10500 lines of Rust, 134 tests (89 unit + 45
 end-to-end smoke), clippy/fmt clean, English UI. Verified on Linux with gcc
 16.1.1 and clang 22.1.6. CI exercises the default macOS compiler and two
 Windows driver dialects (a GNU-style driver and MSVC); see
@@ -25,6 +25,7 @@ Windows driver dialects (a GNU-style driver and MSVC); see
 | `tests/smoke.rs` | end-to-end tests driving the real binary and compiler |
 | `proc.rs` | child deadlines, output capture, request-driven stdin tape transport and timeout-path process-tree cleanup |
 | `magic.rs` | `%` commands, numbered-input lookup and optional `clang-format` presentation |
+| `std_index.rs` | curated ISO C89–C23 identifier-to-header and availability metadata for `%where` |
 | `codegen.rs` | program assembly, shadowing/replacement variants, `_Generic` runtimes |
 | `session.rs` | session state, in-memory stdin tape, shadowing scopes, file-item replacement and completion vocabulary |
 | `ui.rs` | terminal styling, startup banner |
@@ -43,7 +44,8 @@ confirmation for a completed interactive `if`, `if`/`else` batch lookahead,
 control/do-while/preprocessor continuation, tab completion (magics, C keywords,
 retained session names), process-local Up/Down recall and numbered-input
 `%edit [n]`, `-e`/script/piped-input batch modes,
-`%help [--verbose] %quit %clear %reset %src %header %edit %type %bits %Bits %time %timeit %undo %cc %std`, deadlines and
+`%help [--verbose] %quit %clear %reset %src %header %edit %type %bits %Bits
+%utf8 %utf16 %utf32 %where %time %timeit %undo %cc %std`, deadlines and
 timeout-path tree cleanup for compiler/probe/user-program children, cached
 compiler capability probes, CI for 4 platform configs, and a tag-triggered release
 workflow.
@@ -228,6 +230,37 @@ effecting inputs are excluded, because the refinement replays the session an
 extra time. Output is bounded at `CS_ARRAY_LIMIT` elements per dimension, for
 struct members too.
 
+**UTF-8 presentation requires explicit source evidence.** C23's `char8_t`
+typedef is compatible with `unsigned char`, so `_Generic` cannot distinguish
+the spelling after normal conversions. `Session::is_explicit_utf8_array_expr`
+therefore recognizes only a complete `u8"..."` literal sequence or a bare
+identifier whose latest visible simple declaration spells a one-dimensional
+`char8_t` array. Shadowing by an ordinary byte-array declaration cancels the
+metadata, and pointers, multidimensional arrays and complex expressions stay
+on the numeric path. The specialized C probe copies at most
+`CS_ARRAY_LIMIT` raw bytes into the existing marker protocol; Rust parses the
+hex payload, removes at most one terminal zero for the text view, validates
+the complete UTF-8 sequence and escapes controls and bidirectional/invisible
+format characters. Invalid or truncated data falls back to the ordinary
+numeric array representation. This keeps all decoding away from
+locale-dependent C library functions and never silently substitutes U+FFFD.
+
+**Unicode pointer decoding is explicit and shares one probe.**
+`%utf8`/`%utf16`/`%utf32` pass an integer pointer or decayed array through
+`CS_PRINT_UNICODE`. `_Generic` selects the helper without evaluating its
+controlling expression, `sizeof(*(x))` checks the element width without
+evaluation, and the selected function receives `x` once. The default scan
+stops at NUL or 100 code units; `-n N` reads exactly `N`, including embedded
+zeros, with a 4096-unit ceiling. C uses `memcpy` into `uint16_t`/`uint32_t` so
+host endianness is handled without alignment or aliasing assumptions, then
+sends normalized code-unit integers, the address and termination status over
+`M_UNICODE`. Rust strictly decodes UTF-8, pairs UTF-16 surrogates and rejects
+non-scalar UTF-32 values before applying the same control/invisible-character
+escaping used by automatic UTF-8 arrays. No replacement character is
+invented. The command does not enter the replay journal or consume an input
+number. A bound limits work but cannot make an invalid pointer dereference
+defined; the separate child process contains a resulting crash.
+
 **`%type` is a portable `_Generic` query, not reflection.** C has no portable
 way to stringify an arbitrary type. The generated runtime therefore maps
 scalar types and pointers to scalar types to canonical names; the controlling
@@ -259,6 +292,20 @@ formats vary substantially.
 The two commands share the same probe and differ only in hexadecimal
 formatting: `%bits` uses lowercase, while the deliberately case-sensitive
 `%Bits` spelling uses uppercase digits and prefixes.
+
+**`%where` uses normative static metadata, not host-header discovery.**
+Scanning installed headers would make transitive includes and libc extensions
+look portable, and would make answers vary across Linux, macOS and Windows.
+`std_index.rs` instead records a curated set of commonly queried public
+identifiers from ISO C89 through C23, including introduction/removal revisions
+and identifiers intentionally exposed by more than one standard header such as
+the `<math.h>`/`<tgmath.h>` names. The selected compiler mode is reported only
+as an availability interpretation; it never rewrites the standard answer.
+POSIX, implementation extensions, user declarations and the optional
+bounds-checking annex stay outside the index.
+Host `man 3` pages are useful supporting evidence for local declarations,
+feature-test macros and warnings (notably the deprecation and C11 removal of
+`gets`), but are not the source of header ownership.
 
 **Diagnostics must be remapped.** The compiler sees a generated file with a
 prelude and all earlier inputs above the new text; its line numbers are
@@ -400,7 +447,9 @@ References: [crepl](https://l-m.dev/cs/crepl/)
 
 - **Limited introspection commands**: `%type` covers scalar expressions and
   session-visible named aggregate categories, and `%bits`/`%Bits` cover scalar
-  object representations, but `%layout` (struct
+  object representations. The Unicode magics explicitly decode code-unit
+  pointers/arrays, and `%where` covers portable ISO C header ownership and
+  availability from a static index, but `%layout` (struct
   offsets/padding), `%expand` (preprocessor-only view of a macro), `%asm`,
   exact anonymous-aggregate/type-alias reflection and multi-compiler
   comparison remain open. These, not the REPL loop, are what would set the
@@ -617,6 +666,13 @@ that must cost at most two reader threads, not the REPL. The group is only kille
 timeout path while the group leader is still represented by the unreaped
 `Child`, so its PID cannot yet be recycled; killing after reaping could target
 an unrelated process group.
+
+**The timeit clock must compile in strict ISO modes without changing feature
+macros.** When `CLOCK_MONOTONIC` is visible the runtime uses
+`clock_gettime`; strict glibc modes hide that POSIX API, so the generated code
+falls back to C11 `timespec_get(TIME_UTC)`. Defining `_POSIX_C_SOURCE` in the
+generated preamble would make the timer available but also change the libc
+surface observed by user code. Windows retains its `clock()` path.
 
 **Live output filtering must work across arbitrary pipe chunks** (`eval.rs`,
 `LiveFilter`). Replay output before `M_NEW`, value bytes after `M_VAL`, and

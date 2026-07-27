@@ -142,6 +142,152 @@ pub fn identifiers(src: &str) -> Vec<String> {
     out
 }
 
+/// Return the identifier when the complete input is one plain identifier.
+pub fn plain_identifier(src: &str) -> Option<&str> {
+    let text = src.trim();
+    let mut bytes = text.bytes();
+    let first = bytes.next()?;
+    if first != b'_' && !first.is_ascii_alphabetic() {
+        return None;
+    }
+    bytes
+        .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+        .then_some(text)
+}
+
+/// Whether the complete expression is one or more adjacent `u8"..."` string
+/// literal tokens. This deliberately stays conservative: casts, subscripts
+/// and concatenation with differently-prefixed literals are not guessed.
+pub fn is_explicit_u8_string(src: &str) -> bool {
+    let bytes = src.as_bytes();
+    let mut i = 0usize;
+    let mut found = false;
+    loop {
+        while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        if i == bytes.len() {
+            return found;
+        }
+        if bytes.get(i..i + 3) != Some(b"u8\"") {
+            return false;
+        }
+        found = true;
+        i += 3;
+        let mut closed = false;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => i = (i + 2).min(bytes.len()),
+                b'"' => {
+                    i += 1;
+                    closed = true;
+                    break;
+                }
+                _ => i += 1,
+            }
+        }
+        if !closed {
+            return false;
+        }
+    }
+}
+
+/// If `src` is a simple declaration of `wanted`, report whether it explicitly
+/// declares a one-dimensional `char8_t` array.
+///
+/// `Some(false)` is important: a later declaration of another type shadows an
+/// earlier UTF-8 binding. Complex declarators are intentionally left as
+/// `None`; this is source-spelling metadata, not a replacement C parser.
+pub fn explicit_utf8_array_declaration(src: &str, wanted: &str) -> Option<bool> {
+    plain_identifier(wanted)?;
+    let scan = scan(src);
+    let bytes = src.as_bytes();
+    let mut i = 0usize;
+    let (mut parens, mut brackets, mut braces) = (0usize, 0usize, 0usize);
+    let mut prefix_identifiers = Vec::new();
+    let mut allowed_prefix_punctuation = true;
+    let mut saw_top_level_equal = false;
+
+    while i < bytes.len() {
+        if !scan.code[i] || bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let at_top = parens == 0 && brackets == 0 && braces == 0;
+        match bytes[i] {
+            b'(' => parens += 1,
+            b')' => parens = parens.saturating_sub(1),
+            b'[' => brackets += 1,
+            b']' => brackets = brackets.saturating_sub(1),
+            b'{' => braces += 1,
+            b'}' => braces = braces.saturating_sub(1),
+            b'=' if at_top => saw_top_level_equal = true,
+            b';' if at_top => return None,
+            b'*' if at_top => {}
+            c if at_top && (c == b'_' || c.is_ascii_alphabetic()) => {
+                let start = i;
+                i += 1;
+                while i < bytes.len()
+                    && scan.code[i]
+                    && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric())
+                {
+                    i += 1;
+                }
+                let word = &src[start..i];
+                if word != wanted {
+                    prefix_identifiers.push(word);
+                    continue;
+                }
+                if saw_top_level_equal
+                    || prefix_identifiers.is_empty()
+                    || prefix_identifiers.contains(&"typedef")
+                    || !allowed_prefix_punctuation
+                {
+                    return None;
+                }
+                let mut next = i;
+                while next < bytes.len() && (!scan.code[next] || bytes[next].is_ascii_whitespace())
+                {
+                    next += 1;
+                }
+                if bytes.get(next) != Some(&b'[') {
+                    return Some(false);
+                }
+
+                // Only one-dimensional arrays receive the text preview. A
+                // matrix needs row-aware presentation rather than flattening.
+                let mut depth = 0usize;
+                while next < bytes.len() {
+                    if scan.code[next] {
+                        match bytes[next] {
+                            b'[' => depth += 1,
+                            b']' => {
+                                depth = depth.saturating_sub(1);
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    next += 1;
+                }
+                next += 1;
+                while next < bytes.len() && (!scan.code[next] || bytes[next].is_ascii_whitespace())
+                {
+                    next += 1;
+                }
+                let second_dimension = bytes.get(next) == Some(&b'[');
+                return Some(!second_dimension && prefix_identifiers.contains(&"char8_t"));
+            }
+            _ if at_top => allowed_prefix_punctuation = false,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Nothing but whitespace and comments — legal to type, nothing to run.
 pub fn is_blank(src: &str) -> bool {
     let sc = scan(src);
@@ -418,6 +564,43 @@ mod tests {
         );
         assert_eq!(identifiers("puts(\"not_this\")"), vec!["puts"]);
         assert!(identifiers("42 + 0x1F").is_empty());
+    }
+
+    #[test]
+    fn recognizes_only_explicit_simple_utf8_array_sources() {
+        assert_eq!(plain_identifier("  SMILEY_FACE "), Some("SMILEY_FACE"));
+        assert!(plain_identifier("SMILEY_FACE[0]").is_none());
+        assert!(is_explicit_u8_string(r#"u8"hello""#));
+        assert!(is_explicit_u8_string(r#" u8"a"  u8"b" "#));
+        assert!(!is_explicit_u8_string(r#""hello""#));
+        assert!(!is_explicit_u8_string(r#"u8"unterminated"#));
+
+        assert_eq!(
+            explicit_utf8_array_declaration(
+                r#"constexpr char8_t SMILEY_FACE[] = u8"hello";"#,
+                "SMILEY_FACE"
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            explicit_utf8_array_declaration(
+                "const unsigned char SMILEY_FACE[] = { 1, 2, 0 };",
+                "SMILEY_FACE"
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            explicit_utf8_array_declaration("char8_t *SMILEY_FACE;", "SMILEY_FACE"),
+            Some(false)
+        );
+        assert_eq!(
+            explicit_utf8_array_declaration("char8_t SMILEY_FACE[2][4];", "SMILEY_FACE"),
+            Some(false)
+        );
+        assert_eq!(
+            explicit_utf8_array_declaration("sum += SMILEY_FACE[0];", "SMILEY_FACE"),
+            None
+        );
     }
 
     #[test]

@@ -121,6 +121,99 @@ fn prints_floating_point_and_bool() {
 }
 
 #[test]
+fn explicit_u8_literals_get_a_safe_utf8_preview_only() {
+    let out = run(&[
+        r#"u8"\xF0\x9F\x99\x82""#,
+        r#"u8"\xff""#,
+        "unsigned char bytes[] = { 240, 159, 153, 130, 0 };",
+        "bytes",
+    ]);
+    assert!(
+        out.contains("Out[1]: u8\"🙂\"\ncode units: {0xf0, 0x9f, 0x99, 0x82, 0x00}"),
+        "valid explicit UTF-8 literal was not rendered as text:\n{out}"
+    );
+    assert!(
+        out.contains("Out[2]: {255, 0}"),
+        "invalid UTF-8 must fall back to numeric code units:\n{out}"
+    );
+    assert!(
+        out.contains("Out[4]: {240, 159, 153, 130, 0}"),
+        "ordinary unsigned char array must stay numeric:\n{out}"
+    );
+    assert_eq!(
+        out.matches("u8\"🙂\"").count(),
+        1,
+        "numeric byte array was also treated as explicit UTF-8:\n{out}"
+    );
+}
+
+#[test]
+fn unicode_magics_decode_explicit_code_units_without_changing_session() {
+    let out = run(&[
+        "int untouched = 0;",
+        r#"%utf8 ((++untouched == 1) ? u8"A\xE5\xA5\xBD\xF0\x9F\x98\x80" : u8"twice")"#,
+        r#"%utf16 u"A\u597D\U0001F600""#,
+        r#"%utf32 U"A\u597D\U0001F600""#,
+        "%utf8 -n 3 (const unsigned char[]){0x41, 0, 0x42}",
+        "%utf16 (const unsigned short[]){0xd800, 0}",
+        "%utf32 (const unsigned int[]){0x110000, 0}",
+        "%utf8 (const unsigned int[]){0x41, 0}",
+        "%utf8 42",
+        r#"%utf8 -n 4097 u8"x""#,
+        "untouched",
+    ]);
+    assert!(
+        out.contains("text: u8\"A好😀\"")
+            && out.contains("code units: {0x41, 0xe5, 0xa5, 0xbd, 0xf0, 0x9f, 0x98, 0x80, 0x00}"),
+        "UTF-8 magic failed:\n{out}"
+    );
+    assert!(
+        out.contains("text: u\"A好😀\"") && out.contains("0x0041, 0x597d, 0xd83d, 0xde00, 0x0000"),
+        "UTF-16 magic failed:\n{out}"
+    );
+    assert!(
+        out.contains("text: U\"A好😀\"")
+            && out.contains("0x00000041, 0x0000597d, 0x0001f600, 0x00000000"),
+        "UTF-32 magic failed:\n{out}"
+    );
+    assert!(
+        out.contains("text: u8\"A\\0B\""),
+        "-n did not preserve an embedded NUL:\n{out}"
+    );
+    assert!(
+        out.contains("unpaired UTF-16 high surrogate at index 0")
+            && out.contains("invalid UTF-32 scalar value at index 0"),
+        "invalid Unicode was silently replaced:\n{out}"
+    );
+    assert!(
+        out.contains("expected 1-byte code units")
+            && out.contains("%utf8 supports pointers and arrays of integer code-unit types")
+            && out.contains("-n is limited to 4096 code units"),
+        "Unicode magic error paths were not actionable:\n{out}"
+    );
+    assert!(
+        out.contains("Out[2]: 0"),
+        "Unicode magic evaluated more than once, retained its expression, or consumed an input number:\n{out}"
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn strict_iso_mode_keeps_the_runtime_timer_available() {
+    let out = Command::new(env!("CARGO_BIN_EXE_c-shell"))
+        .args(["--no-color", "--std", "c11", "-e", "1"])
+        .output()
+        .expect("run c-shell in strict C11 mode");
+    assert!(
+        out.status.success(),
+        "strict ISO mode broke generated runtime:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1");
+}
+
+#[test]
 fn complete_main_definition_gets_actionable_guidance() {
     let out = run(&[
         "int main(void) { printf(\"hello-main\\n\"); return 0; }",
@@ -628,6 +721,57 @@ fn bits_magic_inspects_object_representations_and_evaluates_once() {
 }
 
 #[test]
+fn where_magic_uses_the_iso_index_without_consuming_input_number() {
+    let out = run(&[
+        "int marker = 7;",
+        "%where printf",
+        "%where sqrt",
+        "%where gets",
+        "%where ckd_add",
+        "%where getline",
+        "%where",
+        "marker",
+    ])
+    .replace("\r\n", "\n");
+    assert!(
+        out.contains("name: printf")
+            && out.contains("header: <stdio.h>")
+            && out.contains("signature: int printf("),
+        "stdio lookup missing:\n{out}"
+    );
+    assert!(
+        out.contains("name: sqrt")
+            && out.contains("headers: <math.h>, <tgmath.h>")
+            && out.contains("kind: function / type-generic macro"),
+        "multi-header lookup missing:\n{out}"
+    );
+    assert!(
+        out.contains("name: gets")
+            && out.contains("removed in C11")
+            && out.contains("note: deprecated;"),
+        "removed/deprecated metadata missing:\n{out}"
+    );
+    assert!(
+        out.contains("name: ckd_add")
+            && out.contains("header: <stdckdint.h>")
+            && out.contains("ISO C availability: C23 and later"),
+        "C23 lookup missing:\n{out}"
+    );
+    assert!(
+        out.contains("getline was not found in c-shell's ISO C standard library index"),
+        "POSIX identifier was not excluded:\n{out}"
+    );
+    assert!(
+        out.contains("usage: %where <identifier>"),
+        "bare %where did not show usage:\n{out}"
+    );
+    assert!(
+        out.contains("Out[2]: 7"),
+        "%where changed session state or consumed an input number:\n{out}"
+    );
+}
+
+#[test]
 fn src_defaults_to_user_view_and_raw_keeps_scaffolding() {
     let user = run(&["int source_value = 7;", "%src"]);
     assert!(user.contains("int main(void)"), "main missing:\n{user}");
@@ -838,6 +982,16 @@ fn help_lists_commands_and_keeps_usage_notes_behind_verbose() {
     assert!(
         plain.contains("Commands:"),
         "missing Commands list:
+{plain}"
+    );
+    assert!(
+        plain.contains("%where <identifier>"),
+        "missing %where command:
+{plain}"
+    );
+    assert!(
+        plain.contains("%utf8/%utf16/%utf32"),
+        "missing Unicode commands:
 {plain}"
     );
     assert!(

@@ -194,6 +194,28 @@ impl Session {
         self.external_replay_warning_shown = true;
     }
 
+    /// Whether an expression has unambiguous UTF-8 source spelling.
+    ///
+    /// C23 makes `char8_t` the same type as `unsigned char`, so the generated
+    /// C program cannot recover the typedef spelling through `_Generic`.
+    /// Retained declarations are searched from the innermost/latest binding
+    /// back to file scope; a later declaration of another type stops the
+    /// search and prevents a stale UTF-8 classification.
+    pub fn is_explicit_utf8_array_expr(&self, expression: &str) -> bool {
+        if lex::is_explicit_u8_string(expression) {
+            return true;
+        }
+        let Some(name) = lex::plain_identifier(expression) else {
+            return false;
+        };
+        for source in self.stmts.iter().rev().chain(self.file_items.iter().rev()) {
+            if let Some(is_utf8) = lex::explicit_utf8_array_declaration(source, name) {
+                return is_utf8;
+            }
+        }
+        false
+    }
+
     /// Every identifier the session mentions, deduplicated and sorted —
     /// the completion vocabulary. Single letters are omitted: offering `x`
     /// as a completion of `x` helps nobody.
@@ -272,5 +294,19 @@ mod tests {
         session.replace_file(0, "int f(void) { return 2; }");
         assert_eq!(session.undo().as_deref(), Some("int f(void) { return 2; }"));
         assert_eq!(session.file_items[0], "int f(void) { return 1; }");
+    }
+
+    #[test]
+    fn explicit_utf8_binding_respects_shadowing_and_undo() {
+        let mut session = Session::default();
+        session.commit(r#"constexpr char8_t text[] = u8"hello";"#, Slot::Stmt);
+        assert!(session.is_explicit_utf8_array_expr("text"));
+        assert!(session.is_explicit_utf8_array_expr(r#"u8"direct""#));
+        assert!(!session.is_explicit_utf8_array_expr("text + 1"));
+
+        session.commit_scoped("unsigned char text[] = { 1, 2, 0 };");
+        assert!(!session.is_explicit_utf8_array_expr("text"));
+        session.undo();
+        assert!(session.is_explicit_utf8_array_expr("text"));
     }
 }

@@ -10,7 +10,9 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-use crate::codegen::{self, M_DONE, M_NEW, M_STDIN, M_VAL, MAX_ARRAY_DEPTH, Slot, UNPRINTABLE};
+use crate::codegen::{
+    self, M_DONE, M_NEW, M_STDIN, M_UNICODE, M_UTF8, M_VAL, MAX_ARRAY_DEPTH, Slot, UNPRINTABLE,
+};
 use crate::errmap;
 use crate::lex;
 use crate::proc;
@@ -53,6 +55,43 @@ pub enum Eval {
     Done(Outcome),
     /// Nothing compiled; the text is already remapped to input-relative lines.
     CompileError(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnicodeEncoding {
+    Utf8,
+    Utf16,
+    Utf32,
+}
+
+impl UnicodeEncoding {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Utf8 => "UTF-8",
+            Self::Utf16 => "UTF-16",
+            Self::Utf32 => "UTF-32",
+        }
+    }
+
+    fn literal_prefix(self) -> &'static str {
+        match self {
+            Self::Utf8 => "u8",
+            Self::Utf16 => "u",
+            Self::Utf32 => "U",
+        }
+    }
+
+    fn unit_width(self) -> usize {
+        match self {
+            Self::Utf8 => 1,
+            Self::Utf16 => 2,
+            Self::Utf32 => 4,
+        }
+    }
+
+    fn hex_digits(self) -> usize {
+        self.unit_width() * 2
+    }
 }
 
 pub struct Evaluator {
@@ -153,6 +192,39 @@ impl Evaluator {
     pub fn bits_of(&self, session: &Session, input: &str, uppercase: bool) -> Result<Eval> {
         let prog = codegen::build_bits_probe(session, input, uppercase);
         self.run_probe(session, prog)
+    }
+
+    /// Explicitly interpret an integer pointer/array as Unicode code units.
+    /// `_Generic` and `sizeof` inspect the expression without evaluating it;
+    /// the selected helper receives the pointer exactly once.
+    pub fn unicode_of(
+        &self,
+        session: &Session,
+        input: &str,
+        encoding: UnicodeEncoding,
+        count: Option<usize>,
+    ) -> Result<Eval> {
+        const DEFAULT_LIMIT: usize = 100;
+
+        let limit = count.unwrap_or(DEFAULT_LIMIT);
+        let prog = codegen::build_unicode_probe(
+            session,
+            input,
+            encoding.unit_width(),
+            limit,
+            count.is_some(),
+        );
+        let mut result = self.run_probe(session, prog)?;
+        if let Eval::Done(outcome) = &mut result
+            && outcome.abnormal.is_none()
+            && let Some(rendered) = outcome
+                .value
+                .as_deref()
+                .and_then(|value| render_unicode_payload(value, encoding, limit))
+        {
+            outcome.value = Some(rendered);
+        }
+        Ok(result)
     }
 
     fn run_probe(&self, session: &Session, prog: codegen::Program) -> Result<Eval> {
@@ -346,6 +418,16 @@ impl Evaluator {
         // Re-running the whole session must stay free of consequences.
         if !addressed || lex::may_have_side_effects(input) {
             return Ok(outcome);
+        }
+
+        if session.is_explicit_utf8_array_expr(input) {
+            let prog = codegen::build_utf8_array_expr(session, input);
+            if let Ok(mut candidate) = self.try_program(prog, Slot::Expr, session.stdin_tape())?
+                && let Some(rendered) = candidate.value.as_deref().and_then(render_utf8_payload)
+            {
+                candidate.value = Some(rendered);
+                return Ok(candidate);
+            }
         }
 
         let mut best = outcome;
@@ -634,6 +716,214 @@ impl Evaluator {
             unprintable: false,
             duration: last_outcome.duration,
         }))
+    }
+}
+
+fn render_utf8_payload(value: &str) -> Option<String> {
+    const LIMIT: usize = 100;
+
+    let payload = value.strip_prefix(M_UTF8)?;
+    let (size, hex) = payload.split_once(':')?;
+    let size = size.parse::<usize>().ok()?;
+    if hex.len() % 2 != 0 || hex.len() / 2 != size.min(LIMIT) {
+        return None;
+    }
+    let bytes = hex
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let text = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(text, 16).ok()
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    if size > LIMIT {
+        return Some(render_byte_array(&bytes, size));
+    }
+    let text_bytes = bytes.strip_suffix(&[0]).unwrap_or(bytes.as_slice());
+    let Ok(text) = std::str::from_utf8(text_bytes) else {
+        return Some(render_byte_array(&bytes, size));
+    };
+
+    let escaped = text.chars().map(escape_utf8_char).collect::<String>();
+    let code_units = bytes
+        .iter()
+        .map(|byte| format!("0x{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("u8\"{escaped}\"\ncode units: {{{code_units}}}"))
+}
+
+fn render_unicode_payload(value: &str, encoding: UnicodeEncoding, limit: usize) -> Option<String> {
+    let payload = value.strip_prefix(M_UNICODE)?;
+    let mut fields = payload.split(':');
+    let actual_width = fields.next()?.parse::<usize>().ok()?;
+    let address = fields.next()?;
+    let encoded_units = fields.next()?;
+    let status = fields.next()?;
+    let count = fields.next()?.parse::<usize>().ok()?;
+    if fields.next().is_some()
+        || address.is_empty()
+        || !address.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !matches!(status, "N" | "M" | "T" | "L" | "E")
+    {
+        return None;
+    }
+
+    let units = if encoded_units.is_empty() {
+        Vec::new()
+    } else {
+        encoded_units
+            .split(',')
+            .map(|unit| {
+                (unit.len() == 8)
+                    .then(|| u32::from_str_radix(unit, 16).ok())
+                    .flatten()
+            })
+            .collect::<Option<Vec<_>>>()?
+    };
+    if count != units.len() || matches!(status, "N" | "M") && count != 0 {
+        return None;
+    }
+
+    let mut lines = vec![format!("encoding: {}", encoding.label())];
+    if status == "N" {
+        lines.push("address: NULL".to_string());
+        return Some(lines.join("\n"));
+    }
+
+    lines.push(format!("address: 0x{address}"));
+    if status == "M" {
+        lines.push(format!(
+            "error: expected {}-byte code units, but the expression points to {actual_width}-byte elements",
+            encoding.unit_width()
+        ));
+        return Some(lines.join("\n"));
+    }
+    if actual_width != encoding.unit_width() {
+        return None;
+    }
+
+    let text_units = units.strip_suffix(&[0]).unwrap_or(units.as_slice());
+    let text_label = if status == "L" { "text prefix" } else { "text" };
+    match decode_unicode(text_units, encoding) {
+        Ok(text) => {
+            let escaped = text.chars().map(escape_utf8_char).collect::<String>();
+            lines.push(format!(
+                "{text_label}: {}\"{escaped}\"",
+                encoding.literal_prefix()
+            ));
+        }
+        Err(error) => lines.push(format!("{text_label}: <{error}>")),
+    }
+
+    let code_units = units
+        .iter()
+        .map(|unit| format!("0x{unit:0width$x}", width = encoding.hex_digits()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    lines.push(format!("code units: {{{code_units}}}"));
+    if status == "L" {
+        lines.push(format!(
+            "note: no NUL terminator in the first {limit} code units"
+        ));
+    }
+    Some(lines.join("\n"))
+}
+
+fn decode_unicode(units: &[u32], encoding: UnicodeEncoding) -> std::result::Result<String, String> {
+    match encoding {
+        UnicodeEncoding::Utf8 => {
+            let bytes = units
+                .iter()
+                .enumerate()
+                .map(|(index, &unit)| {
+                    u8::try_from(unit)
+                        .map_err(|_| format!("invalid UTF-8 code unit at index {index}"))
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            std::str::from_utf8(&bytes)
+                .map(str::to_string)
+                .map_err(|error| {
+                    format!(
+                        "invalid UTF-8 sequence at code unit {}",
+                        error.valid_up_to()
+                    )
+                })
+        }
+        UnicodeEncoding::Utf16 => decode_utf16(units),
+        UnicodeEncoding::Utf32 => units
+            .iter()
+            .enumerate()
+            .map(|(index, &unit)| {
+                char::from_u32(unit)
+                    .ok_or_else(|| format!("invalid UTF-32 scalar value at index {index}"))
+            })
+            .collect(),
+    }
+}
+
+fn decode_utf16(units: &[u32]) -> std::result::Result<String, String> {
+    let mut text = String::new();
+    let mut index = 0usize;
+    while index < units.len() {
+        let first = units[index];
+        if first > u16::MAX as u32 {
+            return Err(format!("invalid UTF-16 code unit at index {index}"));
+        }
+        if (0xd800..=0xdbff).contains(&first) {
+            let Some(&second) = units.get(index + 1) else {
+                return Err(format!("unpaired UTF-16 high surrogate at index {index}"));
+            };
+            if !(0xdc00..=0xdfff).contains(&second) {
+                return Err(format!("unpaired UTF-16 high surrogate at index {index}"));
+            }
+            let scalar = 0x10000 + ((first - 0xd800) << 10) + (second - 0xdc00);
+            text.push(char::from_u32(scalar).expect("paired surrogates form a scalar"));
+            index += 2;
+        } else if (0xdc00..=0xdfff).contains(&first) {
+            return Err(format!("unpaired UTF-16 low surrogate at index {index}"));
+        } else {
+            text.push(char::from_u32(first).expect("non-surrogate u16 is a scalar"));
+            index += 1;
+        }
+    }
+    Ok(text)
+}
+
+fn render_byte_array(bytes: &[u8], size: usize) -> String {
+    let mut elements = bytes.iter().map(u8::to_string).collect::<Vec<_>>();
+    if size > bytes.len() {
+        elements.push(format!("... ({} more)", size - bytes.len()));
+    }
+    format!("{{{}}}", elements.join(", "))
+}
+
+fn escape_utf8_char(character: char) -> String {
+    match character {
+        '"' => "\\\"".to_string(),
+        '\\' => "\\\\".to_string(),
+        '\0' => "\\0".to_string(),
+        '\n' => "\\n".to_string(),
+        '\r' => "\\r".to_string(),
+        '\t' => "\\t".to_string(),
+        character
+            if character.is_control()
+                || matches!(
+                    character,
+                    '\u{00ad}'
+                        | '\u{061c}'
+                        | '\u{200b}'..='\u{200f}'
+                        | '\u{2028}'..='\u{202e}'
+                        | '\u{2060}'..='\u{206f}'
+                        | '\u{feff}'
+                        | '\u{fff9}'..='\u{fffb}'
+                        | '\u{e0000}'..='\u{e007f}'
+                ) =>
+        {
+            format!("\\u{{{:x}}}", character as u32)
+        }
+        character => character.to_string(),
     }
 }
 
@@ -1366,6 +1656,92 @@ mod tests {
         assert_eq!(got.output, "printed");
         assert_eq!(got.value.as_deref(), Some("42"));
         assert!(got.done);
+    }
+
+    #[test]
+    fn renders_only_valid_complete_utf8_payloads_as_text() {
+        let smiley = format!("{M_UTF8}5:f09f998200");
+        assert_eq!(
+            render_utf8_payload(&smiley).as_deref(),
+            Some("u8\"🙂\"\ncode units: {0xf0, 0x9f, 0x99, 0x82, 0x00}")
+        );
+
+        let escaped = format!("{M_UTF8}8:61220a00e280ae00");
+        assert_eq!(
+            render_utf8_payload(&escaped).as_deref(),
+            Some(
+                "u8\"a\\\"\\n\\0\\u{202e}\"\ncode units: {0x61, 0x22, 0x0a, 0x00, 0xe2, 0x80, 0xae, 0x00}"
+            )
+        );
+
+        let invalid = format!("{M_UTF8}2:ff00");
+        assert_eq!(render_utf8_payload(&invalid).as_deref(), Some("{255, 0}"));
+        assert!(render_utf8_payload("not an internal payload").is_none());
+    }
+
+    #[test]
+    fn renders_utf8_utf16_and_utf32_probe_payloads_strictly() {
+        let utf8 = format!("{M_UNICODE}1:1234:00000041,000000e5,000000a5,000000bd,00000000:T:5");
+        assert_eq!(
+            render_unicode_payload(&utf8, UnicodeEncoding::Utf8, 100).as_deref(),
+            Some(
+                "encoding: UTF-8\naddress: 0x1234\ntext: u8\"A好\"\ncode units: {0x41, 0xe5, 0xa5, 0xbd, 0x00}"
+            )
+        );
+
+        let utf16 = format!("{M_UNICODE}2:abcd:00000041,0000597d,0000d83d,0000de00,00000000:T:5");
+        assert_eq!(
+            render_unicode_payload(&utf16, UnicodeEncoding::Utf16, 100).as_deref(),
+            Some(
+                "encoding: UTF-16\naddress: 0xabcd\ntext: u\"A好😀\"\ncode units: {0x0041, 0x597d, 0xd83d, 0xde00, 0x0000}"
+            )
+        );
+
+        let utf32 = format!("{M_UNICODE}4:beef:00000041,0001f600,00000000:E:3");
+        assert_eq!(
+            render_unicode_payload(&utf32, UnicodeEncoding::Utf32, 3).as_deref(),
+            Some(
+                "encoding: UTF-32\naddress: 0xbeef\ntext: U\"A😀\"\ncode units: {0x00000041, 0x0001f600, 0x00000000}"
+            )
+        );
+    }
+
+    #[test]
+    fn unicode_probe_reports_null_mismatch_invalid_and_unterminated_data() {
+        let null = format!("{M_UNICODE}1:0::N:0");
+        assert_eq!(
+            render_unicode_payload(&null, UnicodeEncoding::Utf8, 100).as_deref(),
+            Some("encoding: UTF-8\naddress: NULL")
+        );
+
+        let mismatch = format!("{M_UNICODE}4:1234::M:0");
+        assert_eq!(
+            render_unicode_payload(&mismatch, UnicodeEncoding::Utf16, 100).as_deref(),
+            Some(
+                "encoding: UTF-16\naddress: 0x1234\nerror: expected 2-byte code units, but the expression points to 4-byte elements"
+            )
+        );
+
+        let invalid16 = format!("{M_UNICODE}2:1234:0000d800,00000000:T:2");
+        assert!(
+            render_unicode_payload(&invalid16, UnicodeEncoding::Utf16, 100)
+                .unwrap()
+                .contains("unpaired UTF-16 high surrogate at index 0")
+        );
+        let invalid32 = format!("{M_UNICODE}4:1234:00110000,00000000:T:2");
+        assert!(
+            render_unicode_payload(&invalid32, UnicodeEncoding::Utf32, 100)
+                .unwrap()
+                .contains("invalid UTF-32 scalar value at index 0")
+        );
+
+        let limited = format!("{M_UNICODE}1:1234:00000041,00000042:L:2");
+        assert_eq!(
+            render_unicode_payload(&limited, UnicodeEncoding::Utf8, 2).as_deref(),
+            Some(
+                "encoding: UTF-8\naddress: 0x1234\ntext prefix: u8\"AB\"\ncode units: {0x41, 0x42}\nnote: no NUL terminator in the first 2 code units"
+            )
+        );
     }
 
     #[test]
