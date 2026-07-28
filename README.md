@@ -174,12 +174,14 @@ GCC nested-function warning: enter the statements from the body directly and
 omit the final `return`.
 
 Common headers (`stdio`, `stdlib`, `string`, `math`, `stdbool`, `stdint`,
-`inttypes`, `stddef`, `limits`, `ctype`, `stdarg`, `time`, `uchar`, `wchar`)
-are pre-included, so no `#include` is needed for the everyday library;
-`%header` lists them. Unix builds link `-lm`; Windows math functions come from
-the C runtime. GNU-style GCC/Clang drivers use `-Wall -Wextra`; MSVC-style
-`cl`/`clang-cl` drivers use `/W3`. The warning is often exactly the thing you
-came to check.
+`inttypes`, `stddef`, `limits`, `ctype`, `stdarg`, `time`, `wchar`) are
+pre-included, so no `#include` is needed for the everyday library. `uchar` is
+also pre-included when the compiler can confirm that the host C library
+provides it; some macOS SDKs omit that header. `%header` shows the exact
+guarded include block. Unix builds link `-lm`; Windows math functions come
+from the C runtime. GNU-style GCC/Clang drivers use `-Wall -Wextra`;
+MSVC-style `cl`/`clang-cl` drivers use `/W3`. The warning is often exactly the
+thing you came to check.
 
 ### Rebinding declarations and definitions
 

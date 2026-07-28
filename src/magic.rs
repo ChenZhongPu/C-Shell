@@ -187,9 +187,22 @@ fn is_c_identifier(text: &str) -> bool {
         && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
-fn auto_included(header: &str) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutoInclusion {
+    Always,
+    WhenAvailable,
+}
+
+fn auto_inclusion(header: &str) -> Option<AutoInclusion> {
     let include = format!("#include {header}");
-    codegen::HEADERS.lines().any(|line| line.trim() == include)
+    codegen::HEADERS
+        .lines()
+        .any(|line| line.trim() == include)
+        .then_some(if header == "<uchar.h>" {
+            AutoInclusion::WhenAvailable
+        } else {
+            AutoInclusion::Always
+        })
 }
 
 fn cppreference_header_url(header: &str) -> Option<String> {
@@ -311,15 +324,28 @@ fn render_where(name: &str, ev: &Evaluator, ui: &Ui) {
         }
     }
 
-    let included = headers
+    let always = headers
         .iter()
         .copied()
-        .filter(|header| auto_included(header))
+        .filter(|header| auto_inclusion(header) == Some(AutoInclusion::Always))
         .collect::<Vec<_>>();
-    if included.is_empty() {
+    let conditional = headers
+        .iter()
+        .copied()
+        .filter(|header| auto_inclusion(header) == Some(AutoInclusion::WhenAvailable))
+        .collect::<Vec<_>>();
+    if always.is_empty() && conditional.is_empty() {
         println!("auto-included by c-shell: no");
     } else {
-        println!("auto-included by c-shell: yes ({})", included.join(", "));
+        if !always.is_empty() {
+            println!("auto-included by c-shell: yes ({})", always.join(", "));
+        }
+        if !conditional.is_empty() {
+            println!(
+                "auto-included by c-shell when available: {}",
+                conditional.join(", ")
+            );
+        }
     }
     if let Some(note) = found.note {
         println!("note: {note}");
@@ -438,7 +464,7 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
         "header" | "headers" => {
             println!(
                 "{}",
-                ui.dim("Included in every program (no #include needed):")
+                ui.dim("Automatically included (optional headers are guarded):")
             );
             print!("{}", codegen::HEADERS);
         }
@@ -747,5 +773,15 @@ mod tests {
         );
         assert_eq!(cppreference_header_url("stdio.h"), None);
         assert_eq!(cppreference_header_url("<../stdio.h>"), None);
+    }
+
+    #[test]
+    fn reports_uchar_as_a_conditional_default_header() {
+        assert_eq!(
+            auto_inclusion("<uchar.h>"),
+            Some(AutoInclusion::WhenAvailable)
+        );
+        assert_eq!(auto_inclusion("<wchar.h>"), Some(AutoInclusion::Always));
+        assert_eq!(auto_inclusion("<tgmath.h>"), None);
     }
 }

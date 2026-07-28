@@ -44,7 +44,11 @@ pub const HEADERS: &str = "\
 #include <ctype.h>
 #include <stdarg.h>
 #include <time.h>
+#if defined(__has_include)
+#  if __has_include(<uchar.h>)
 #include <uchar.h>
+#  endif
+#endif
 #include <wchar.h>
 ";
 
@@ -1613,6 +1617,25 @@ fn escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uchar_is_guarded_for_c_libraries_that_do_not_ship_it() {
+        let condition = HEADERS
+            .find("#if defined(__has_include)")
+            .expect("optional-header guard");
+        let probe = HEADERS
+            .find("#  if __has_include(<uchar.h>)")
+            .expect("uchar availability probe");
+        let include = HEADERS
+            .find("#include <uchar.h>")
+            .expect("guarded uchar include");
+        let end = HEADERS[include..]
+            .find("#  endif")
+            .map(|offset| include + offset)
+            .expect("end of uchar availability branch");
+        assert!(condition < probe && probe < include && include < end);
+        assert!(HEADERS.contains("#include <wchar.h>"));
+    }
 
     #[test]
     fn finds_reusable_struct_and_union_type_spellings() {

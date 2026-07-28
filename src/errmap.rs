@@ -273,11 +273,34 @@ pub fn only_new(text: &str) -> String {
 /// message. A warning about an earlier input, on the other hand, has nothing
 /// to do with the error being reported and only buries it.
 pub fn drop_stale_warnings(text: &str) -> String {
-    filter_blocks(text, |header| {
+    let filtered = filter_blocks(text, |header| {
         // Both spellings: GNU/Clang `warning:` and MSVC `warning C4552:`.
         let is_warning = header.contains("warning:") || header.contains("warning C");
         header.starts_with("<input>:") || !is_warning
-    })
+    });
+    if !filtered.trim().is_empty() {
+        return filtered;
+    }
+
+    // Normally generated-runtime diagnostics are implementation details and
+    // disappear as expression/statement fallbacks are tried. A fatal error
+    // with no surviving user diagnostic is different: hiding it leaves an
+    // entirely blank result and makes every input appear to do nothing.
+    // Preserve only the compiler's reason, not generated line numbers or
+    // source excerpts.
+    text.lines()
+        .find_map(|line| {
+            line.starts_with("<generated>")
+                .then(|| line.split_once("fatal error").map(|(_, rest)| rest))
+                .flatten()
+        })
+        .map(|reason| {
+            format!(
+                "error: c-shell's generated C runtime failed to compile: fatal error{reason}\n\
+                 run %src --raw to inspect the generated program\n"
+            )
+        })
+        .unwrap_or(filtered)
 }
 
 /// Walk diagnostics block by block, keeping those whose anchored header line
@@ -470,6 +493,18 @@ mod tests {
         assert!(
             drop_stale_warnings(&mapped).is_empty(),
             "synthetic Clang semicolon diagnostic survived: {mapped}"
+        );
+    }
+
+    #[test]
+    fn fatal_generated_runtime_errors_never_become_blank() {
+        let raw = "<generated>:15:10: fatal error: 'uchar.h' file not found\n\
+                   15 | #include <uchar.h>\n\
+                      |          ^~~~~~~~~\n";
+        assert_eq!(
+            drop_stale_warnings(raw),
+            "error: c-shell's generated C runtime failed to compile: fatal error: 'uchar.h' file not found\n\
+             run %src --raw to inspect the generated program\n"
         );
     }
 
