@@ -497,7 +497,7 @@ mod windows {
         pub fn attach(child: &Child) -> io::Result<Self> {
             unsafe {
                 let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-                if handle == 0 {
+                if handle.is_null() {
                     return Err(io::Error::last_os_error());
                 }
 

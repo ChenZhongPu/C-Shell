@@ -601,7 +601,18 @@ static int cs_taped_scanf(const char *format, ...)
 #define scanf cs_taped_scanf
 
 static inline uint64_t cs_timeit_now_ns(void) {
-#if defined(CLOCK_MONOTONIC)
+#if defined(_WIN32)
+#if defined(TIME_UTC)
+    struct timespec ts;
+    if (timespec_get(&ts, TIME_UTC) != TIME_UTC)
+        return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#else
+    /* Legacy MinGW CRTs may expose neither C11 timespec_get nor a
+       clock_gettime that links without winpthreads. */
+    return (uint64_t)clock() * (1000000000ULL / CLOCKS_PER_SEC);
+#endif
+#elif defined(CLOCK_MONOTONIC)
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
         return 0;
