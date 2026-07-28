@@ -8,6 +8,19 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, MutexGuard};
+
+// Each case below drives a real REPL which in turn launches the C compiler
+// repeatedly. Running dozens of those process trees together can exhaust the
+// much smaller process budget of hosted macOS runners. Keep unit tests
+// parallel, but admit only one external-toolchain smoke session at a time.
+static TOOLCHAIN_GATE: Mutex<()> = Mutex::new(());
+
+fn toolchain_gate() -> MutexGuard<'static, ()> {
+    TOOLCHAIN_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Feed `lines` to c-shell on stdin, return everything it printed to stdout.
 fn run(lines: &[&str]) -> String {
@@ -15,6 +28,7 @@ fn run(lines: &[&str]) -> String {
 }
 
 fn run_with_timeout(secs: u32, lines: &[&str]) -> String {
+    let _gate = toolchain_gate();
     let mut child = Command::new(env!("CARGO_BIN_EXE_c-shell"))
         .arg("--no-color")
         .arg("--timeout")
@@ -42,6 +56,7 @@ fn run_with_timeout(secs: u32, lines: &[&str]) -> String {
 }
 
 fn run_evals_with_stdin(codes: &[&str], input: &str) -> std::process::Output {
+    let _gate = toolchain_gate();
     let mut command = Command::new(env!("CARGO_BIN_EXE_c-shell"));
     command.arg("--no-color");
     for code in codes {
@@ -60,6 +75,11 @@ fn run_evals_with_stdin(codes: &[&str], input: &str) -> std::process::Output {
         .write_all(input.as_bytes())
         .expect("write program stdin");
     child.wait_with_output().expect("wait for c-shell -e")
+}
+
+fn c_shell_output(mut command: Command) -> std::process::Output {
+    let _gate = toolchain_gate();
+    command.output().expect("run c-shell")
 }
 
 #[test]
@@ -202,10 +222,9 @@ fn unicode_magics_decode_explicit_code_units_without_changing_session() {
 #[cfg(not(windows))]
 #[test]
 fn strict_iso_mode_keeps_the_runtime_timer_available() {
-    let out = Command::new(env!("CARGO_BIN_EXE_c-shell"))
-        .args(["--no-color", "--std", "c11", "-e", "1"])
-        .output()
-        .expect("run c-shell in strict C11 mode");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_c-shell"));
+    command.args(["--no-color", "--std", "c11", "-e", "1"]);
+    let out = c_shell_output(command);
     assert!(
         out.status.success(),
         "strict ISO mode broke generated runtime:\nstdout:\n{}\nstderr:\n{}",
@@ -500,20 +519,18 @@ fn disguised_calls_commit_their_side_effects() {
 
 #[test]
 fn eval_flag_prints_bare_value_and_exits_clean() {
-    let out = Command::new(env!("CARGO_BIN_EXE_c-shell"))
-        .args(["-e", "1 + 1"])
-        .output()
-        .expect("run c-shell -e");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_c-shell"));
+    command.args(["-e", "1 + 1"]);
+    let out = c_shell_output(command);
     assert!(out.status.success());
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "2");
 }
 
 #[test]
 fn eval_flag_failure_sets_exit_code_and_uses_stderr() {
-    let out = Command::new(env!("CARGO_BIN_EXE_c-shell"))
-        .args(["-e", "no_such_variable"])
-        .output()
-        .expect("run c-shell -e");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_c-shell"));
+    command.args(["-e", "no_such_variable"]);
+    let out = c_shell_output(command);
     assert!(!out.status.success(), "failure must be visible to scripts");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("error"),
@@ -536,11 +553,9 @@ mul(6, 7)
 ",
     )
     .expect("write script");
-    let out = Command::new(env!("CARGO_BIN_EXE_c-shell"))
-        .arg("--script")
-        .arg(&path)
-        .output()
-        .expect("run c-shell --script");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_c-shell"));
+    command.arg("--script").arg(&path);
+    let out = c_shell_output(command);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -894,10 +909,9 @@ fn unsupported_value_category_is_explained_and_not_misclassified() {
 
 #[test]
 fn unsupported_explicit_standard_is_an_error() {
-    let out = Command::new(env!("CARGO_BIN_EXE_c-shell"))
-        .args(["--std", "definitely-not-a-c-standard", "-e", "1"])
-        .output()
-        .expect("run c-shell with invalid standard");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_c-shell"));
+    command.args(["--std", "definitely-not-a-c-standard", "-e", "1"]);
+    let out = c_shell_output(command);
     assert!(!out.status.success(), "invalid --std was silently ignored");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("does not support requested standard"),
