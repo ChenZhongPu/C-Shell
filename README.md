@@ -58,8 +58,8 @@ Out[5]: 1
 
 ## Highlights
 
-- **Your compiler, your answers.** GCC, Clang, MSVC, and tcc determine the
-  language rules, ABI behavior, warnings, and errors.
+- **Your compiler, your answers.** GNU GCC, LLVM Clang, Apple Clang, and MSVC
+  determine the language rules, ABI behavior, warnings, and errors.
 - **A stateful C session.** Declarations, statements, functions, and types
   remain available to later inputs without replacing C's normal scope rules.
 - **Interactive editing.** Syntax highlighting, completion, history, smart
@@ -90,9 +90,9 @@ change with compiler version, flags, surrounding code or another execution.
 
 ## Installation
 
-Requires a Rust toolchain to build and, at runtime, a C compiler compatible
-with one of the supported GNU/Clang or MSVC command-line dialects. GCC, Clang,
-MSVC and tcc are the built-in detection candidates.
+Requires a Rust toolchain to build and, at runtime, GNU GCC, LLVM Clang,
+Apple Clang, or MSVC. Other compilers are not part of the supported or tested
+compatibility surface.
 
 Install the published crate from crates.io:
 
@@ -107,8 +107,8 @@ cargo install --path .
 ```
 
 With `--cc`, only that compiler is tried. Otherwise startup checks `$CC`, then
-PATH (`cc`, `gcc`, `clang`, `tcc`; on Windows `gcc`, `clang`, `cc`,
-`clang-cl`, `cl`). `--cc` and `$CC` must name one executable or path, not a
+PATH (`cc`, `gcc`, `clang`; on Windows `gcc`, `clang`, `cc`, `clang-cl`,
+`cl`). `--cc` and `$CC` must name one executable or path, not a
 shell command containing flags. The first candidate that passes every check
 wins. Capabilities are probed by trial compilation, never derived from version
 strings — executable names can be aliases, and distros backport features. For
@@ -222,13 +222,7 @@ Out[4]: 9
 The old item is replaced at its original position to preserve declaration
 order. A function-shaped input is never retried inside `main`; this prevents
 GCC nested-function extensions from creating a session that Clang or MSVC
-interprets differently.
-
-Both forms are recorded in the session journal. `%undo` reverses the most
-recent retained state change, including an appended statement, a newly opened
-shadowing scope, or a file-scope replacement. Failed inputs and pure value
-queries do not change retained state and therefore create nothing to undo.
-`%reset` clears the complete session.
+interprets differently. `%reset` clears the complete session.
 
 ### Commands
 
@@ -238,7 +232,7 @@ queries do not change retained state and therefore create nothing to undo.
 %help      %quit      %clear     %reset     %edit [n]
 %src       %header    %where     %type      %bits/%Bits
 %utf8      %utf16     %utf32     %time      %timeit
-%undo      %cc        %std
+%cc        %std
 ```
 
 `%help` lists the commands and nothing else, so it stays a one-screen
@@ -246,12 +240,13 @@ reference. `%help --verbose` appends the usage notes: which inputs are
 retained, how continuation and rebinding behave, what the value printer and
 `%type` and `%bits`/`%Bits` cover, and how the `scanf` tape replays.
 
+`%time` executes the specified input once and measures only that input inside
+the generated C process; compilation, process startup and retained-session
+replay are excluded. `%timeit` follows the IPython model: it automatically
+selects a loop count and reports statistics from multiple runs.
+
 `%clear` erases the terminal display and returns the cursor to the top without
 changing variables, retained C code or the input counter.
-
-`%undo` reverses the most recent retained state change. It does not rewind the
-visible `In[n]` counter or remove failed and forgotten pure inputs from the
-numbered `%edit` archive.
 
 Direct `u8"..."` literals and bare identifiers explicitly declared as
 one-dimensional `char8_t` arrays receive a validated UTF-8 preview:
@@ -463,7 +458,7 @@ file. The separate current-session input archive exists only for direct
 ## How it works
 
 c-shell works by reassembling your session and passing complete C files to your
-real host compiler (`gcc`, `clang`, `cl`, or `tcc`).
+real host compiler (GNU GCC, LLVM/Apple Clang, or MSVC).
 
 For full technical details on accumulation and replay, the `scanf` stdin tape,
 `_Generic` value printers, diagnostic remapping, and capability caching, see

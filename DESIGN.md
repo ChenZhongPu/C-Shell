@@ -4,7 +4,7 @@ Settled architecture decisions, the one big open problem, and the traps buried
 in the code that you must know about before changing it. README is for users;
 this file is for whoever develops the tool next.
 
-Status: v0.2.7 working. ~10500 lines of Rust, 134 tests (89 unit + 45
+Status: v0.2.7 working. ~10500 lines of Rust, 140 tests (95 unit + 45
 end-to-end smoke), clippy/fmt clean, English UI. Verified on Linux with gcc
 16.1.1 and clang 22.1.6. CI exercises the default macOS compiler and two
 Windows driver dialects (a GNU-style driver and MSVC); see
@@ -45,7 +45,7 @@ control/do-while/preprocessor continuation, tab completion (magics, C keywords,
 retained session names), process-local Up/Down recall and numbered-input
 `%edit [n]`, `-e`/script/piped-input batch modes,
 `%help [--verbose] %quit %clear %reset %src %header %edit %type %bits %Bits
-%utf8 %utf16 %utf32 %where %time %timeit %undo %cc %std`, deadlines and
+%utf8 %utf16 %utf32 %where %time %timeit %cc %std`, deadlines and
 timeout-path tree cleanup for compiler/probe/user-program children, cached
 compiler capability probes, CI for 4 platform configs, and a tag-triggered release
 workflow.
@@ -466,15 +466,12 @@ References: [crepl](https://l-m.dev/cs/crepl/)
   names per step would be the fix); ANSI colors on legacy conhost.
 - No session save/load. `Session` is not serializable yet; adding serde is
   straightforward.
-- **No way to remove a retained input short of `%reset`.** `%undo` existed
-  through 0.2.0 and was dropped: compiler-validated rebinding already covers
-  the common correction (redeclare, redefine), and a LIFO stack whose "last
-  change" need not be the last thing typed—pure expressions are forgotten—did
-  not match the `In[n]` the user sees. What is still uncovered is removing a
-  *specific* retained statement, which is what blocks a signature change while
-  an older call site survives. A targeted `%drop n` keyed on the input number
-  would fit the visible model better than undo did, at the cost of
-  reintroducing per-input change tracking in `session.rs`.
+- **No way to remove a retained input short of `%reset`.** Compiler-validated
+  rebinding covers the common correction (redeclare, redefine), but removing a
+  *specific* retained statement is still uncovered and can block a signature
+  change while an older call site survives. A targeted `%drop n` keyed on the
+  input number would fit the visible model, at the cost of adding per-input
+  change tracking in `session.rs`.
 - UI strings are English but scattered across `main.rs` / `magic.rs` /
   `eval.rs` / `toolchain.rs`; centralize before attempting i18n.
 - Highlight theme is hardcoded (`base16-ocean.dark`); poor on light terminals.
@@ -511,13 +508,12 @@ References: [crepl](https://l-m.dev/cs/crepl/)
   program is still running is lost. Piped input is unaffected, which is why
   the smoke tests never see it. Fix would mean patching or replacing the
   raw-mode toggle; noted, not urgent.
-- **Process-tree cleanup is timeout-path cleanup, not a sandbox.** On Unix a
-  process group is killed only when the direct child is still running at the
-  deadline. A detached child, or a child left behind by a parent that exits
-  successfully, can survive. Windows uses `taskkill /T`, which likewise
-  misses some orphans. Job Objects (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) are
-  the airtight Windows upgrade; Unix would also need an explicit policy for
-  descendants after normal parent exit.
+- **Process containment is not a sandbox.** On Unix each launched process
+  group is killed when its run ends; a child that explicitly calls `setsid`
+  can still escape. Windows assigns every run to a Job Object with
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so normal parent exit does not orphan
+  ordinary descendants. User code remains unsandboxed and runs with the
+  shell's permissions.
 
 ---
 
@@ -653,19 +649,20 @@ lines, so the clamp cannot mislabel foreign diagnostics.
 **Every compiler, capability probe, generated user program and optional
 `clang-format` process goes through the deadline-aware helpers in `proc`.**
 The module owns three subtleties that must not be unbundled: (1) the child
-gets its own Unix process group, and on timeout the *group* is killed —
+gets its own Unix process group, and when the run ends the *group* is killed —
 killing only the child leaves forked descendants running and, worse, holding
-the output pipe so the reader threads block forever; (2) when stdin is a
+the output pipe so the reader threads block forever; Windows uses a Job Object
+with the same lifetime; (2) when stdin is a
 real terminal the child's group must be handed the foreground
 (`tcsetpgrp`, both from `pre_exec` and the parent — the double set closes a
 race) or any tty read gets the program stopped by SIGTTIN, and SIGTTOU must
 be ignored before the parent can take the terminal back; (3) readers drain
 into shared buffers and are *abandoned* after a grace period, never joined
 unconditionally — a `setsid` escapee can hold both pipes open forever, and
-that must cost at most two reader threads, not the REPL. The group is only killed on the
-timeout path while the group leader is still represented by the unreaped
-`Child`, so its PID cannot yet be recycled; killing after reaping could target
-an unrelated process group.
+that must cost at most two reader threads, not the REPL. Unix observes normal
+exit with `waitid(..., WNOWAIT)`, kills the group while the leader remains
+unreaped, then collects its exit status; this avoids targeting a recycled
+process-group ID.
 
 **The timeit clock must compile in strict ISO modes without changing feature
 macros.** When `CLOCK_MONOTONIC` is visible the runtime uses

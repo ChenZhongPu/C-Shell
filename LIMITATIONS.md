@@ -25,7 +25,7 @@
 
 ## Platform & Process Management
 
-- **Timeout cleanup follows the launched process tree.** On Unix the process group is killed when the direct child times out, but a child that detaches or outlives a parent that exits successfully can escape cleanup. Windows `taskkill /T` has similar orphan limitations.
+- **Process cleanup follows the launched process tree.** On Unix, the process group is killed when each run ends; a child that explicitly creates a new session with `setsid` can still escape. On Windows, each run is contained in a Job Object that is closed when the run ends.
 - **No session save/load.** The input history is bounded (up to 1000 lines) within the current process memory/file session, but session state cannot be saved to a file or loaded across launches.
 - **`cl.exe` setup requirement.** MSVC `cl.exe` needs a configured build environment with `INCLUDE`/`LIB` environment variables set up (a Developer Command Prompt is standard).
 - **Windows testing status.** CI covers GNU-style and MSVC compiler drivers, but interactive behavior has not been extensively tested on real Windows installations. Feedback and bug reports are welcome.

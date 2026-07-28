@@ -367,7 +367,6 @@ const HELP: &str = "Commands:
   %where <identifier> find an ISO C library identifier's standard header
   %time <code...>    time the execution of a statement or expression once
   %timeit <code...>  benchmark a statement or expression over multiple loops
-  %undo              undo the most recent retained state change
   %cc [path]         show or switch the C compiler
   %std [std]         show or switch the language standard (c11/c17/c23);
                      %std default returns to the compiler's own default";
@@ -405,9 +404,11 @@ const HELP_NOTES: &str = "Notes:
   visibility. It also links each matching header to cppreference. POSIX,
   platform/compiler extensions and user names are excluded.
   %time evaluates an expression or statement once, displays its output/value,
-  and reports wall-clock execution time. Side effects are retained in session.
+  and times only that input inside C; compilation, process startup and retained
+  session replay are excluded. Side effects are retained in session.
   %timeit benchmarks an expression or statement in an auto-ranged loop over
-  multiple runs without modifying the session state.
+  multiple runs without modifying the session state. Inputs that may change
+  state warn because they execute repeatedly.
   Struct values use designated members; nested known structs and arrays
   expand, but pointer members are shown only as addresses or NULL. Use an
   explicit member expression (p.name) or dereference (*ptr) to drill down.
@@ -451,14 +452,6 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
         "reset" => {
             session.reset();
             println!("{}", ui.dim("session cleared"));
-        }
-
-        "undo" => {
-            if session.undo().is_some() {
-                println!("{}", ui.dim("undo successful"));
-            } else {
-                println!("{}", ui.err("nothing to undo"));
-            }
         }
 
         "header" | "headers" => {
@@ -565,7 +558,7 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
                 session.counter = n;
                 session.remember_input(n, tail);
 
-                match ev.eval(session, tail)? {
+                match ev.time(session, tail)? {
                     Eval::CompileError(diag) => println!("{}", ui.err(diag.trim_end())),
                     Eval::Done(o) => {
                         if o.streamed_output_needs_newline {
@@ -602,10 +595,17 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
                                 session.attach_stdin_events(o.stdin_events.clone());
                             }
                         }
-                        println!(
-                            "{}",
-                            ui.dim(&format!("Wall time: {}", format_duration(o.duration)))
-                        );
+                        if let Some(duration) = o.timed_duration {
+                            println!(
+                                "{}",
+                                ui.dim(&format!("Wall time: {}", format_duration(duration)))
+                            );
+                        } else {
+                            println!(
+                                "{}",
+                                ui.dim("Wall time: unavailable (input did not complete)")
+                            );
+                        }
                     }
                 }
             }
@@ -615,6 +615,14 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
             if tail.is_empty() {
                 println!("{}", ui.err("usage: %timeit <expression or statement>"));
             } else {
+                if session.may_have_side_effects(tail) {
+                    println!(
+                        "{}",
+                        ui.warn(
+                            "\"%timeit input\" may execute repeatedly and is not retained for replay; later evaluations do not include its C state changes"
+                        )
+                    );
+                }
                 match ev.timeit(session, tail)? {
                     Eval::CompileError(diag) => println!("{}", ui.err(diag.trim_end())),
                     Eval::Done(o) => {

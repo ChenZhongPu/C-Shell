@@ -4,22 +4,6 @@ use crate::codegen::Slot;
 use crate::lex;
 use crate::proc::StdinEvent;
 
-#[derive(Clone)]
-enum LogEntry {
-    AddedFile {
-        stdin_events: usize,
-    },
-    AddedStmt {
-        opened_scope: bool,
-        stdin_events: usize,
-    },
-    ReplacedFile {
-        index: usize,
-        previous: String,
-        stdin_events: usize,
-    },
-}
-
 #[derive(Default, Clone)]
 pub struct Session {
     /// `#include`s, `#define`s, function definitions, type definitions.
@@ -47,9 +31,6 @@ pub struct Session {
     /// The external-side-effect replay warning is intentionally once per
     /// session; `%reset` starts a fresh warning epoch.
     external_replay_warning_shown: bool,
-    /// How each accepted input changed the generated program, so `%undo` can
-    /// reverse appends, scope openings and file-scope replacements exactly.
-    log: Vec<LogEntry>,
 }
 
 impl Session {
@@ -62,7 +43,6 @@ impl Session {
         let stored = match slot {
             Slot::FileScope => {
                 self.file_items.push(text.to_string());
-                self.log.push(LogEntry::AddedFile { stdin_events: 0 });
                 return;
             }
             Slot::Stmt => text.to_string(),
@@ -75,10 +55,6 @@ impl Session {
         };
         self.stmts.push(indent(&stored));
         self.stmt_stdin_events.push(0);
-        self.log.push(LogEntry::AddedStmt {
-            opened_scope: false,
-            stdin_events: 0,
-        });
     }
 
     /// Record a declaration that compiled only after entering a nested block.
@@ -90,21 +66,12 @@ impl Session {
         self.stmts.push(indent(text));
         self.stmt_stdin_events.push(0);
         self.scope_depth += 1;
-        self.log.push(LogEntry::AddedStmt {
-            opened_scope: true,
-            stdin_events: 0,
-        });
     }
 
     /// Replace a compiler-selected file-scope item in place. Keeping its index
     /// preserves declaration order for older functions/types that refer to it.
     pub fn replace_file(&mut self, index: usize, text: &str) {
-        let previous = std::mem::replace(&mut self.file_items[index], text.to_string());
-        self.log.push(LogEntry::ReplacedFile {
-            index,
-            previous,
-            stdin_events: 0,
-        });
+        self.file_items[index] = text.to_string();
     }
 
     /// Attach fresh program-input lines to the state-changing input that was
@@ -115,18 +82,10 @@ impl Session {
             return;
         }
         let count = events.len();
-        match self.log.last_mut().expect("stdin input must change state") {
-            LogEntry::AddedStmt { stdin_events, .. } => {
-                *stdin_events += count;
-                *self
-                    .stmt_stdin_events
-                    .last_mut()
-                    .expect("statement stdin annotation") += count;
-            }
-            LogEntry::AddedFile { stdin_events } | LogEntry::ReplacedFile { stdin_events, .. } => {
-                *stdin_events += count;
-            }
-        }
+        *self
+            .stmt_stdin_events
+            .last_mut()
+            .expect("stdin input must change state") += count;
         self.stdin_tape.extend(events);
     }
 
@@ -136,39 +95,6 @@ impl Session {
 
     pub fn stmt_stdin_event_count(&self, index: usize) -> usize {
         self.stmt_stdin_events.get(index).copied().unwrap_or(0)
-    }
-
-    /// Drop the most recently accepted state-changing input, returning what
-    /// was removed. Pure queries and magic commands never enter this log.
-    pub fn undo(&mut self) -> Option<String> {
-        let (removed, stdin_events) = match self.log.pop()? {
-            LogEntry::AddedFile { stdin_events } => (self.file_items.pop(), stdin_events),
-            LogEntry::AddedStmt {
-                opened_scope,
-                stdin_events,
-            } => {
-                let removed = self.stmts.pop().map(|s| s.trim().to_string());
-                self.stmt_stdin_events.pop();
-                if opened_scope {
-                    let brace = self.stmts.pop();
-                    self.stmt_stdin_events.pop();
-                    debug_assert_eq!(brace.as_deref().map(str::trim), Some("{"));
-                    self.scope_depth = self.scope_depth.saturating_sub(1);
-                }
-                (removed, stdin_events)
-            }
-            LogEntry::ReplacedFile {
-                index,
-                previous,
-                stdin_events,
-            } => {
-                let removed = std::mem::replace(&mut self.file_items[index], previous);
-                (Some(removed), stdin_events)
-            }
-        };
-        self.stdin_tape
-            .truncate(self.stdin_tape.len().saturating_sub(stdin_events));
-        removed
     }
 
     pub fn remember_input(&mut self, number: usize, text: &str) {
@@ -188,6 +114,37 @@ impl Session {
 
     pub fn external_replay_warning_shown(&self) -> bool {
         self.external_replay_warning_shown
+    }
+
+    /// Whether source may affect state, treating retained functions whose
+    /// bodies only call other known-pure retained functions as pure.
+    pub fn may_have_side_effects(&self, source: &str) -> bool {
+        let functions = self
+            .file_items
+            .iter()
+            .filter_map(|item| lex::function_definition(item))
+            .collect::<Vec<_>>();
+        let mut pure = functions
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        loop {
+            let impure = functions
+                .iter()
+                .filter_map(|(name, body)| {
+                    lex::may_have_side_effects_with_pure_calls(body, |called| pure.contains(called))
+                        .then_some(*name)
+                })
+                .collect::<Vec<_>>();
+            let old_len = pure.len();
+            pure.retain(|name| !impure.contains(name));
+            if pure.len() == old_len {
+                break;
+            }
+        }
+
+        lex::may_have_side_effects_with_pure_calls(source, |called| pure.contains(called))
     }
 
     pub fn mark_external_replay_warning_shown(&mut self) {
@@ -237,7 +194,6 @@ impl Session {
         self.stmt_stdin_events.clear();
         self.stdin_tape.clear();
         self.scope_depth = 0;
-        self.log.clear();
         self.counter = 0;
         self.inputs.clear();
         self.external_replay_warning_shown = false;
@@ -270,34 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn undo_closes_a_shadowing_scope() {
-        let mut session = Session::default();
-        session.commit("int x = 1;", Slot::Stmt);
-        session.commit_scoped("int x = 2;");
-        session.attach_stdin_events(vec![StdinEvent {
-            bytes: b"2\n".to_vec(),
-            eof: false,
-        }]);
-        assert_eq!(session.stdin_tape().len(), 1);
-        assert_eq!(session.stmt_stdin_event_count(2), 1);
-        assert_eq!(session.scope_depth, 1);
-        assert_eq!(session.undo().as_deref(), Some("int x = 2;"));
-        assert_eq!(session.scope_depth, 0);
-        assert_eq!(session.stmts.len(), 1);
-        assert!(session.stdin_tape().is_empty());
-    }
-
-    #[test]
-    fn undo_restores_a_replaced_file_item() {
-        let mut session = Session::default();
-        session.commit("int f(void) { return 1; }", Slot::FileScope);
-        session.replace_file(0, "int f(void) { return 2; }");
-        assert_eq!(session.undo().as_deref(), Some("int f(void) { return 2; }"));
-        assert_eq!(session.file_items[0], "int f(void) { return 1; }");
-    }
-
-    #[test]
-    fn explicit_utf8_binding_respects_shadowing_and_undo() {
+    fn explicit_utf8_binding_respects_shadowing() {
         let mut session = Session::default();
         session.commit(r#"constexpr char8_t text[] = u8"hello";"#, Slot::Stmt);
         assert!(session.is_explicit_utf8_array_expr("text"));
@@ -306,7 +235,22 @@ mod tests {
 
         session.commit_scoped("unsigned char text[] = { 1, 2, 0 };");
         assert!(!session.is_explicit_utf8_array_expr("text"));
-        session.undo();
-        assert!(session.is_explicit_utf8_array_expr("text"));
+    }
+
+    #[test]
+    fn recursive_pure_functions_do_not_count_as_side_effects() {
+        let mut session = Session::default();
+        session.commit(
+            "long long fib(int n) { if (n <= 1) return n; return fib(n - 1) + fib(n - 2); }",
+            Slot::FileScope,
+        );
+        assert!(!session.may_have_side_effects("fib(8)"));
+
+        session.commit(
+            "int impure(void) { static int n; return ++n; }",
+            Slot::FileScope,
+        );
+        assert!(session.may_have_side_effects("impure()"));
+        assert!(session.may_have_side_effects("unknown()"));
     }
 }

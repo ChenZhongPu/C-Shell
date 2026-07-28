@@ -18,6 +18,8 @@ use crate::session::Session;
 pub const M_NEW: &str = "\x01\x02c-shell/new\x02\x01";
 /// Everything after this marker is the `Out[n]` value rather than program output.
 pub const M_VAL: &str = "\x01\x02c-shell/val\x02\x01";
+/// Prefix for the nanosecond payload produced by a single `%time` input.
+pub const M_TIME: &str = "\x01\x02c-shell/time\x02\x01";
 /// Reaching this marker proves that the newest input returned normally.
 pub const M_DONE: &str = "\x01\x02c-shell/done\x02\x01";
 /// A wrapped stdin call requests one recorded or live line from the parent.
@@ -62,7 +64,31 @@ pub const HEADERS: &str = "\
 /// flushed by the time the marker appears. Emitting the marker at the call
 /// site instead would file `puts("hi")`'s own output under its return value.
 const RUNTIME: &str = r##"
+static inline uint64_t cs_timeit_now_ns(void);
+
+#ifdef CS_ENABLE_TIME_ONCE
+static uint64_t cs_time_once_start_ns;
+static uint64_t cs_time_once_elapsed_ns;
+static int cs_time_once_running;
+
+static inline void cs_time_once_begin(void)
+{
+    cs_time_once_running = 1;
+    cs_time_once_start_ns = cs_timeit_now_ns();
+}
+
+static inline void cs_time_once_stop(void)
+{
+    if (cs_time_once_running) {
+        cs_time_once_elapsed_ns = cs_timeit_now_ns() - cs_time_once_start_ns;
+        cs_time_once_running = 0;
+    }
+}
+
+#define CS_VAL() do { cs_time_once_stop(); fputs(CS_M_VAL, stdout); } while (0)
+#else
 #define CS_VAL() fputs(CS_M_VAL, stdout)
+#endif
 
 static inline void cs_p_b (_Bool v)              { CS_VAL(); printf("%s\n", v ? "true" : "false"); }
 static inline void cs_p_c (char v)               { CS_VAL(); printf("'%c' (%d)\n", (v >= 32 && v < 127) ? v : '?', (int)v); }
@@ -575,15 +601,15 @@ static int cs_taped_scanf(const char *format, ...)
 #define scanf cs_taped_scanf
 
 static inline uint64_t cs_timeit_now_ns(void) {
-#if defined(_WIN32)
-    return (uint64_t)clock() * 1000000ULL;
-#elif defined(CLOCK_MONOTONIC)
+#if defined(CLOCK_MONOTONIC)
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 #else
     struct timespec ts;
-    timespec_get(&ts, TIME_UTC);
+    if (timespec_get(&ts, TIME_UTC) != TIME_UTC)
+        return 0;
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 #endif
 }
@@ -704,42 +730,61 @@ pub fn build_user_view(session: &Session) -> String {
 
 /// Build the program for evaluating `input` in `slot` against `session`.
 pub fn build(session: &Session, input: &str, slot: Slot) -> Program {
-    build_inner(session, input, BuildFlavor::Normal(slot))
+    build_inner(session, input, BuildFlavor::Normal(slot), false)
+}
+
+/// Build an ordinary evaluation while measuring only the newest input inside
+/// the generated C process. Retained session replay and process startup happen
+/// before the timer starts.
+pub fn build_timed(session: &Session, input: &str, slot: Slot) -> Program {
+    build_inner(session, input, BuildFlavor::Normal(slot), true)
 }
 
 /// Retry a block-scope declaration inside a fresh nested scope. If the real
 /// compiler accepts this after rejecting the normal assembly, later inputs
 /// remain in that scope and see the new binding.
 pub fn build_scoped_stmt(session: &Session, input: &str) -> Program {
-    build_inner(session, input, BuildFlavor::ScopedStmt)
+    build_inner(session, input, BuildFlavor::ScopedStmt, false)
+}
+
+pub fn build_scoped_stmt_timed(session: &Session, input: &str) -> Program {
+    build_inner(session, input, BuildFlavor::ScopedStmt, true)
 }
 
 /// Retry a file-scope definition by substituting it for one existing item at
 /// the same index. The compiler, not a name parser, decides which candidate
 /// replacement makes the whole session valid.
 pub fn build_file_replacement(session: &Session, input: &str, index: usize) -> Program {
-    build_inner(session, input, BuildFlavor::ReplaceFile(index))
+    build_inner(session, input, BuildFlavor::ReplaceFile(index), false)
+}
+
+pub fn build_file_replacement_timed(session: &Session, input: &str, index: usize) -> Program {
+    build_inner(session, input, BuildFlavor::ReplaceFile(index), true)
 }
 
 /// Build a program that evaluates an expression without trying to print it.
 /// Used only after the normal value-printer trial failed, to distinguish an
 /// unsupported value category (struct/complex/void/etc.) from invalid C.
 pub fn build_expr_probe(session: &Session, input: &str) -> Program {
-    build_inner(session, input, BuildFlavor::SilentExpr)
+    build_inner(session, input, BuildFlavor::SilentExpr, false)
+}
+
+pub fn build_expr_probe_timed(session: &Session, input: &str) -> Program {
+    build_inner(session, input, BuildFlavor::SilentExpr, true)
 }
 
 /// Build a non-mutating `%type` query. `_Generic` selects a type-name string
 /// without evaluating `input`; M_VAL keeps the result out of live program
 /// output so the magic renderer can print it itself.
 pub fn build_type_probe(session: &Session, input: &str) -> Program {
-    build_inner(session, input, BuildFlavor::TypeProbe)
+    build_inner(session, input, BuildFlavor::TypeProbe, false)
 }
 
 /// Build a non-mutating `%bits` query. `_Generic` selects a scalar helper
 /// without evaluating its controlling expression; the selected helper then
 /// receives and inspects the expression value exactly once.
 pub fn build_bits_probe(session: &Session, input: &str, uppercase: bool) -> Program {
-    build_inner(session, input, BuildFlavor::BitsProbe(uppercase))
+    build_inner(session, input, BuildFlavor::BitsProbe(uppercase), false)
 }
 
 /// Build a program that prints an expression as an array of `depth`
@@ -749,13 +794,21 @@ pub fn build_bits_probe(session: &Session, input: &str, uppercase: bool) -> Prog
 /// only controls how far it indexes, and a depth deeper than the value has
 /// simply fails to compile.
 pub fn build_array_expr(session: &Session, input: &str, depth: usize) -> Program {
-    build_inner(session, input, BuildFlavor::ArrayExpr(depth))
+    build_inner(session, input, BuildFlavor::ArrayExpr(depth), false)
+}
+
+pub fn build_array_expr_timed(session: &Session, input: &str, depth: usize) -> Program {
+    build_inner(session, input, BuildFlavor::ArrayExpr(depth), true)
 }
 
 /// Build a bounded raw-code-unit probe for an expression that Rust has
 /// conservatively identified as an explicit `char8_t[]` or `u8"..."` array.
 pub fn build_utf8_array_expr(session: &Session, input: &str) -> Program {
-    build_inner(session, input, BuildFlavor::Utf8ArrayExpr)
+    build_inner(session, input, BuildFlavor::Utf8ArrayExpr, false)
+}
+
+pub fn build_utf8_array_expr_timed(session: &Session, input: &str) -> Program {
+    build_inner(session, input, BuildFlavor::Utf8ArrayExpr, true)
 }
 
 /// Build a non-mutating, single-evaluation Unicode code-unit probe.
@@ -774,15 +827,16 @@ pub fn build_unicode_probe(
             limit,
             exact,
         },
+        false,
     )
 }
 
 /// Build a program that benchmarks an expression or statement over `loops` iterations.
 pub fn build_timeit_probe(session: &Session, input: &str, loops: u64) -> Program {
-    build_inner(session, input, BuildFlavor::TimeitProbe(loops))
+    build_inner(session, input, BuildFlavor::TimeitProbe(loops), false)
 }
 
-fn build_inner(session: &Session, input: &str, flavor: BuildFlavor) -> Program {
+fn build_inner(session: &Session, input: &str, flavor: BuildFlavor, timed: bool) -> Program {
     let slot = flavor.slot();
     let silent_expr = matches!(flavor, BuildFlavor::SilentExpr);
     let type_probe = matches!(flavor, BuildFlavor::TypeProbe);
@@ -827,12 +881,16 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor) -> Program {
     // Ahead of the runtime, which expands them.
     src.push_str(&format!("#define CS_M_NEW \"{}\"\n", escape(M_NEW)));
     src.push_str(&format!("#define CS_M_VAL \"{}\"\n", escape(M_VAL)));
+    src.push_str(&format!("#define CS_M_TIME \"{}\"\n", escape(M_TIME)));
     src.push_str(&format!("#define CS_M_DONE \"{}\"\n", escape(M_DONE)));
     src.push_str(&format!("#define CS_M_STDIN \"{}\"\n", escape(M_STDIN)));
     src.push_str(&format!("#define CS_M_UTF8 \"{}\"\n", escape(M_UTF8)));
     src.push_str(&format!("#define CS_M_UNICODE \"{}\"\n", escape(M_UNICODE)));
     if bits_uppercase.is_some() {
         src.push_str("#define CS_ENABLE_BITS 1\n");
+    }
+    if timed {
+        src.push_str("#define CS_ENABLE_TIME_ONCE 1\n");
     }
     src.push_str(RUNTIME);
 
@@ -864,6 +922,9 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor) -> Program {
         src.push('\n');
     }
     src.push_str("    CS_MARK(CS_M_NEW);\n");
+    if timed {
+        src.push_str("    cs_time_once_begin();\n");
+    }
 
     match slot {
         Slot::FileScope => {}
@@ -937,6 +998,12 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor) -> Program {
         }
     }
 
+    if timed {
+        src.push_str("    cs_time_once_stop();\n");
+        src.push_str(
+            "    printf(\"%s%llu\\n\", CS_M_TIME, (unsigned long long)cs_time_once_elapsed_ns);\n",
+        );
+    }
     src.push_str("    CS_MARK(CS_M_DONE);\n");
     for _ in 0..session.scope_depth + usize::from(scoped_stmt) {
         src.push_str("    }\n");
@@ -1697,6 +1764,24 @@ mod tests {
             !RUNTIME.contains(&format!("#define CS_PRINT_ARRAY{}(", MAX_ARRAY_DEPTH + 1)),
             "a deeper printer exists but MAX_ARRAY_DEPTH does not reach it"
         );
+    }
+
+    #[test]
+    fn single_input_timer_starts_after_replay_and_reports_after_input() {
+        let mut session = Session::default();
+        session.stmts.push("replayed();".into());
+        let source = build_timed(&session, "measured()", Slot::Expr).src;
+
+        let replay = source.find("replayed();").expect("retained replay");
+        let marker = source.find("CS_MARK(CS_M_NEW)").expect("new-input marker");
+        let begin = source.find("cs_time_once_begin();").expect("timer start");
+        let input = source.rfind("measured()").expect("timed input");
+        let report = source
+            .find("CS_M_TIME, (unsigned long long)cs_time_once_elapsed_ns")
+            .expect("timing report");
+
+        assert!(replay < marker && marker < begin && begin < input && input < report);
+        assert!(source.contains("#define CS_ENABLE_TIME_ONCE 1"));
     }
 
     #[test]

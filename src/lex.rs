@@ -142,6 +142,138 @@ pub fn identifiers(src: &str) -> Vec<String> {
     out
 }
 
+/// Return the simple function name and body for a function definition.
+/// Compound literals and control-flow blocks are rejected even though they
+/// also contain a `) {` boundary.
+pub fn function_definition(src: &str) -> Option<(&str, &str)> {
+    let sc = scan(src);
+    let b = src.as_bytes();
+    let mut parens = 0i32;
+    let mut brackets = 0i32;
+    let mut body_open = None;
+    for (index, &byte) in b.iter().enumerate() {
+        if !sc.code[index] {
+            continue;
+        }
+        match byte {
+            b'(' => parens += 1,
+            b')' => parens -= 1,
+            b'[' => brackets += 1,
+            b']' => brackets -= 1,
+            b'=' if parens == 0 && brackets == 0 => return None,
+            b'{' if parens == 0 && brackets == 0 => {
+                body_open = Some(index);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let body_open = body_open?;
+    let close = (0..body_open)
+        .rev()
+        .find(|&index| sc.code[index] && !b[index].is_ascii_whitespace())?;
+    if b[close] != b')' {
+        return None;
+    }
+
+    let mut depth = 0i32;
+    let mut open = None;
+    for index in (0..=close).rev() {
+        if !sc.code[index] {
+            continue;
+        }
+        match b[index] {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    open = Some(index);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let open = open?;
+    let before = (0..open)
+        .rev()
+        .find(|&index| sc.code[index] && !b[index].is_ascii_whitespace())?;
+    let name = if b[before] == b')' {
+        let mut depth = 0i32;
+        let mut inner_open = None;
+        for index in (0..=before).rev() {
+            if !sc.code[index] {
+                continue;
+            }
+            match b[index] {
+                b')' => depth += 1,
+                b'(' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        inner_open = Some(index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        identifier_between(src, &sc.code, inner_open? + 1, before)?
+    } else {
+        identifier_ending_at(src, &sc.code, before)?
+    };
+
+    let mut depth = 0i32;
+    let mut body_close = None;
+    for (index, &byte) in b.iter().enumerate().skip(body_open) {
+        if !sc.code[index] {
+            continue;
+        }
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    body_close = Some(index);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    Some((name, &src[body_open + 1..body_close?]))
+}
+
+fn identifier_ending_at<'a>(src: &'a str, code: &[bool], end: usize) -> Option<&'a str> {
+    let b = src.as_bytes();
+    if !(b[end] == b'_' || b[end].is_ascii_alphanumeric()) {
+        return None;
+    }
+    let mut start = end;
+    while start > 0
+        && code[start - 1]
+        && (b[start - 1] == b'_' || b[start - 1].is_ascii_alphanumeric())
+    {
+        start -= 1;
+    }
+    (!b[start].is_ascii_digit()).then_some(&src[start..=end])
+}
+
+fn identifier_between<'a>(
+    src: &'a str,
+    code: &[bool],
+    start: usize,
+    end: usize,
+) -> Option<&'a str> {
+    let b = src.as_bytes();
+    let first = (start..end).find(|&index| code[index] && !b[index].is_ascii_whitespace())?;
+    let last = (first..end)
+        .rev()
+        .find(|&index| code[index] && !b[index].is_ascii_whitespace())?;
+    let ident = identifier_ending_at(src, code, last)?;
+    let ident_start = last + 1 - ident.len();
+    (ident_start == first).then_some(ident)
+}
+
 /// Return the identifier when the complete input is one plain identifier.
 pub fn plain_identifier(src: &str) -> Option<&str> {
     let text = src.trim();
@@ -309,10 +441,22 @@ pub fn is_blank(src: &str) -> bool {
 /// and `arr[0]()` alike. It also nets a cast like `(int)(x)`, which only a
 /// symbol table could tell apart from a call; per the rule above it is kept.
 pub fn may_have_side_effects(src: &str) -> bool {
+    may_have_side_effects_with_pure_calls(src, |_| false)
+}
+
+/// Conservative side-effect check which accepts direct calls to functions
+/// known to have no side effects. Indirect calls stay impure because their
+/// target cannot be established from source text alone.
+pub fn may_have_side_effects_with_pure_calls(
+    src: &str,
+    is_known_pure_call: impl Fn(&str) -> bool,
+) -> bool {
     // Operators that only *contain* `=` without assigning.
     const COMPARISONS: [u8; 4] = *b"=!<>";
     // Call-like syntax that computes nothing at runtime.
-    const PURE_CALLS: [&str; 3] = ["sizeof", "_Alignof", "alignof"];
+    const NON_CALLS: [&str; 7] = [
+        "if", "for", "while", "switch", "sizeof", "_Alignof", "alignof",
+    ];
 
     let sc = scan(src);
     let b = src.as_bytes();
@@ -349,7 +493,10 @@ pub fn may_have_side_effects(src: &str) -> bool {
                 if prev == b')' || prev == b']' {
                     return true;
                 }
-                if is_ident_byte(prev) && !PURE_CALLS.contains(&prev_word) {
+                if is_ident_byte(prev)
+                    && !NON_CALLS.contains(&prev_word)
+                    && !is_known_pure_call(prev_word)
+                {
                     return true;
                 }
             }

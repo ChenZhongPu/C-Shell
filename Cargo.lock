@@ -147,6 +147,7 @@ dependencies = [
  "tempfile",
  "wait-timeout",
  "which",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -129,7 +129,7 @@ fn parse_std_probe(out: &str, family: Family) -> Option<String> {
 #[cfg(windows)]
 const CANDIDATES: &[&str] = &["gcc", "clang", "cc", "clang-cl", "cl"];
 #[cfg(not(windows))]
-const CANDIDATES: &[&str] = &["cc", "gcc", "clang", "tcc"];
+const CANDIDATES: &[&str] = &["cc", "gcc", "clang"];
 
 fn family_of(path: &Path, banner: &str) -> Family {
     let stem = path

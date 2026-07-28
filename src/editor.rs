@@ -27,7 +27,7 @@ use crate::ui::Ui;
 /// The magic commands, for completion.
 const MAGICS: &[&str] = &[
     "%help", "%quit", "%exit", "%clear", "%reset", "%src", "%header", "%edit", "%type", "%bits",
-    "%Bits", "%utf8", "%utf16", "%utf32", "%where", "%time", "%timeit", "%undo", "%cc", "%std",
+    "%Bits", "%utf8", "%utf16", "%utf32", "%where", "%time", "%timeit", "%cc", "%std",
 ];
 
 /// C keywords, common types and stdlib staples worth offering at a C prompt.

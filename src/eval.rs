@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use crate::codegen::{
-    self, M_DONE, M_NEW, M_STDIN, M_UNICODE, M_UTF8, M_VAL, MAX_ARRAY_DEPTH, Slot, UNPRINTABLE,
+    self, M_DONE, M_NEW, M_STDIN, M_TIME, M_UNICODE, M_UTF8, M_VAL, MAX_ARRAY_DEPTH, Slot,
+    UNPRINTABLE,
 };
 use crate::errmap;
 use crate::lex;
@@ -49,6 +50,9 @@ pub struct Outcome {
     pub unprintable: bool,
     /// Execution duration of the compiled program.
     pub duration: Duration,
+    /// Duration reported by the generated single-input timer. This is absent
+    /// when `%time` input did not reach the timing marker.
+    pub timed_duration: Option<Duration>,
 }
 
 pub enum Eval {
@@ -264,14 +268,28 @@ impl Evaluator {
     }
 
     pub fn eval(&self, session: &Session, input: &str) -> Result<Eval> {
-        if function_definition_name(input).as_deref() == Some("main") {
+        self.eval_inner(session, input, false)
+    }
+
+    /// Evaluate once while timing only the newest C input inside the generated
+    /// process. Compiler work, process startup and retained-session replay are
+    /// deliberately outside the measured interval.
+    pub fn time(&self, session: &Session, input: &str) -> Result<Eval> {
+        self.eval_inner(session, input, true)
+    }
+
+    fn eval_inner(&self, session: &Session, input: &str, timed: bool) -> Result<Eval> {
+        if lex::function_definition(input)
+            .map(|(name, _)| name == "main")
+            .unwrap_or(false)
+        {
             return Ok(Eval::CompileError(
                 "c-shell already provides main(); enter the statements from its body directly and omit the final return"
                     .to_string(),
             ));
         }
 
-        let diag = match self.attempt(session, input)? {
+        let diag = match self.attempt(session, input, timed)? {
             Ok(o) => return Ok(Eval::Done(o)),
             Err(d) => d,
         };
@@ -291,7 +309,7 @@ impl Evaluator {
         let repairable = !t.ends_with(';') && !t.trim_start().starts_with('#');
         if repairable {
             let patched = format!("{t};");
-            if let Ok(mut o) = self.attempt(session, &patched)? {
+            if let Ok(mut o) = self.attempt(session, &patched, timed)? {
                 o.rewritten = Some(patched);
                 return Ok(Eval::Done(o));
             }
@@ -307,9 +325,14 @@ impl Evaluator {
         &self,
         session: &Session,
         input: &str,
+        timed: bool,
     ) -> Result<std::result::Result<Outcome, String>> {
         if looks_file_scope(input) {
-            let normal = codegen::build(session, input, Slot::FileScope);
+            let normal = if timed {
+                codegen::build_timed(session, input, Slot::FileScope)
+            } else {
+                codegen::build(session, input, Slot::FileScope)
+            };
             let reported = match self.try_program(normal, Slot::FileScope, session.stdin_tape())? {
                 Ok(o) => return Ok(Ok(o)),
                 Err(diag) => diag,
@@ -332,7 +355,11 @@ impl Evaluator {
                 if session.file_items[index].trim_start().starts_with('#') {
                     continue;
                 }
-                let prog = codegen::build_file_replacement(session, input, index);
+                let prog = if timed {
+                    codegen::build_file_replacement_timed(session, input, index)
+                } else {
+                    codegen::build_file_replacement(session, input, index)
+                };
                 if let Ok(mut o) = self.try_program(prog, Slot::FileScope, session.stdin_tape())? {
                     o.file_replacement = Some(index);
                     return Ok(Ok(o));
@@ -350,17 +377,25 @@ impl Evaluator {
             &[Slot::Stmt]
         };
         for &slot in slots {
-            let normal = codegen::build(session, input, slot);
+            let normal = if timed {
+                codegen::build_timed(session, input, slot)
+            } else {
+                codegen::build(session, input, slot)
+            };
             match self.try_program(normal, slot, session.stdin_tape())? {
                 Ok(o) if slot == Slot::Expr => {
-                    return Ok(Ok(self.refine_array(session, input, o)?));
+                    return Ok(Ok(self.refine_array(session, input, o, timed)?));
                 }
                 Ok(o) => return Ok(Ok(o)),
                 Err(diag) if slot == Slot::Stmt => {
                     let retry_scoped = is_rebinding_diagnostic(&diag);
                     reported = diag;
                     if retry_scoped {
-                        let scoped = codegen::build_scoped_stmt(session, input);
+                        let scoped = if timed {
+                            codegen::build_scoped_stmt_timed(session, input)
+                        } else {
+                            codegen::build_scoped_stmt(session, input)
+                        };
                         if let Ok(mut o) =
                             self.try_program(scoped, Slot::Stmt, session.stdin_tape())?
                         {
@@ -378,7 +413,11 @@ impl Evaluator {
         // repair turns it into a statement, compile and execute the same text
         // as a silent expression so the UI can explain why there is no value.
         if try_expr {
-            let prog = codegen::build_expr_probe(session, input);
+            let prog = if timed {
+                codegen::build_expr_probe_timed(session, input)
+            } else {
+                codegen::build_expr_probe(session, input)
+            };
             if let Ok(mut o) = self.try_program(prog, Slot::Expr, session.stdin_tape())? {
                 o.value = None;
                 o.unprintable = true;
@@ -410,7 +449,13 @@ impl Evaluator {
     /// Depth cannot be decided at run time the way array-ness can, so depth 1
     /// is tried first — it is both the common case and the cheap one — and a
     /// deeper pass runs only when the elements themselves had no printer.
-    fn refine_array(&self, session: &Session, input: &str, outcome: Outcome) -> Result<Outcome> {
+    fn refine_array(
+        &self,
+        session: &Session,
+        input: &str,
+        outcome: Outcome,
+        timed: bool,
+    ) -> Result<Outcome> {
         // Re-running the whole session must stay free of consequences.
         if lex::may_have_side_effects(input) {
             return Ok(outcome);
@@ -425,7 +470,11 @@ impl Evaluator {
         // The generated probe trusts this conservative source classification
         // instead of repeating a compiler-sensitive address comparison.
         if session.is_explicit_utf8_array_expr(input) {
-            let prog = codegen::build_utf8_array_expr(session, input);
+            let prog = if timed {
+                codegen::build_utf8_array_expr_timed(session, input)
+            } else {
+                codegen::build_utf8_array_expr(session, input)
+            };
             if let Ok(mut candidate) = self.try_program(prog, Slot::Expr, session.stdin_tape())?
                 && let Some(rendered) = candidate.value.as_deref().and_then(render_utf8_payload)
             {
@@ -444,7 +493,11 @@ impl Evaluator {
 
         let mut best = outcome;
         for depth in 1..=MAX_ARRAY_DEPTH {
-            let prog = codegen::build_array_expr(session, input, depth);
+            let prog = if timed {
+                codegen::build_array_expr_timed(session, input, depth)
+            } else {
+                codegen::build_array_expr(session, input, depth)
+            };
             let Ok(candidate) = self.try_program(prog, Slot::Expr, session.stdin_tape())? else {
                 break;
             };
@@ -535,7 +588,7 @@ impl Evaluator {
             proc::run_captured(&mut cmd, self.timeout, self.allow_program_stdin)
         }
         .with_context(|| format!("failed to start {}", exe.display()))?;
-        let duration = start_time.elapsed();
+        let process_duration = start_time.elapsed();
         if let Some(live) = &live {
             live.finish();
         }
@@ -544,6 +597,8 @@ impl Evaluator {
         let err = String::from_utf8_lossy(&cap.stderr).into_owned();
         let out_parts = split_new(&out, true);
         let err_parts = split_new(&err, false);
+        let timed_duration = out_parts.time_ns.map(Duration::from_nanos);
+        let duration = timed_duration.unwrap_or(process_duration);
 
         let abnormal = match cap.status {
             None => Some(format!(
@@ -602,6 +657,7 @@ impl Evaluator {
             file_replacement: None,
             unprintable: false,
             duration,
+            timed_duration,
         })
     }
 
@@ -727,6 +783,7 @@ impl Evaluator {
             file_replacement: None,
             unprintable: false,
             duration: last_outcome.duration,
+            timed_duration: None,
         }))
     }
 }
@@ -983,6 +1040,7 @@ fn format_integer(mut n: u64) -> String {
 struct SplitOutput {
     output: String,
     value: Option<String>,
+    time_ns: Option<u64>,
     done: bool,
 }
 
@@ -994,6 +1052,7 @@ fn split_new(s: &str, has_value: bool) -> SplitOutput {
         return SplitOutput {
             output: s.to_string(),
             value: None,
+            time_ns: None,
             done: false,
         };
     };
@@ -1002,7 +1061,15 @@ fn split_new(s: &str, has_value: bool) -> SplitOutput {
         Some(i) => (&tail[..i], true),
         None => (tail, false),
     };
-    let body = body.replace(M_STDIN, "");
+    let mut body = body.replace(M_STDIN, "");
+    let time_ns = body.rfind(M_TIME).and_then(|i| {
+        let payload = body[i + M_TIME.len()..]
+            .trim_end_matches(['\r', '\n'])
+            .parse()
+            .ok();
+        body.truncate(i);
+        payload
+    });
     if has_value && let Some(i) = body.rfind(M_VAL) {
         return SplitOutput {
             output: body[..i].to_string(),
@@ -1011,12 +1078,14 @@ fn split_new(s: &str, has_value: bool) -> SplitOutput {
                     .trim_end_matches(['\r', '\n'])
                     .to_string(),
             ),
+            time_ns,
             done,
         };
     }
     SplitOutput {
         output: body,
         value: None,
+        time_ns,
         done,
     }
 }
@@ -1084,6 +1153,10 @@ impl LiveFilter {
                         .stdout
                         .then(|| find_bytes(&self.pending, M_VAL.as_bytes()))
                         .flatten();
+                    let timing = self
+                        .stdout
+                        .then(|| find_bytes(&self.pending, M_TIME.as_bytes()))
+                        .flatten();
                     let done = find_bytes(&self.pending, M_DONE.as_bytes());
                     let request = (!self.stdout)
                         .then(|| find_bytes(&self.pending, M_STDIN.as_bytes()))
@@ -1091,6 +1164,9 @@ impl LiveFilter {
                     let mut next = Vec::new();
                     if let Some(i) = value {
                         next.push((i, M_VAL.len(), Some(LiveState::Value)));
+                    }
+                    if let Some(i) = timing {
+                        next.push((i, M_TIME.len(), Some(LiveState::Value)));
                     }
                     if let Some(i) = done {
                         next.push((i, M_DONE.len(), Some(LiveState::Done)));
@@ -1110,7 +1186,7 @@ impl LiveFilter {
                         }
                     } else {
                         let markers: &[&[u8]] = if self.stdout {
-                            &[M_VAL.as_bytes(), M_DONE.as_bytes()]
+                            &[M_VAL.as_bytes(), M_TIME.as_bytes(), M_DONE.as_bytes()]
                         } else {
                             &[M_DONE.as_bytes(), M_STDIN.as_bytes()]
                         };
@@ -1478,121 +1554,7 @@ fn looks_file_scope(input: &str) -> bool {
         }
         return false;
     }
-    !first.is_empty() && function_definition_name(input).is_some()
-}
-
-/// Return the simple function name whose parameter list meets a top-level
-/// body brace. Merely spotting `) {` is insufficient: compound literals such
-/// as `Point p = (Point){1, 2}` have the same byte pattern.
-fn function_definition_name(input: &str) -> Option<String> {
-    let sc = lex::scan(input);
-    let b = input.as_bytes();
-    let mut parens = 0i32;
-    let mut brackets = 0i32;
-    let mut brace = None;
-    for (i, &byte) in b.iter().enumerate() {
-        if !sc.code[i] {
-            continue;
-        }
-        match byte {
-            b'(' => parens += 1,
-            b')' => parens -= 1,
-            b'[' => brackets += 1,
-            b']' => brackets -= 1,
-            b'=' if parens == 0 && brackets == 0 => return None,
-            b'{' if parens == 0 && brackets == 0 => {
-                brace = Some(i);
-                break;
-            }
-            // Braces while parentheses remain open can belong to a struct in
-            // a parameter list (or to an expression); only a later top-level
-            // brace can be the function body.
-            b'{' => {}
-            _ => {}
-        }
-    }
-    let brace = brace?;
-    let close = (0..brace)
-        .rev()
-        .find(|&i| sc.code[i] && !b[i].is_ascii_whitespace())?;
-    if b[close] != b')' {
-        return None;
-    }
-
-    // Find that closing paren's mate and require a declarator-like token just
-    // before it. This rejects `(Type){...}` and `cond ? (Type){...}`.
-    let mut depth = 0i32;
-    let mut open = None;
-    for i in (0..=close).rev() {
-        if !sc.code[i] {
-            continue;
-        }
-        match b[i] {
-            b')' => depth += 1,
-            b'(' => {
-                depth -= 1;
-                if depth == 0 {
-                    open = Some(i);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let open = open?;
-    let before = (0..open)
-        .rev()
-        .find(|&i| sc.code[i] && !b[i].is_ascii_whitespace())?;
-    if b[before] == b')' {
-        // Parenthesized declarator: `int (main)(void) { ... }`.
-        let mut depth = 0i32;
-        let mut inner_open = None;
-        for i in (0..=before).rev() {
-            if !sc.code[i] {
-                continue;
-            }
-            match b[i] {
-                b')' => depth += 1,
-                b'(' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        inner_open = Some(i);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let inner_open = inner_open?;
-        return identifier_between(input, &sc.code, inner_open + 1, before);
-    }
-    identifier_ending_at(input, &sc.code, before)
-}
-
-fn identifier_ending_at(input: &str, code: &[bool], end: usize) -> Option<String> {
-    let b = input.as_bytes();
-    if !(b[end] == b'_' || b[end].is_ascii_alphanumeric()) {
-        return None;
-    }
-    let mut start = end;
-    while start > 0
-        && code[start - 1]
-        && (b[start - 1] == b'_' || b[start - 1].is_ascii_alphanumeric())
-    {
-        start -= 1;
-    }
-    (!b[start].is_ascii_digit()).then(|| input[start..=end].to_string())
-}
-
-fn identifier_between(input: &str, code: &[bool], start: usize, end: usize) -> Option<String> {
-    let b = input.as_bytes();
-    let first = (start..end).find(|&i| code[i] && !b[i].is_ascii_whitespace())?;
-    let last = (first..end)
-        .rev()
-        .find(|&i| code[i] && !b[i].is_ascii_whitespace())?;
-    let ident = identifier_ending_at(input, code, last)?;
-    let ident_start = last + 1 - ident.len();
-    (ident_start == first).then_some(ident)
+    !first.is_empty() && lex::function_definition(input).is_some()
 }
 
 #[cfg(test)]
@@ -1623,19 +1585,19 @@ mod tests {
     #[test]
     fn recognizes_main_definitions_without_matching_similar_expressions() {
         assert_eq!(
-            function_definition_name("int main(void) { return 0; }").as_deref(),
+            lex::function_definition("int main(void) { return 0; }").map(|(name, _)| name),
             Some("main")
         );
         assert_eq!(
-            function_definition_name("int (main)(int argc, char **argv) { return argc; }")
-                .as_deref(),
+            lex::function_definition("int (main)(int argc, char **argv) { return argc; }")
+                .map(|(name, _)| name),
             Some("main")
         );
         assert_eq!(
-            function_definition_name("int domain(void) { return 1; }").as_deref(),
+            lex::function_definition("int domain(void) { return 1; }").map(|(name, _)| name),
             Some("domain")
         );
-        assert_eq!(function_definition_name("Point p = (Point){1, 2};"), None);
+        assert_eq!(lex::function_definition("Point p = (Point){1, 2};"), None);
     }
 
     #[test]
@@ -1667,6 +1629,24 @@ mod tests {
         let got = split_new(&s, true);
         assert_eq!(got.output, "printed");
         assert_eq!(got.value.as_deref(), Some("42"));
+        assert_eq!(got.time_ns, None);
+        assert!(got.done);
+    }
+
+    #[test]
+    fn splits_single_input_timing_without_polluting_output_or_value() {
+        let expression = format!("old{M_NEW}printed{M_VAL}42\n{M_TIME}123\n{M_DONE}");
+        let got = split_new(&expression, true);
+        assert_eq!(got.output, "printed");
+        assert_eq!(got.value.as_deref(), Some("42"));
+        assert_eq!(got.time_ns, Some(123));
+        assert!(got.done);
+
+        let statement = format!("old{M_NEW}printed{M_TIME}456\n{M_DONE}");
+        let got = split_new(&statement, true);
+        assert_eq!(got.output, "printed");
+        assert_eq!(got.value, None);
+        assert_eq!(got.time_ns, Some(456));
         assert!(got.done);
     }
 
@@ -1784,6 +1764,19 @@ mod tests {
         assert_eq!(visible, b"hello");
         assert_eq!(f.state, LiveState::Done);
         assert!(f.visible_any && !f.visible_ends_in_newline);
+    }
+
+    #[test]
+    fn live_filter_hides_statement_timing_payloads() {
+        let mut f = LiveFilter::new(true);
+        let wire = format!("replayed{M_NEW}hello{M_TIME}123\n{M_DONE}");
+        let mut visible = Vec::new();
+        for chunk in wire.as_bytes().chunks(3) {
+            visible.extend(f.feed(chunk));
+        }
+        visible.extend(f.finish());
+        assert_eq!(visible, b"hello");
+        assert_eq!(f.state, LiveState::Done);
     }
 
     #[test]

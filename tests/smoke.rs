@@ -253,20 +253,6 @@ fn statements_execute_and_mutate_state() {
 }
 
 #[test]
-fn local_redeclaration_opens_a_shadowing_scope_and_undo_restores_it() {
-    let out = run(&["int x = 1;", "x = 5;", "int x = 2;", "x", "%undo", "x"]);
-    assert!(
-        out.contains("opened a nested scope"),
-        "shadowing retry was not reported:\n{out}"
-    );
-    assert!(out.contains("Out[4]: 2"), "new binding not visible:\n{out}");
-    assert!(
-        out.contains("Out[5]: 5"),
-        "undo did not restore the old binding:\n{out}"
-    );
-}
-
-#[test]
 fn file_scope_redefinition_replaces_in_place_portably() {
     let out = run(&[
         "int f(int n) { return n * 2; }",
@@ -308,19 +294,18 @@ fn tag_redefinition_replaces_the_old_type_when_retained_session_still_compiles()
 }
 
 #[test]
-fn file_scope_replacement_is_undoable_and_functions_never_demote() {
+fn file_scope_replacement_and_functions_never_demote() {
     let out = run(&[
         "int g(int n) { return n * 2; }",
         "int g(int n) { return n * 3; }",
-        "%undo",
         "g(3)",
         "int local = 7;",
         "int illegal(void) { return local; }",
         "local",
     ]);
     assert!(
-        out.contains("Out[3]: 6"),
-        "undo did not restore the old function:\n{out}"
+        out.contains("Out[3]: 9"),
+        "replacement did not update the function:\n{out}"
     );
     assert!(
         out.contains("error") && out.contains("local"),
@@ -953,10 +938,11 @@ fn program_output_is_shown_once() {
 fn time_and_timeit_magics_work() {
     let out = run(&[
         "int acc = 0;",
-        "%time acc += 10;",
+        "%time ++acc",
         "acc",
-        "%timeit acc + 5",
+        "%timeit acc += 5",
         "acc",
+        "%time exit(0);",
     ]);
     assert!(
         out.contains("Wall time:"),
@@ -964,8 +950,18 @@ fn time_and_timeit_magics_work() {
 {out}"
     );
     assert!(
-        out.contains("Out[3]: 10"),
-        "side effect of %time not committed:
+        out.contains("Out[2]: 1"),
+        "%time expression was evaluated more than once:
+{out}"
+    );
+    assert!(
+        out.contains("Out[3]: 1"),
+        "%time side effect was not retained:
+{out}"
+    );
+    assert!(
+        out.contains("\"%timeit input\" may execute repeatedly and is not retained for replay"),
+        "missing %timeit non-replay warning:
 {out}"
     );
     assert!(
@@ -974,9 +970,32 @@ fn time_and_timeit_magics_work() {
 {out}"
     );
     assert!(
-        out.contains("Out[4]: 10"),
+        out.contains("Out[4]: 1"),
         "%timeit modified session state:
 {out}"
+    );
+    assert!(
+        !out.contains("c-shell/time"),
+        "internal timing marker leaked:
+{out}"
+    );
+    assert!(
+        out.contains("Wall time: unavailable (input did not complete)"),
+        "incomplete %time input fell back to whole-process timing:
+{out}"
+    );
+}
+
+#[test]
+fn timeit_pure_function_does_not_warn() {
+    let out = run(&[
+        "long long fib(int n) { if (n <= 1) return n; return fib(n - 1) + fib(n - 2); }",
+        "%timeit fib(8)",
+    ]);
+    assert!(out.contains("per loop"), "missing %timeit report:\n{out}");
+    assert!(
+        !out.contains("\"%timeit input\" may execute repeatedly"),
+        "pure function benchmark emitted a warning:\n{out}"
     );
 }
 
