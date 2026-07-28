@@ -4,8 +4,8 @@ Settled architecture decisions, the one big open problem, and the traps buried
 in the code that you must know about before changing it. README is for users;
 this file is for whoever develops the tool next.
 
-Status: v0.2.7 working. ~10500 lines of Rust, 140 tests (95 unit + 45
-end-to-end smoke), clippy/fmt clean, English UI. Verified on Linux with gcc
+Status: v0.2.8 working. ~10500 lines of Rust, 147 tests (101 unit + 46
+end-to-end smoke), clippy/fmt clean, English/Chinese UI. Verified on Linux with gcc
 16.1.1 and clang 22.1.6. CI exercises the default macOS compiler and two
 Windows driver dialects (a GNU-style driver and MSVC); see
 `.github/workflows/ci.yml` for the exact matrix.
@@ -29,6 +29,7 @@ Windows driver dialects (a GNU-style driver and MSVC); see
 | `codegen.rs` | program assembly, shadowing/replacement variants, `_Generic` runtimes |
 | `session.rs` | session state, in-memory stdin tape, shadowing scopes, file-item replacement and completion vocabulary |
 | `ui.rs` | terminal styling, startup banner |
+| `i18n.rs` | system-locale detection, `--lang` override, and Fluent catalog lookup |
 
 Implemented: expression evaluation with value printing, statements, automatic
 file-scope hoisting for functions/`#include`/`typedef`, multi-line input,

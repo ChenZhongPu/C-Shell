@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
+use crate::i18n;
 use crate::proc;
 
 /// Deadline for every probe: a compiler that needs longer than this to
@@ -365,9 +366,9 @@ impl Toolchain {
             match tc.probe_run(&[], VERSION_PROBE) {
                 Some(out) => tc.default_std = parse_std_probe(&out, family),
                 None => {
-                    tried.push(format!(
-                        "{} (cannot build a working program)",
-                        tc.path.display()
+                    tried.push(i18n::text_with(
+                        "compiler-cannot-build",
+                        &[("path", tc.path.display().to_string())],
                     ));
                     continue;
                 }
@@ -376,9 +377,12 @@ impl Toolchain {
                 if tc.supports_std(s) {
                     tc.std = s.to_string();
                 } else {
-                    tried.push(format!(
-                        "{} (does not support requested standard {s})",
-                        tc.path.display()
+                    tried.push(i18n::text_with(
+                        "compiler-standard-unsupported",
+                        &[
+                            ("path", tc.path.display().to_string()),
+                            ("standard", s.to_string()),
+                        ],
                     ));
                     continue;
                 }
@@ -399,9 +403,9 @@ impl Toolchain {
             // broken" with no hint why. A compiler that cannot reach it in
             // any mode is disqualified outright, not limped along with.
             if !tc.value_printer_ok() {
-                tried.push(format!(
-                    "{} (selected mode cannot compile the value printer)",
-                    tc.path.display()
+                tried.push(i18n::text_with(
+                    "compiler-printer-unsupported",
+                    &[("path", tc.path.display().to_string())],
                 ));
                 continue;
             }
@@ -409,17 +413,15 @@ impl Toolchain {
             return Ok(tc);
         }
 
-        bail!(
-            "no usable C compiler found (tried: {}).\n\
-             c-shell requires a mode capable of its C11-style value printer.\n\
-             Install gcc or clang, or point c-shell at one with --cc <path>.{}",
-            tried.join(", "),
-            if cfg!(windows) {
-                "\nOn Windows, MSVC (cl.exe) only works from a Developer Command Prompt."
-            } else {
-                ""
-            }
-        )
+        let windows_note = if cfg!(windows) {
+            format!("\n{}", i18n::text("compiler-windows-note"))
+        } else {
+            String::new()
+        };
+        bail!(i18n::text_with(
+            "compiler-not-found",
+            &[("tried", tried.join(", ")), ("windows-note", windows_note),],
+        ))
     }
 
     pub fn is_msvc(&self) -> bool {
@@ -581,12 +583,15 @@ impl Toolchain {
     pub fn describe(&self) -> String {
         let std = match (&self.std, &self.default_std) {
             (s, _) if s.is_empty() => match &self.default_std {
-                Some(d) => format!("default std {d}"),
-                None => "default std".to_string(),
+                Some(d) => {
+                    i18n::text_with("compiler-default-std-value", &[("standard", d.clone())])
+                }
+                None => i18n::text("compiler-default-std"),
             },
-            (s, Some(d)) if self.auto_std => {
-                format!("-std={s}, auto-raised: default {d} lacks _Generic")
-            }
+            (s, Some(d)) if self.auto_std => i18n::text_with(
+                "compiler-auto-std",
+                &[("selected", s.clone()), ("default", d.clone())],
+            ),
             (s, _) => format!("-std={s}"),
         };
         format!("{} ({})", self.version, std)

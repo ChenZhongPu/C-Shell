@@ -1,11 +1,14 @@
 //! Terminal styling, centralised so `--no-color` has one switch to flip.
 
+use crate::i18n::Language;
+
 pub struct Ui {
     pub color: bool,
     /// Whether stdout is an interactive terminal that can consume terminal
     /// control sequences. OSC 8 is ignored by terminals that do not implement
     /// hyperlinks, while the linked URL remains visible as ordinary text.
     pub hyperlinks: bool,
+    pub language: Language,
 }
 
 /// Startup banner, slant style. Kept under 60 columns so it survives
@@ -18,6 +21,14 @@ const BANNER: &str = r#"   ______          _____    __  __    ______    __     _
 "#;
 
 impl Ui {
+    pub fn text(&self, key: &str) -> String {
+        crate::i18n::text_for(self.language, key)
+    }
+
+    pub fn text_with(&self, key: &str, values: &[(&'static str, String)]) -> String {
+        crate::i18n::text_with_for(self.language, key, values)
+    }
+
     fn paint(&self, code: &str, s: &str) -> String {
         if self.color {
             format!("\x1b[{code}m{s}\x1b[0m")
@@ -86,6 +97,8 @@ impl Ui {
 
 #[cfg(test)]
 mod tests {
+    use crate::i18n::Language;
+
     use super::Ui;
 
     #[test]
@@ -94,12 +107,14 @@ mod tests {
         let plain = Ui {
             color: false,
             hyperlinks: false,
+            language: Language::English,
         };
         assert_eq!(plain.hyperlink(url), url);
 
         let interactive = Ui {
             color: false,
             hyperlinks: true,
+            language: Language::English,
         };
         assert_eq!(
             interactive.hyperlink(url),

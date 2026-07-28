@@ -15,8 +15,17 @@ fn run(lines: &[&str]) -> String {
 }
 
 fn run_with_timeout(secs: u32, lines: &[&str]) -> String {
+    run_with_language_and_timeout("en", secs, lines)
+}
+
+fn run_with_language(language: &str, lines: &[&str]) -> String {
+    run_with_language_and_timeout(language, 15, lines)
+}
+
+fn run_with_language_and_timeout(language: &str, secs: u32, lines: &[&str]) -> String {
     let mut child = Command::new(env!("CARGO_BIN_EXE_c-shell"))
         .arg("--no-color")
+        .args(["--lang", language])
         .arg("--timeout")
         .arg(secs.to_string())
         .stdin(Stdio::piped())
@@ -43,7 +52,7 @@ fn run_with_timeout(secs: u32, lines: &[&str]) -> String {
 
 fn run_evals_with_stdin(codes: &[&str], input: &str) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_c-shell"));
-    command.arg("--no-color");
+    command.args(["--no-color", "--lang", "en"]);
     for code in codes {
         command.args(["-e", code]);
     }
@@ -203,7 +212,7 @@ fn unicode_magics_decode_explicit_code_units_without_changing_session() {
 #[test]
 fn strict_iso_mode_keeps_the_runtime_timer_available() {
     let out = Command::new(env!("CARGO_BIN_EXE_c-shell"))
-        .args(["--no-color", "--std", "c11", "-e", "1"])
+        .args(["--no-color", "--lang", "en", "--std", "c11", "-e", "1"])
         .output()
         .expect("run c-shell in strict C11 mode");
     assert!(
@@ -486,7 +495,7 @@ fn disguised_calls_commit_their_side_effects() {
 #[test]
 fn eval_flag_prints_bare_value_and_exits_clean() {
     let out = Command::new(env!("CARGO_BIN_EXE_c-shell"))
-        .args(["-e", "1 + 1"])
+        .args(["--lang", "en", "-e", "1 + 1"])
         .output()
         .expect("run c-shell -e");
     assert!(out.status.success());
@@ -496,7 +505,7 @@ fn eval_flag_prints_bare_value_and_exits_clean() {
 #[test]
 fn eval_flag_failure_sets_exit_code_and_uses_stderr() {
     let out = Command::new(env!("CARGO_BIN_EXE_c-shell"))
-        .args(["-e", "no_such_variable"])
+        .args(["--lang", "en", "-e", "no_such_variable"])
         .output()
         .expect("run c-shell -e");
     assert!(!out.status.success(), "failure must be visible to scripts");
@@ -522,6 +531,7 @@ mul(6, 7)
     )
     .expect("write script");
     let out = Command::new(env!("CARGO_BIN_EXE_c-shell"))
+        .args(["--lang", "en"])
         .arg("--script")
         .arg(&path)
         .output()
@@ -880,7 +890,14 @@ fn unsupported_value_category_is_explained_and_not_misclassified() {
 #[test]
 fn unsupported_explicit_standard_is_an_error() {
     let out = Command::new(env!("CARGO_BIN_EXE_c-shell"))
-        .args(["--std", "definitely-not-a-c-standard", "-e", "1"])
+        .args([
+            "--lang",
+            "en",
+            "--std",
+            "definitely-not-a-c-standard",
+            "-e",
+            "1",
+        ])
         .output()
         .expect("run c-shell with invalid standard");
     assert!(!out.status.success(), "invalid --std was silently ignored");
@@ -1033,6 +1050,76 @@ fn help_lists_commands_and_keeps_usage_notes_behind_verbose() {
         verbose.contains("Notes:"),
         "missing Notes in verbose help:
 {verbose}"
+    );
+}
+
+#[test]
+fn language_override_localizes_c_shell_but_not_compiler_diagnostics() {
+    let chinese = run_with_language("zh", &["%help", "%where sqrt", "%bits 1"]);
+    assert!(
+        chinese.contains("命令：")
+            && chinese.contains("名称： sqrt")
+            && chinese.contains("头文件：")
+            && chinese.contains("类型： int")
+            && chinese.contains("大小： 4 字节"),
+        "Chinese UI was incomplete:\n{chinese}"
+    );
+    assert!(
+        !chinese.contains("Commands:") && !chinese.contains("Name: sqrt"),
+        "English c-shell labels leaked into the Chinese UI:\n{chinese}"
+    );
+
+    let help = Command::new(env!("CARGO_BIN_EXE_c-shell"))
+        .args(["--lang", "zh", "--help"])
+        .output()
+        .expect("run localized --help");
+    assert!(help.status.success());
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        help.contains("用法：") && help.contains("选项：") && help.contains("（默认：10）"),
+        "command-line help was not localized:\n{help}"
+    );
+    assert!(
+        !help.contains("[default:") && !help.contains("[possible values:"),
+        "clap's English annotations leaked into Chinese help:\n{help}"
+    );
+
+    let invalid_cli = Command::new(env!("CARGO_BIN_EXE_c-shell"))
+        .args(["--lang", "zh", "--timeout", "not-a-number"])
+        .output()
+        .expect("run invalid localized command line");
+    assert!(!invalid_cli.status.success());
+    let invalid_cli = String::from_utf8_lossy(&invalid_cli.stderr);
+    assert!(
+        invalid_cli.contains("错误：")
+            && invalid_cli.contains("的值“not-a-number”无效")
+            && invalid_cli.contains("用法：c-shell [OPTIONS]")
+            && invalid_cli.contains("更多信息请尝试“--help”。"),
+        "command-line error was not localized:\n{invalid_cli}"
+    );
+    assert!(
+        !invalid_cli.contains("invalid value") && !invalid_cli.contains("For more information"),
+        "English clap text leaked into a Chinese command-line error:\n{invalid_cli}"
+    );
+
+    let compiler_error = |language| {
+        Command::new(env!("CARGO_BIN_EXE_c-shell"))
+            .args([
+                "--no-color",
+                "--lang",
+                language,
+                "-e",
+                "c_shell_i18n_missing_identifier",
+            ])
+            .output()
+            .expect("run failing C input")
+    };
+    let english_error = compiler_error("en");
+    let chinese_error = compiler_error("zh");
+    assert!(!english_error.status.success() && !chinese_error.status.success());
+    assert_eq!(
+        english_error.stderr, chinese_error.stderr,
+        "c-shell modified the compiler's diagnostic for the Chinese UI"
     );
 }
 

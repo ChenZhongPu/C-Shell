@@ -43,7 +43,7 @@ jobs:
           mkdir "$name"
           bin="target/${{ matrix.target }}/release/c-shell"
           [[ -f "$bin.exe" ]] && bin="$bin.exe"
-          cp "$bin" README.md LICENSE "$name"/
+          cp "$bin" README.md README.zh-CN.md LICENSE "$name"/
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             7z a "$name.zip" "$name" >/dev/null
             echo "ASSET=$name.zip" >> "$GITHUB_ENV"

@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use crate::codegen::{self, Slot};
 use crate::eval::{Eval, Evaluator, UnicodeEncoding};
+use crate::i18n;
 use crate::proc;
 use crate::session::Session;
 use crate::std_index;
@@ -71,14 +72,14 @@ fn edit_input(args: &[&str], session: &Session) -> std::result::Result<Option<St
         [number] => {
             let number = number
                 .parse::<usize>()
-                .map_err(|_| "usage: %edit [input-number]".to_string())?;
+                .map_err(|_| i18n::text("edit-usage"))?;
             session
                 .input(number)
                 .map(str::to_string)
                 .map(Some)
-                .ok_or_else(|| format!("no C input In[{number}]"))
+                .ok_or_else(|| i18n::text_with("edit-not-found", &[("number", number.to_string())]))
         }
-        _ => Err("usage: %edit [input-number]".to_string()),
+        _ => Err(i18n::text("edit-usage")),
     }
 }
 
@@ -148,7 +149,7 @@ fn unicode_query(tail: &str) -> std::result::Result<(Option<usize>, &str), Strin
 
     let tail = tail.trim();
     if tail.is_empty() {
-        return Err("missing expression".to_string());
+        return Err(i18n::text("unicode-missing-expression"));
     }
     let Some(after_flag) = tail.strip_prefix("-n") else {
         return Ok((None, tail));
@@ -169,12 +170,15 @@ fn unicode_query(tail: &str) -> std::result::Result<(Option<usize>, &str), Strin
     let expression = after_flag[count_end..].trim();
     let count = count_text
         .parse::<usize>()
-        .map_err(|_| "-n requires a non-negative code-unit count".to_string())?;
+        .map_err(|_| i18n::text("unicode-invalid-count"))?;
     if count > MAX_EXPLICIT_UNITS {
-        return Err(format!("-n is limited to {MAX_EXPLICIT_UNITS} code units"));
+        return Err(i18n::text_with(
+            "unicode-count-limit",
+            &[("limit", MAX_EXPLICIT_UNITS.to_string())],
+        ));
     }
     if expression.is_empty() {
-        return Err("missing expression after -n <count>".to_string());
+        return Err(i18n::text("unicode-missing-after-count"));
     }
     Ok((Some(count), expression))
 }
@@ -212,9 +216,22 @@ fn cppreference_header_url(header: &str) -> Option<String> {
         .then(|| format!("https://en.cppreference.com/c/header/{stem}"))
 }
 
+fn terminal_width(text: &str) -> usize {
+    text.chars()
+        .map(|character| if character.is_ascii() { 1 } else { 2 })
+        .sum()
+}
+
+fn pad_to_width(text: &str, width: usize) -> String {
+    format!(
+        "{text}{}",
+        " ".repeat(width.saturating_sub(terminal_width(text)))
+    )
+}
+
 fn render_where_header_table(headers: &[&str], ui: &Ui) {
-    const HEADER_LABEL: &str = "header";
-    const DOCUMENTATION_LABEL: &str = "documentation";
+    let header_label = ui.text("where-header-column");
+    let documentation_label = ui.text("where-doc-column");
 
     let rows = headers
         .iter()
@@ -227,25 +244,29 @@ fn render_where_header_table(headers: &[&str], ui: &Ui) {
         .collect::<Vec<_>>();
     let header_width = rows
         .iter()
-        .map(|(header, _)| header.len())
+        .map(|(header, _)| terminal_width(header))
         .max()
         .unwrap_or(0)
-        .max(HEADER_LABEL.len());
+        .max(terminal_width(&header_label));
     let documentation_width = rows
         .iter()
-        .map(|(_, url)| url.len())
+        .map(|(_, url)| terminal_width(url))
         .max()
         .unwrap_or(0)
-        .max(DOCUMENTATION_LABEL.len());
+        .max(terminal_width(&documentation_label));
     let border = format!(
         "+-{}-+-{}-+",
         "-".repeat(header_width),
         "-".repeat(documentation_width)
     );
 
-    println!("headers:");
+    println!("{}", ui.text("where-headers"));
     println!("{border}");
-    println!("| {HEADER_LABEL:<header_width$} | {DOCUMENTATION_LABEL:<documentation_width$} |");
+    println!(
+        "| {} | {} |",
+        pad_to_width(&header_label, header_width),
+        pad_to_width(&documentation_label, documentation_width)
+    );
     println!("{border}");
     for (header, url) in rows {
         let documentation = if url == "-" {
@@ -257,36 +278,63 @@ fn render_where_header_table(headers: &[&str], ui: &Ui) {
         // hyperlink control bytes occupy no terminal columns.
         println!(
             "| {header:<header_width$} | {documentation}{} |",
-            " ".repeat(documentation_width - url.len())
+            " ".repeat(documentation_width - terminal_width(&url))
         );
     }
     println!("{border}");
 }
 
+fn kind_label(kind: std_index::Kind, ui: &Ui) -> String {
+    use std_index::Kind;
+    let key = match kind {
+        Kind::Function => "kind-function",
+        Kind::FunctionLikeMacro => "kind-function-like-macro",
+        Kind::ObjectLikeMacro => "kind-object-like-macro",
+        Kind::TypeGenericMacro => "kind-type-generic-macro",
+        Kind::Typedef => "kind-typedef",
+        Kind::Type => "kind-type",
+    };
+    ui.text(key)
+}
+
+fn localized_index_note(note: &str, ui: &Ui) -> String {
+    let key = match note {
+        "deprecated; removed from ISO C in C11 because it cannot perform bounded input" => {
+            "index-note-gets"
+        }
+        "provided by <stdbool.h> through C17; a language keyword in C23" => "index-note-stdbool",
+        "provided by <stdalign.h> through C17; a language keyword in C23" => "index-note-stdalign",
+        "provided by <assert.h> in C11/C17; a language keyword in C23" => "index-note-assert",
+        "obsolescent in C23" => "index-note-obsolescent",
+        "still provided by <stdnoreturn.h> in C23; prefer [[noreturn]] in new C23 code" => {
+            "index-note-noreturn"
+        }
+        "an implementation may additionally provide a macro form" => "index-note-macro-form",
+        _ => return note.to_string(),
+    };
+    ui.text(key)
+}
+
 fn render_where(name: &str, ev: &Evaluator, ui: &Ui) {
     let Some(found) = std_index::lookup(name) else {
-        println!(
-            "{}",
-            ui.err(&format!(
-                "{name} was not found in c-shell's ISO C standard library index"
-            ))
-        );
+        let message = ui.text_with("where-not-found", &[("name", name.to_string())]);
+        println!("{}", ui.err(&message));
         return;
     };
 
-    println!("name: {}", found.name);
+    println!("{} {}", ui.text("where-name"), found.name);
     let kinds = found
         .kinds()
         .into_iter()
-        .map(std_index::Kind::label)
+        .map(|kind| kind_label(kind, ui))
         .collect::<Vec<_>>()
         .join(" / ");
-    println!("kind: {kinds}");
+    println!("{} {kinds}", ui.text("where-kind"));
 
     let headers = found.headers();
     render_where_header_table(&headers, ui);
     if let Some(signature) = found.signature {
-        println!("signature: {signature}");
+        println!("{} {signature}", ui.text("where-signature"));
     }
 
     let since = found.since();
@@ -295,13 +343,24 @@ fn render_where(name: &str, ev: &Evaluator, ui: &Ui) {
             .previous()
             .expect("no indexed identifier is removed in C89");
         println!(
-            "ISO C availability: {}–{}; removed in {}",
-            since.label(),
-            last.label(),
-            removed.label()
+            "{}",
+            ui.text_with(
+                "where-availability-range",
+                &[
+                    ("since", since.label().to_string()),
+                    ("last", last.label().to_string()),
+                    ("removed", removed.label().to_string()),
+                ],
+            )
         );
     } else {
-        println!("ISO C availability: {} and later", since.label());
+        println!(
+            "{}",
+            ui.text_with(
+                "where-availability-later",
+                &[("since", since.label().to_string())],
+            )
+        );
     }
 
     let mode = if ev.tc.std.is_empty() {
@@ -311,16 +370,14 @@ fn render_where(name: &str, ev: &Evaluator, ui: &Ui) {
     };
     if let Some(mode) = mode {
         if let Some(standard) = std_index::CStandard::from_mode(mode) {
-            println!(
-                "selected mode: {mode} ({})",
-                if found.available_in(standard) {
-                    "available"
-                } else {
-                    "not available as an ISO C library identifier"
-                }
-            );
+            let availability = if found.available_in(standard) {
+                ui.text("where-available")
+            } else {
+                ui.text("where-unavailable")
+            };
+            println!("{} {mode} ({availability})", ui.text("where-selected-mode"));
         } else {
-            println!("selected mode: {mode}");
+            println!("{} {mode}", ui.text("where-selected-mode"));
         }
     }
 
@@ -335,91 +392,27 @@ fn render_where(name: &str, ev: &Evaluator, ui: &Ui) {
         .filter(|header| auto_inclusion(header) == Some(AutoInclusion::WhenAvailable))
         .collect::<Vec<_>>();
     if always.is_empty() && conditional.is_empty() {
-        println!("auto-included by c-shell: no");
+        println!("{}", ui.text("where-auto-no"));
     } else {
         if !always.is_empty() {
-            println!("auto-included by c-shell: yes ({})", always.join(", "));
+            println!("{} ({})", ui.text("where-auto-yes"), always.join(", "));
         }
         if !conditional.is_empty() {
             println!(
-                "auto-included by c-shell when available: {}",
+                "{} {}",
+                ui.text("where-auto-conditional"),
                 conditional.join(", ")
             );
         }
     }
     if let Some(note) = found.note {
-        println!("note: {note}");
+        println!(
+            "{} {}",
+            ui.text("where-note"),
+            localized_index_note(note, ui)
+        );
     }
 }
-
-const HELP: &str = "Commands:
-  %help [--verbose]  show commands; --verbose adds usage notes
-  %quit / %exit      quit (Ctrl-D works too)
-  %clear             clear the screen without changing the session
-  %reset             clear the session and start fresh
-  %src [--raw]       show user C; --raw includes generated runtime/protocol
-  %header            list the headers included in every program
-  %edit [n]          copy latest or In[n] into the prompt for editing
-  %type <expression> query an expression's type without evaluating it
-  %bits <expression> inspect a scalar value using lowercase hexadecimal
-  %Bits <expression> same as %bits, with uppercase hexadecimal
-  %utf8/%utf16/%utf32 [-n N] <expression> decode Unicode code units
-  %where <identifier> find an ISO C library identifier's standard header
-  %time <code...>    time the execution of a statement or expression once
-  %timeit <code...>  benchmark a statement or expression over multiple loops
-  %cc [path]         show or switch the C compiler
-  %std [std]         show or switch the language standard (c11/c17/c23);
-                     %std default returns to the compiler's own default";
-
-/// The behavioral rules that are not guessable from the command list. Kept
-/// behind  so the default help stays a one-screen reference.
-const HELP_NOTES: &str = "Notes:
-  A bare expression prints its value; a trailing ';' runs it silently.
-  A completed if waits for a blank continuation line; type else / else if
-  there instead to continue it. Other closed blocks submit immediately, but
-  a struct/union/enum definition waits for its mandatory trailing ';'.
-  Function definitions, #include and typedef go to file scope automatically.
-  %edit n can reopen any C In[n] from this session, including a failed one;
-  it only fills the next prompt. Modify it and press Enter to submit it under
-  a new number; the original numbered input remains unchanged.
-  c-shell supplies main(); enter its body as statements and omit final return.
-  Redeclaring a local opens a nested shadowing scope. Redefining a function
-  or type replaces the prior file-scope input only if the compiler accepts
-  the complete rewritten session; functions are never demoted into main.
-  %type uses _Generic matching: scalar types and scalar pointers are named;
-  complete named structs/unions report e.g. Struct Point or Union Value;
-  simple anonymous typedefs use the typedef name. Other aliases and top-level
-  qualifiers are canonicalized, and arrays/functions undergo their normal
-  expression conversions.
-  %bits/%Bits evaluate a scalar expression once, then show its type, value,
-  size, hexadecimal and binary representation, memory bytes and byte order.
-  Command spelling is case-sensitive; only %Bits selects uppercase hex.
-  IEEE-754 float/double values also show sign, exponent and fraction fields;
-  aggregates, arrays and function pointers are not supported.
-  %utf8/%utf16/%utf32 read integer arrays or pointers as Unicode code units.
-  By default they stop at NUL or 100 units; -n N reads exactly N units, up to
-  4096. Invalid Unicode is reported without replacement characters. Pointer
-  reads are explicit but still require the addressed memory to be valid.
-  %where uses a built-in ISO C89-C23 index, not the host's transitive header
-  visibility. It also links each matching header to cppreference. POSIX,
-  platform/compiler extensions and user names are excluded.
-  %time evaluates an expression or statement once, displays its output/value,
-  and times only that input inside C; compilation, process startup and retained
-  session replay are excluded. Side effects are retained in session.
-  %timeit benchmarks an expression or statement in an auto-ranged loop over
-  multiple runs without modifying the session state. Inputs that may change
-  state warn because they execute repeatedly.
-  Struct values use designated members; nested known structs and arrays
-  expand, but pointer members are shown only as addresses or NULL. Use an
-  explicit member expression (p.name) or dereference (*ptr) to drill down.
-  Arrays print their elements, one or two dimensions deep, bounded at 100 per
-  dimension; a real pointer still prints as an address, and elements with no
-  printer of their own show <unprintable>.
-  Pure bare expressions (x + 1, sizeof(int)) are evaluated and forgotten.
-  Statements and bare expressions that may have effects are kept.
-  Direct scanf calls record one private input line per dynamic request; later
-  replay uses that tape, including calls in functions and loops. Other known
-  file/input/process APIs warn because their external effects may repeat.";
 
 pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) -> Result<Action> {
     let body = line.trim().trim_start_matches('%');
@@ -432,13 +425,15 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
 
     match cmd {
         "help" | "h" | "?" => match rest.as_slice() {
-            [] => println!("{HELP}"),
+            [] => println!("{}", ui.text("magic-help")),
             [flag] if *flag == "--verbose" => println!(
-                "{HELP}
+                "{}
 
-{HELP_NOTES}"
+{}",
+                ui.text("magic-help"),
+                ui.text("magic-help-notes")
             ),
-            _ => println!("{}", ui.err("usage: %help [--verbose]")),
+            _ => println!("{}", ui.err(&ui.text("help-usage"))),
         },
         "quit" | "exit" | "q" => return Ok(Action::Quit),
 
@@ -451,14 +446,11 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
 
         "reset" => {
             session.reset();
-            println!("{}", ui.dim("session cleared"));
+            println!("{}", ui.dim(&ui.text("session-cleared")));
         }
 
         "header" | "headers" => {
-            println!(
-                "{}",
-                ui.dim("Automatically included (optional headers are guarded):")
-            );
+            println!("{}", ui.dim(&ui.text("headers-intro")));
             print!("{}", codegen::HEADERS);
         }
 
@@ -468,46 +460,39 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
                 let prog = codegen::build(session, "", Slot::Stmt);
                 println!("{}", format_c(&prog.src));
             }
-            _ => println!("{}", ui.err("usage: %src [--raw]")),
+            _ => println!("{}", ui.err(&ui.text("src-usage"))),
         },
 
         "edit" => match edit_input(&rest, session) {
             Ok(Some(input)) => return Ok(Action::Prefill(input)),
-            Ok(None) => println!("{}", ui.dim("nothing to edit")),
+            Ok(None) => println!("{}", ui.dim(&ui.text("nothing-to-edit"))),
             Err(message) => println!("{}", ui.err(&message)),
         },
 
         "type" => {
             if tail.is_empty() {
-                println!("{}", ui.err("usage: %type <expression>"));
+                println!("{}", ui.err(&ui.text("type-usage")));
             } else {
-                render_probe(
-                    ev.type_of(session, tail)?,
-                    ui,
-                    "type query produced no result",
-                );
+                render_probe(ev.type_of(session, tail)?, ui, &ui.text("type-no-result"));
             }
         }
 
         bits_command @ ("bits" | "Bits") => {
             let uppercase = bits_command == "Bits";
             if tail.is_empty() {
-                println!(
-                    "{}",
-                    ui.err(&format!("usage: %{bits_command} <expression>"))
-                );
+                let usage = ui.text_with("bits-usage", &[("command", bits_command.to_string())]);
+                println!("{}", ui.err(&usage));
             } else {
                 let result = ev.bits_of(session, tail, uppercase)?;
                 match result {
                     Eval::CompileError(diag) if unsupported_bits_type(&diag) => {
-                        println!(
-                            "{}",
-                            ui.err(&format!(
-                                "%{bits_command} supports standard scalar values and pointers to scalar types"
-                            ))
+                        let message = ui.text_with(
+                            "bits-unsupported",
+                            &[("command", bits_command.to_string())],
                         );
+                        println!("{}", ui.err(&message));
                     }
-                    result => render_probe(result, ui, "bits query produced no result"),
+                    result => render_probe(result, ui, &ui.text("bits-no-result")),
                 }
             }
         }
@@ -520,25 +505,28 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
                 _ => unreachable!(),
             };
             match unicode_query(tail) {
-                Err(message) => println!(
-                    "{}",
-                    ui.err(&format!(
-                        "usage: %{unicode_command} [-n code-units] <expression> ({message})"
-                    ))
-                ),
+                Err(message) => {
+                    let usage = ui.text_with(
+                        "unicode-usage",
+                        &[
+                            ("command", unicode_command.to_string()),
+                            ("message", message),
+                        ],
+                    );
+                    println!("{}", ui.err(&usage));
+                }
                 Ok((count, expression)) => {
                     let result = ev.unicode_of(session, expression, encoding, count)?;
                     match result {
                         Eval::CompileError(diag) if unsupported_unicode_type(&diag) => {
-                            println!(
-                                "{}",
-                                ui.err(&format!(
-                                    "%{unicode_command} supports pointers and arrays of integer code-unit types"
-                                ))
+                            let message = ui.text_with(
+                                "unicode-unsupported",
+                                &[("command", unicode_command.to_string())],
                             );
+                            println!("{}", ui.err(&message));
                         }
                         result => {
-                            render_probe(result, ui, "Unicode query produced no result");
+                            render_probe(result, ui, &ui.text("unicode-no-result"));
                         }
                     }
                 }
@@ -547,12 +535,12 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
 
         "where" => match rest.as_slice() {
             [name] if is_c_identifier(name) => render_where(name, ev, ui),
-            _ => println!("{}", ui.err("usage: %where <identifier>")),
+            _ => println!("{}", ui.err(&ui.text("where-usage"))),
         },
 
         "time" => {
             if tail.is_empty() {
-                println!("{}", ui.err("usage: %time <expression or statement>"));
+                println!("{}", ui.err(&ui.text("time-usage")));
             } else {
                 let n = session.counter + 1;
                 session.counter = n;
@@ -566,7 +554,7 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
                         }
                         let note = |s: &str| println!("{}", ui.dim(s));
                         if o.rewritten.is_some() {
-                            note("(missing semicolon added automatically)");
+                            note(&ui.text("note-missing-semicolon"));
                         }
                         if !o.warnings.trim().is_empty() {
                             println!("{}", ui.warn(o.warnings.trim_end()));
@@ -582,7 +570,7 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
                         match &o.abnormal {
                             Some(msg) => {
                                 println!("{}", ui.err(msg));
-                                note("(input not kept in the session)");
+                                note(&ui.text("note-input-not-kept"));
                             }
                             None => {
                                 if let Some(index) = o.file_replacement {
@@ -596,15 +584,13 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
                             }
                         }
                         if let Some(duration) = o.timed_duration {
+                            let label = ui.text("wall-time");
                             println!(
                                 "{}",
-                                ui.dim(&format!("Wall time: {}", format_duration(duration)))
+                                ui.dim(&format!("{label} {}", format_duration(duration)))
                             );
                         } else {
-                            println!(
-                                "{}",
-                                ui.dim("Wall time: unavailable (input did not complete)")
-                            );
+                            println!("{}", ui.dim(&ui.text("wall-time-unavailable")));
                         }
                     }
                 }
@@ -613,15 +599,10 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
 
         "timeit" => {
             if tail.is_empty() {
-                println!("{}", ui.err("usage: %timeit <expression or statement>"));
+                println!("{}", ui.err(&ui.text("timeit-usage")));
             } else {
                 if session.may_have_side_effects(tail) {
-                    println!(
-                        "{}",
-                        ui.warn(
-                            "\"%timeit input\" may execute repeatedly and is not retained for replay; later evaluations do not include its C state changes"
-                        )
-                    );
+                    println!("{}", ui.warn(&ui.text("timeit-state-warning")));
                 }
                 match ev.timeit(session, tail)? {
                     Eval::CompileError(diag) => println!("{}", ui.err(diag.trim_end())),
@@ -676,16 +657,18 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
                     }
                     _ => println!(
                         "{}",
-                        ui.err(&format!("this compiler does not support -std={want}"))
+                        ui.err(
+                            &ui.text_with("std-unsupported", &[("standard", want.to_string())],)
+                        )
                     ),
                 }
             }
         }
 
-        other => println!(
-            "{}",
-            ui.err(&format!("unknown command %{other} — try %help"))
-        ),
+        other => {
+            let message = ui.text_with("unknown-command", &[("command", other.to_string())]);
+            println!("{}", ui.err(&message));
+        }
     }
     Ok(Action::Continue)
 }

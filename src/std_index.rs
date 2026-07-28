@@ -14,19 +14,6 @@ pub enum Kind {
     Type,
 }
 
-impl Kind {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Function => "function",
-            Self::FunctionLikeMacro => "function-like macro",
-            Self::ObjectLikeMacro => "object-like macro",
-            Self::TypeGenericMacro => "type-generic macro",
-            Self::Typedef => "typedef",
-            Self::Type => "type",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CStandard {
     C89,

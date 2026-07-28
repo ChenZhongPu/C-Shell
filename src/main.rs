@@ -8,6 +8,7 @@ mod codegen;
 mod editor;
 mod errmap;
 mod eval;
+mod i18n;
 mod lex;
 mod magic;
 mod proc;
@@ -17,7 +18,10 @@ mod toolchain;
 mod ui;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{
+    Arg, ArgAction, CommandFactory, FromArgMatches, Parser,
+    error::{ContextKind, ErrorKind},
+};
 use reedline::{
     EditCommand, Emacs, IdeMenu, KeyCode, KeyModifiers, MenuBuilder, Reedline, ReedlineEvent,
     ReedlineMenu, Signal, default_emacs_keybindings,
@@ -29,11 +33,18 @@ use std::time::Duration;
 
 use crate::codegen::Slot;
 use crate::eval::{Eval, Evaluator};
+use crate::i18n::Language;
 use crate::session::Session;
 use crate::ui::Ui;
 
 #[derive(Parser)]
-#[command(name = "c-shell", version, about = "An interactive prompt for C")]
+#[command(
+    name = "c-shell",
+    version,
+    about = "An interactive prompt for C",
+    disable_help_flag = true,
+    disable_version_flag = true
+)]
 struct Args {
     /// C compiler to use (default: $CC, then the first one found on PATH)
     #[arg(long, value_name = "PATH")]
@@ -69,6 +80,10 @@ struct Args {
     /// Disable colored output
     #[arg(long)]
     no_color: bool,
+
+    /// UI language; overrides automatic locale detection
+    #[arg(long, value_enum, value_name = "LANG")]
+    lang: Option<Language>,
 }
 
 /// How results are rendered.
@@ -81,8 +96,122 @@ enum Style {
     Bare,
 }
 
+fn command_for(language: Language) -> clap::Command {
+    let tr = |key| i18n::text_for(language, key);
+    let command = Args::command()
+        .arg(
+            Arg::new("help")
+                .short('h')
+                .long("help")
+                .action(ArgAction::Help)
+                .help(tr("arg-help")),
+        )
+        .arg(
+            Arg::new("version")
+                .short('V')
+                .long("version")
+                .action(ArgAction::Version)
+                .help(tr("arg-version")),
+        )
+        .about(tr("app-about"))
+        .mut_arg("cc", |arg| arg.help(tr("arg-cc")))
+        .mut_arg("std", |arg| arg.help(tr("arg-std")))
+        .mut_arg("eval", |arg| arg.help(tr("arg-eval")))
+        .mut_arg("script", |arg| arg.help(tr("arg-script")))
+        .mut_arg("quiet", |arg| arg.help(tr("arg-quiet")))
+        .mut_arg("timeout", |arg| {
+            arg.help(tr("arg-timeout")).hide_default_value(true)
+        })
+        .mut_arg("no_color", |arg| arg.help(tr("arg-no-color")))
+        .mut_arg("lang", |arg| {
+            arg.help(tr("arg-lang")).hide_possible_values(true)
+        });
+    if language.is_chinese() {
+        let usage = tr("cli-usage");
+        let options = tr("cli-options");
+        command.help_template(format!(
+            "{{before-help}}{{about-with-newline}}\n{usage}{{usage}}\n\n{options}\n{{options}}{{after-help}}"
+        ))
+    } else {
+        command
+    }
+}
+
+fn cli_error_context(error: &clap::Error, kind: ContextKind) -> Option<String> {
+    error.get(kind).map(ToString::to_string)
+}
+
+fn exit_with_chinese_cli_error(error: clap::Error, command: &mut clap::Command) -> ! {
+    let argument = cli_error_context(&error, ContextKind::InvalidArg)
+        .unwrap_or_else(|| i18n::text("cli-argument"));
+    let value = cli_error_context(&error, ContextKind::InvalidValue).unwrap_or_default();
+    let prior = cli_error_context(&error, ContextKind::PriorArg).unwrap_or_default();
+    let message = match error.kind() {
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation => i18n::text_with(
+            "cli-invalid-value",
+            &[("argument", argument), ("value", value)],
+        ),
+        ErrorKind::UnknownArgument | ErrorKind::InvalidSubcommand => {
+            i18n::text_with("cli-unknown-argument", &[("argument", argument)])
+        }
+        ErrorKind::NoEquals => i18n::text_with("cli-equals-required", &[("argument", argument)]),
+        ErrorKind::TooManyValues | ErrorKind::WrongNumberOfValues => {
+            i18n::text_with("cli-wrong-value-count", &[("argument", argument)])
+        }
+        ErrorKind::TooFewValues | ErrorKind::MissingRequiredArgument => {
+            i18n::text_with("cli-missing-value", &[("argument", argument)])
+        }
+        ErrorKind::ArgumentConflict => i18n::text_with(
+            "cli-argument-conflict",
+            &[("argument", argument), ("prior", prior)],
+        ),
+        ErrorKind::InvalidUtf8 => i18n::text("cli-invalid-utf8"),
+        _ => i18n::text("cli-invalid-arguments"),
+    };
+    eprintln!("{}{message}", i18n::text("cli-error"));
+
+    if let Some(values) = cli_error_context(&error, ContextKind::ValidValue)
+        && !values.is_empty()
+    {
+        eprintln!(
+            "{}",
+            i18n::text_with("cli-valid-values", &[("values", values)])
+        );
+    }
+    if let Some(suggestion) = cli_error_context(&error, ContextKind::SuggestedArg)
+        && !suggestion.is_empty()
+    {
+        eprintln!(
+            "{}",
+            i18n::text_with("cli-suggestion", &[("suggestion", suggestion)])
+        );
+    }
+    let usage = command.render_usage().to_string();
+    let usage = usage.strip_prefix("Usage: ").unwrap_or(&usage);
+    eprintln!("\n{}{usage}", i18n::text("cli-usage"));
+    eprintln!("\n{}", i18n::text("cli-more-info"));
+    std::process::exit(error.exit_code());
+}
+
+fn parse_args(language: Language) -> Args {
+    let mut command = command_for(language);
+    let matches = match command.clone().try_get_matches() {
+        Ok(matches) => matches,
+        Err(error) if language.is_chinese() && error.use_stderr() => {
+            exit_with_chinese_cli_error(error, &mut command)
+        }
+        Err(error) => error.exit(),
+    };
+    Args::from_arg_matches(&matches).expect("clap arguments match Args")
+}
+
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let detected_language = i18n::detect();
+    let language = i18n::requested_from_args(std::env::args_os()).unwrap_or(detected_language);
+    i18n::set(language);
+    let args = parse_args(language);
+    let language = args.lang.unwrap_or(detected_language);
+    i18n::set(language);
     // Auto-detect: no colors when redirected, explicitly opted out, or on a
     // terminal that declared itself unable (TERM=dumb).
     let stdout_is_terminal = std::io::stdout().is_terminal();
@@ -97,6 +226,7 @@ fn main() -> Result<()> {
     let ui = Ui {
         color,
         hyperlinks: stdout_is_terminal && terminal_is_usable,
+        language,
     };
 
     let tc = toolchain::Toolchain::detect(args.cc.as_deref(), args.std.as_deref())?;
@@ -125,8 +255,13 @@ fn main() -> Result<()> {
     }
 
     if let Some(path) = &args.script {
-        let file = std::fs::File::open(path)
-            .with_context(|| format!("cannot open script {}", path.display()))?;
+        let file = std::fs::File::open(path).with_context(|| {
+            i18n::text_with_for(
+                language,
+                "script-open-error",
+                &[("path", path.display().to_string())],
+            )
+        })?;
         let ok = run_batch(std::io::BufReader::new(file), &mut session, &mut ev, &ui)?;
         std::process::exit(if ok { 0 } else { 1 });
     }
@@ -149,10 +284,7 @@ fn main() -> Result<()> {
             env!("CARGO_PKG_VERSION"),
             ev.tc.describe()
         );
-        println!(
-            "{}",
-            ui.dim("Type C code to evaluate it · %help for commands · Ctrl-D to exit")
-        );
+        println!("{}", ui.dim(&ui.text("startup-hint")));
     }
 
     // Completion vocabulary, refreshed after every input and shared with the
@@ -226,7 +358,7 @@ fn main() -> Result<()> {
         }
     }
 
-    println!("{}", ui.dim("bye"));
+    println!("{}", ui.dim(&ui.text("bye")));
     Ok(())
 }
 
@@ -314,7 +446,7 @@ fn submit(
             magic::Action::Continue => Ok((true, false, None)),
             magic::Action::Prefill(input) if interactive_edit => Ok((true, false, Some(input))),
             magic::Action::Prefill(_) => {
-                let message = ui.err("%edit is available only in interactive REPL mode");
+                let message = ui.err(&ui.text("edit-interactive-only"));
                 if style == Style::Bare {
                     eprintln!("{message}");
                 } else {
@@ -341,9 +473,8 @@ fn submit(
             .map(|name| format!("{name}()"))
             .collect::<Vec<_>>()
             .join(", ");
-        let msg = ui.warn(&format!(
-            "warning: external side-effect call detected ({calls}); retained inputs are replayed before every later evaluation, so input operations and file or process effects may happen repeatedly"
-        ));
+        let warning = ui.text_with("external-side-effect-warning", &[("calls", calls)]);
+        let msg = ui.warn(&warning);
         if bare {
             eprintln!("{msg}");
         } else {
@@ -374,14 +505,14 @@ fn submit(
                 }
             };
             if o.rewritten.is_some() {
-                note("(missing semicolon added automatically)");
+                note(&ui.text("note-missing-semicolon"));
             }
             if o.unprintable {
-                let msg = "valid expression, but this value category has no printer; evaluated without Out[n]";
+                let msg = ui.text("unprintable-value");
                 if bare {
                     eprintln!("{msg}");
                 } else {
-                    note(msg);
+                    note(&msg);
                 }
             }
             if !o.warnings.trim().is_empty() {
@@ -423,7 +554,7 @@ fn submit(
                     } else {
                         println!("{}", ui.err(msg));
                     }
-                    note("(input not kept in the session)");
+                    note(&ui.text("note-input-not-kept"));
                 }
                 None => {
                     if let Some(index) = o.file_replacement {
@@ -441,18 +572,19 @@ fn submit(
             }
             if o.abnormal.is_none() {
                 if o.file_replacement.is_some() {
-                    note("(replaced previous file-scope definition)");
+                    note(&ui.text("note-replaced-file"));
                 } else if o.slot == Slot::FileScope {
-                    note("(added at file scope)");
+                    note(&ui.text("note-added-file"));
                 }
                 if o.scoped_rebind {
-                    note("(opened a nested scope to shadow an earlier declaration)");
+                    note(&ui.text("note-shadowed"));
                 }
                 if !o.stdin_events.is_empty() {
-                    note(&format!(
-                        "(captured {} stdin request(s) for replay; contents hidden)",
-                        o.stdin_events.len()
-                    ));
+                    let message = ui.text_with(
+                        "note-stdin-captured",
+                        &[("count", o.stdin_events.len().to_string())],
+                    );
+                    note(&message);
                 }
             }
             Ok((o.abnormal.is_none(), false, None))

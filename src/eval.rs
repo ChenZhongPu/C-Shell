@@ -15,6 +15,7 @@ use crate::codegen::{
     UNPRINTABLE,
 };
 use crate::errmap;
+use crate::i18n;
 use crate::lex;
 use crate::proc;
 use crate::session::Session;
@@ -108,7 +109,7 @@ pub struct Evaluator {
 
 impl Evaluator {
     pub fn new(tc: crate::toolchain::Toolchain, timeout: Duration) -> Result<Self> {
-        let dir = tempfile::tempdir().context("failed to create temporary directory")?;
+        let dir = tempfile::tempdir().context(i18n::text("temp-dir-error"))?;
         Ok(Evaluator {
             tc,
             dir,
@@ -155,29 +156,39 @@ impl Evaluator {
         let src = self.src_path();
         let exe = self.exe_path();
         if let Err(e) = std::fs::write(&src, text) {
-            return Err(format!("cannot write temporary source: {e}"));
+            return Err(i18n::text_with(
+                "temp-source-write-error",
+                &[("error", e.to_string())],
+            ));
         }
         let args = self.tc.compile_args(&src, &exe, self.dir.path());
         let mut cmd = Command::new(&self.tc.path);
         cmd.args(&args);
         let cap = match proc::run_captured(&mut cmd, self.timeout, false) {
             Ok(c) => c,
-            Err(e) => return Err(format!("cannot run compiler: {e}")),
+            Err(e) => {
+                return Err(i18n::text_with(
+                    "compiler-run-error",
+                    &[("error", e.to_string())],
+                ));
+            }
         };
         let mut d = String::from_utf8_lossy(&cap.stderr).into_owned();
         d.push_str(&String::from_utf8_lossy(&cap.stdout));
         if cap.stdout_truncated || cap.stderr_truncated {
-            d.push_str(&format!(
-                "\ncompiler output exceeded {} MiB per stream and was truncated\n",
-                proc::MAX_CAPTURE_BYTES / (1024 * 1024)
+            d.push('\n');
+            d.push_str(&i18n::text_with(
+                "compiler-output-truncated",
+                &[("mib", (proc::MAX_CAPTURE_BYTES / (1024 * 1024)).to_string())],
             ));
+            d.push('\n');
         }
         match cap.status {
             Some(st) if st.success() => Ok((exe, d)),
             Some(_) => Err(d),
-            None => Err(format!(
-                "compiler timed out after {}s and was killed",
-                self.timeout.as_secs()
+            None => Err(i18n::text_with(
+                "compiler-timeout",
+                &[("seconds", self.timeout.as_secs().to_string())],
             )),
         }
     }
@@ -195,7 +206,14 @@ impl Evaluator {
     /// the expression once, as the selected helper's function argument.
     pub fn bits_of(&self, session: &Session, input: &str, uppercase: bool) -> Result<Eval> {
         let prog = codegen::build_bits_probe(session, input, uppercase);
-        self.run_probe(session, prog)
+        let mut result = self.run_probe(session, prog)?;
+        if i18n::current().is_chinese()
+            && let Eval::Done(outcome) = &mut result
+            && let Some(value) = &mut outcome.value
+        {
+            *value = localize_bits_output(value);
+        }
+        Ok(result)
     }
 
     /// Explicitly interpret an integer pointer/array as Unicode code units.
@@ -283,10 +301,7 @@ impl Evaluator {
             .map(|(name, _)| name == "main")
             .unwrap_or(false)
         {
-            return Ok(Eval::CompileError(
-                "c-shell already provides main(); enter the statements from its body directly and omit the final return"
-                    .to_string(),
-            ));
+            return Ok(Eval::CompileError(i18n::text("main-already-provided")));
         }
 
         let diag = match self.attempt(session, input, timed)? {
@@ -587,7 +602,12 @@ impl Evaluator {
         } else {
             proc::run_captured(&mut cmd, self.timeout, self.allow_program_stdin)
         }
-        .with_context(|| format!("failed to start {}", exe.display()))?;
+        .with_context(|| {
+            i18n::text_with(
+                "program-start-error",
+                &[("path", exe.display().to_string())],
+            )
+        })?;
         let process_duration = start_time.elapsed();
         if let Some(live) = &live {
             live.finish();
@@ -601,28 +621,26 @@ impl Evaluator {
         let duration = timed_duration.unwrap_or(process_duration);
 
         let abnormal = match cap.status {
-            None => Some(format!(
-                "killed after {}s (possible infinite loop)",
-                self.timeout.as_secs()
+            None => Some(i18n::text_with(
+                "program-killed",
+                &[("seconds", self.timeout.as_secs().to_string())],
             )),
             Some(st) => describe_abnormal(&st),
         }
         .or_else(|| {
             (cap.stdout_truncated || cap.stderr_truncated).then(|| {
-                format!(
-                    "program output exceeded {} MiB per stream and was truncated",
-                    proc::MAX_CAPTURE_BYTES / (1024 * 1024)
+                i18n::text_with(
+                    "program-output-truncated",
+                    &[("mib", (proc::MAX_CAPTURE_BYTES / (1024 * 1024)).to_string())],
                 )
             })
         })
         .or_else(|| {
-            cap.stdin_diverged.then(|| {
-                "stdin tape diverged while replaying retained input; use %reset".to_string()
-            })
+            cap.stdin_diverged
+                .then(|| i18n::text("stdin-tape-diverged"))
         })
         .or_else(|| {
-            (!out_parts.done || !err_parts.done)
-                .then(|| "program exited before the input completed".to_string())
+            (!out_parts.done || !err_parts.done).then(|| i18n::text("program-exited-early"))
         });
 
         let streamed_output_needs_newline = live
@@ -759,14 +777,30 @@ impl Evaluator {
         let std_dev = variance.sqrt();
 
         let (mean_str, dev_str) = format_timeit_stats(mean, std_dev);
-        let report = format!(
-            "{} ± {} per loop (mean ± std. dev. of {} run{}, {} loop{} each)",
-            mean_str,
-            dev_str,
-            samples_ns.len(),
-            if samples_ns.len() == 1 { "" } else { "s" },
-            format_integer(loops),
-            if loops == 1 { "" } else { "s" }
+        let report = i18n::text_with(
+            "timeit-report",
+            &[
+                ("mean", mean_str),
+                ("deviation", dev_str),
+                ("runs", samples_ns.len().to_string()),
+                (
+                    "run-word",
+                    i18n::text(if samples_ns.len() == 1 {
+                        "timeit-run"
+                    } else {
+                        "timeit-runs"
+                    }),
+                ),
+                ("loops", format_integer(loops)),
+                (
+                    "loop-word",
+                    i18n::text(if loops == 1 {
+                        "timeit-loop"
+                    } else {
+                        "timeit-loops"
+                    }),
+                ),
+            ],
         );
 
         Ok(Eval::Done(Outcome {
@@ -820,7 +854,66 @@ fn render_utf8_payload(value: &str) -> Option<String> {
         .map(|byte| format!("0x{byte:02x}"))
         .collect::<Vec<_>>()
         .join(", ");
-    Some(format!("u8\"{escaped}\"\ncode units: {{{code_units}}}"))
+    Some(format!(
+        "u8\"{escaped}\"\n{} {{{code_units}}}",
+        i18n::text("unicode-code-units")
+    ))
+}
+
+fn localize_bits_output(value: &str) -> String {
+    value
+        .lines()
+        .map(|line| {
+            let translate_prefix = |prefix: &str, key: &str| {
+                line.strip_prefix(prefix)
+                    .map(|rest| format!("{} {rest}", i18n::text(key)))
+            };
+            translate_prefix("type: ", "bits-type")
+                .or_else(|| {
+                    line.strip_prefix("size: ").map(|rest| {
+                        let rest = rest
+                            .strip_suffix(" bytes")
+                            .map(|number| format!("{number} {}", i18n::text("bits-bytes")))
+                            .or_else(|| {
+                                rest.strip_suffix(" byte")
+                                    .map(|number| format!("{number} {}", i18n::text("bits-byte")))
+                            })
+                            .unwrap_or_else(|| rest.to_string());
+                        format!("{} {rest}", i18n::text("bits-size"))
+                    })
+                })
+                .or_else(|| translate_prefix("value: ", "bits-value"))
+                .or_else(|| translate_prefix("hex: ", "bits-hex"))
+                .or_else(|| translate_prefix("binary: ", "bits-binary"))
+                .or_else(|| translate_prefix("memory: ", "bits-memory"))
+                .or_else(|| {
+                    line.strip_prefix("byte order: ").map(|order| {
+                        let order = match order {
+                            "little-endian" => i18n::text("bits-little-endian"),
+                            "big-endian" => i18n::text("bits-big-endian"),
+                            _ => order.to_string(),
+                        };
+                        format!("{} {order}", i18n::text("bits-byte-order"))
+                    })
+                })
+                .or_else(|| translate_prefix("sign: ", "bits-sign"))
+                .or_else(|| {
+                    translate_prefix("exponent: ", "bits-exponent").map(|line| {
+                        line.replace(
+                            "(zero/subnormal)",
+                            &format!("({})", i18n::text("bits-zero-subnormal")),
+                        )
+                        .replace(
+                            "(infinity/NaN)",
+                            &format!("({})", i18n::text("bits-infinity-nan")),
+                        )
+                    })
+                })
+                .or_else(|| translate_prefix("fraction: ", "bits-fraction"))
+                .unwrap_or_else(|| line.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn render_unicode_payload(value: &str, encoding: UnicodeEncoding, limit: usize) -> Option<String> {
@@ -855,17 +948,24 @@ fn render_unicode_payload(value: &str, encoding: UnicodeEncoding, limit: usize) 
         return None;
     }
 
-    let mut lines = vec![format!("encoding: {}", encoding.label())];
+    let mut lines = vec![format!(
+        "{} {}",
+        i18n::text("unicode-encoding"),
+        encoding.label()
+    )];
     if status == "N" {
-        lines.push("address: NULL".to_string());
+        lines.push(format!("{} NULL", i18n::text("unicode-address")));
         return Some(lines.join("\n"));
     }
 
-    lines.push(format!("address: 0x{address}"));
+    lines.push(format!("{} 0x{address}", i18n::text("unicode-address")));
     if status == "M" {
-        lines.push(format!(
-            "error: expected {}-byte code units, but the expression points to {actual_width}-byte elements",
-            encoding.unit_width()
+        lines.push(i18n::text_with(
+            "unicode-width-error",
+            &[
+                ("expected", encoding.unit_width().to_string()),
+                ("actual", actual_width.to_string()),
+            ],
         ));
         return Some(lines.join("\n"));
     }
@@ -874,16 +974,20 @@ fn render_unicode_payload(value: &str, encoding: UnicodeEncoding, limit: usize) 
     }
 
     let text_units = units.strip_suffix(&[0]).unwrap_or(units.as_slice());
-    let text_label = if status == "L" { "text prefix" } else { "text" };
+    let text_label = i18n::text(if status == "L" {
+        "unicode-text-prefix"
+    } else {
+        "unicode-text"
+    });
     match decode_unicode(text_units, encoding) {
         Ok(text) => {
             let escaped = text.chars().map(escape_utf8_char).collect::<String>();
             lines.push(format!(
-                "{text_label}: {}\"{escaped}\"",
+                "{text_label} {}\"{escaped}\"",
                 encoding.literal_prefix()
             ));
         }
-        Err(error) => lines.push(format!("{text_label}: <{error}>")),
+        Err(error) => lines.push(format!("{text_label} <{error}>")),
     }
 
     let code_units = units
@@ -891,10 +995,14 @@ fn render_unicode_payload(value: &str, encoding: UnicodeEncoding, limit: usize) 
         .map(|unit| format!("0x{unit:0width$x}", width = encoding.hex_digits()))
         .collect::<Vec<_>>()
         .join(", ");
-    lines.push(format!("code units: {{{code_units}}}"));
+    lines.push(format!(
+        "{} {{{code_units}}}",
+        i18n::text("unicode-code-units")
+    ));
     if status == "L" {
-        lines.push(format!(
-            "note: no NUL terminator in the first {limit} code units"
+        lines.push(i18n::text_with(
+            "unicode-no-nul",
+            &[("limit", limit.to_string())],
         ));
     }
     Some(lines.join("\n"))
@@ -907,16 +1015,20 @@ fn decode_unicode(units: &[u32], encoding: UnicodeEncoding) -> std::result::Resu
                 .iter()
                 .enumerate()
                 .map(|(index, &unit)| {
-                    u8::try_from(unit)
-                        .map_err(|_| format!("invalid UTF-8 code unit at index {index}"))
+                    u8::try_from(unit).map_err(|_| {
+                        i18n::text_with(
+                            "unicode-invalid-utf8-unit",
+                            &[("index", index.to_string())],
+                        )
+                    })
                 })
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             std::str::from_utf8(&bytes)
                 .map(str::to_string)
                 .map_err(|error| {
-                    format!(
-                        "invalid UTF-8 sequence at code unit {}",
-                        error.valid_up_to()
+                    i18n::text_with(
+                        "unicode-invalid-utf8-sequence",
+                        &[("index", error.valid_up_to().to_string())],
                     )
                 })
         }
@@ -925,8 +1037,9 @@ fn decode_unicode(units: &[u32], encoding: UnicodeEncoding) -> std::result::Resu
             .iter()
             .enumerate()
             .map(|(index, &unit)| {
-                char::from_u32(unit)
-                    .ok_or_else(|| format!("invalid UTF-32 scalar value at index {index}"))
+                char::from_u32(unit).ok_or_else(|| {
+                    i18n::text_with("unicode-invalid-utf32", &[("index", index.to_string())])
+                })
             })
             .collect(),
     }
@@ -938,20 +1051,32 @@ fn decode_utf16(units: &[u32]) -> std::result::Result<String, String> {
     while index < units.len() {
         let first = units[index];
         if first > u16::MAX as u32 {
-            return Err(format!("invalid UTF-16 code unit at index {index}"));
+            return Err(i18n::text_with(
+                "unicode-invalid-utf16-unit",
+                &[("index", index.to_string())],
+            ));
         }
         if (0xd800..=0xdbff).contains(&first) {
             let Some(&second) = units.get(index + 1) else {
-                return Err(format!("unpaired UTF-16 high surrogate at index {index}"));
+                return Err(i18n::text_with(
+                    "unicode-unpaired-high",
+                    &[("index", index.to_string())],
+                ));
             };
             if !(0xdc00..=0xdfff).contains(&second) {
-                return Err(format!("unpaired UTF-16 high surrogate at index {index}"));
+                return Err(i18n::text_with(
+                    "unicode-unpaired-high",
+                    &[("index", index.to_string())],
+                ));
             }
             let scalar = 0x10000 + ((first - 0xd800) << 10) + (second - 0xdc00);
             text.push(char::from_u32(scalar).expect("paired surrogates form a scalar"));
             index += 2;
         } else if (0xdc00..=0xdfff).contains(&first) {
-            return Err(format!("unpaired UTF-16 low surrogate at index {index}"));
+            return Err(i18n::text_with(
+                "unicode-unpaired-low",
+                &[("index", index.to_string())],
+            ));
         } else {
             text.push(char::from_u32(first).expect("non-surrogate u16 is a scalar"));
             index += 1;
@@ -963,7 +1088,10 @@ fn decode_utf16(units: &[u32]) -> std::result::Result<String, String> {
 fn render_byte_array(bytes: &[u8], size: usize) -> String {
     let mut elements = bytes.iter().map(u8::to_string).collect::<Vec<_>>();
     if size > bytes.len() {
-        elements.push(format!("... ({} more)", size - bytes.len()));
+        elements.push(i18n::text_with(
+            "array-more",
+            &[("count", (size - bytes.len()).to_string())],
+        ));
     }
     format!("{{{}}}", elements.join(", "))
 }
@@ -1381,16 +1509,12 @@ fn describe_abnormal(st: &std::process::ExitStatus) -> Option<String> {
     use std::os::unix::process::ExitStatusExt;
     let sig = st.signal()?;
     Some(match sig {
-        11 => "program crashed: segmentation fault (SIGSEGV) — \
-               usually a NULL/wild pointer dereference or an out-of-bounds index"
-            .into(),
-        6 => "program aborted (SIGABRT) — \
-              usually a failed assert, or heap corruption caught by the C library"
-            .into(),
-        8 => "arithmetic error (SIGFPE) — usually integer division by zero".into(),
-        4 => "illegal instruction (SIGILL)".into(),
-        7 | 10 => "bus error (SIGBUS) — usually a misaligned memory access".into(),
-        _ => format!("program terminated by signal {sig}"),
+        11 => i18n::text("signal-segv"),
+        6 => i18n::text("signal-abrt"),
+        8 => i18n::text("signal-fpe"),
+        4 => i18n::text("signal-ill"),
+        7 | 10 => i18n::text("signal-bus"),
+        _ => i18n::text_with("signal-other", &[("signal", sig.to_string())]),
     })
 }
 
@@ -1399,13 +1523,11 @@ fn describe_abnormal(st: &std::process::ExitStatus) -> Option<String> {
     // Windows has no signals; a fatal fault surfaces as an NTSTATUS exit code.
     let code = st.code()? as u32;
     Some(match code {
-        0xC0000005 => "program crashed: access violation — \
-                       usually a NULL/wild pointer dereference or an out-of-bounds index"
-            .into(),
-        0xC0000094 => "arithmetic error: integer division by zero".into(),
-        0xC000001D => "illegal instruction".into(),
-        0xC00000FD => "stack overflow — usually runaway recursion or a huge stack array".into(),
-        0xC0000409 => "stack buffer overrun detected".into(),
+        0xC0000005 => i18n::text("windows-access-violation"),
+        0xC0000094 => i18n::text("windows-division-zero"),
+        0xC000001D => i18n::text("windows-illegal-instruction"),
+        0xC00000FD => i18n::text("windows-stack-overflow"),
+        0xC0000409 => i18n::text("windows-buffer-overrun"),
         _ => return None,
     })
 }

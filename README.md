@@ -1,6 +1,12 @@
 <h1 align="center">c-shell</h1>
 
 <p align="center">
+  English
+  ·
+  <a href="README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
   <strong>A compiler-backed interactive shell for C.</strong>
   <br>
   Explore syntax, types, diagnostics, and implementation behavior without writing a temporary <code>main</code>.
@@ -41,7 +47,7 @@
 Start `c-shell` and type C directly at the prompt:
 
 ```text
-c-shell 0.2.7  ·  cc (GCC) 16.1.1 (default std gnu23)
+c-shell 0.2.8  ·  cc (GCC) 16.1.1 (default std gnu23)
 In [1]: int x = 41;
 In [2]: x + 1
 Out[2]: 42
@@ -120,6 +126,7 @@ genuine GCC.
 c-shell                              # auto-detect a compiler
 c-shell --cc clang --std c23         # request compiler and mode; verify the banner
 c-shell --timeout 30                 # deadline for each compilation and program run
+c-shell --lang zh                    # force the Chinese UI (use en for English)
 c-shell -e 'sizeof(long)'            # evaluate and exit: bare value on stdout,
                                      # diagnostics on stderr, exit code on failure
 c-shell --script demo.csh            # run inputs from a file, then exit
@@ -132,6 +139,12 @@ Terminal handling is automatic: when stdout is not a terminal (or
 terminal the banner, prompts and farewell are suppressed and input is read
 in batch mode — which also accumulates multi-line definitions, so scripts
 and pipes can contain full function bodies.
+
+The c-shell interface defaults to English and automatically selects Chinese
+when the system UI locale is Chinese. Use `--lang en` or `--lang zh` to
+override detection. This affects only text written by c-shell: compiler
+diagnostics, compiler version strings, and evaluated program output pass
+through unchanged.
 
 The language standard defaults to **whatever your compiler defaults to**
 (gnu23 for gcc 16, gnu17 for clang 22; the banner shows what was detected).
@@ -486,6 +499,12 @@ by surprise on push.
 Before working on the code, read [DESIGN.md](DESIGN.md): it records the
 architecture decisions, the open state-model question, and several traps you
 need to know about before changing things.
+
+Interface translations live in Fluent message catalogs under `locales/`.
+English is the fallback catalog, and the key-set test requires every catalog
+to define the same messages. Keep compiler diagnostics and evaluated program
+output out of these catalogs: they belong to the selected compiler and the
+user's C program, respectively.
 
 ## License
 
