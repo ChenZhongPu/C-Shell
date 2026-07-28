@@ -255,7 +255,7 @@ Direct `u8"..."` literals and bare identifiers explicitly declared as
 one-dimensional `char8_t` arrays receive a validated UTF-8 preview:
 
 ```text
-In [1]: const char8_t smiley[] = u8"\xF0\x9F\x99\x82";
+In [1]: const char8_t smiley[] = u8"\U0001F642";
 In [2]: smiley
 Out[2]: u8"🙂"
 code units: {0xf0, 0x9f, 0x99, 0x82, 0x00}

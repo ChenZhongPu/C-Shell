@@ -153,7 +153,7 @@ fn explicit_u8_literals_get_a_safe_utf8_preview_only() {
 fn unicode_magics_decode_explicit_code_units_without_changing_session() {
     let out = run(&[
         "int untouched = 0;",
-        r#"%utf8 ((++untouched == 1) ? u8"A\xE5\xA5\xBD\xF0\x9F\x98\x80" : u8"twice")"#,
+        r#"%utf8 ((++untouched == 1) ? u8"A\u597D\U0001F600" : u8"twice")"#,
         r#"%utf16 u"A\u597D\U0001F600""#,
         r#"%utf32 U"A\u597D\U0001F600""#,
         "%utf8 -n 3 (const unsigned char[]){0x41, 0, 0x42}",
