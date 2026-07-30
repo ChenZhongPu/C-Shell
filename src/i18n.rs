@@ -43,6 +43,13 @@ impl Language {
         self == Self::Chinese
     }
 
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::English => "en",
+            Self::Chinese => "zh",
+        }
+    }
+
     fn identifier(self) -> LanguageIdentifier {
         match self {
             Self::English => "en".parse().expect("valid embedded English locale"),

@@ -6,8 +6,22 @@
 //! Windows (MinGW and MSVC), which is precisely the coverage a dev machine
 //! cannot provide.
 
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+use tungstenite::{
+    Message as WebSocketMessage, client::IntoClientRequest, connect, stream::MaybeTlsStream,
+};
+
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 /// Feed `lines` to c-shell on stdin, return everything it printed to stdout.
 fn run(lines: &[&str]) -> String {
@@ -69,6 +83,165 @@ fn run_evals_with_stdin(codes: &[&str], input: &str) -> std::process::Output {
         .write_all(input.as_bytes())
         .expect("write program stdin");
     child.wait_with_output().expect("wait for c-shell -e")
+}
+
+#[test]
+fn web_mode_serves_a_local_pty_repl_behind_a_random_path() {
+    let child = Command::new(env!("CARGO_BIN_EXE_c-shell"))
+        .args(["--web", "--no-open", "--lang", "en", "--no-color"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start c-shell --web");
+    let mut child = ChildGuard(child);
+    let stdout = child.0.stdout.take().expect("web server stdout");
+    let mut stdout = BufReader::new(stdout);
+    let mut first_line = String::new();
+    stdout
+        .read_line(&mut first_line)
+        .expect("read browser terminal URL");
+    let url = first_line
+        .split_whitespace()
+        .find(|word| word.starts_with("http://127.0.0.1:"))
+        .expect("local browser terminal URL")
+        .to_string();
+    assert!(
+        url.ends_with('/')
+            && url
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .is_some_and(|token| {
+                    token.len() == 32
+                        && token
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                }),
+        "URL did not contain a random 128-bit path: {url}"
+    );
+
+    let origin = url
+        .strip_prefix("http://")
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(authority, _)| format!("http://{authority}"))
+        .expect("URL authority");
+    let (authority, token_path) = url
+        .strip_prefix("http://")
+        .and_then(|rest| rest.split_once('/'))
+        .expect("HTTP URL parts");
+    let mut http = TcpStream::connect(authority).expect("connect browser page");
+    http.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set HTTP timeout");
+    write!(
+        http,
+        "GET /{token_path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+    )
+    .expect("request browser page");
+    let mut page = String::new();
+    http.read_to_string(&mut page).expect("read browser page");
+    assert!(
+        page.starts_with("HTTP/1.1 200 OK\r\n")
+            && page.contains("content-security-policy:")
+            && page.contains("<script defer src=\"xterm.js\"></script>")
+            && page.contains("<main id=\"terminal\""),
+        "random-path page was incomplete:\n{page}"
+    );
+
+    let websocket_url = format!("{}ws", url.replacen("http://", "ws://", 1));
+
+    let mut forbidden = websocket_url
+        .clone()
+        .into_client_request()
+        .expect("invalid-origin request");
+    forbidden
+        .headers_mut()
+        .insert("Origin", "http://example.invalid".parse().unwrap());
+    let error = connect(forbidden).expect_err("foreign WebSocket origin was accepted");
+    assert!(
+        matches!(
+            error,
+            tungstenite::Error::Http(ref response)
+                if response.status() == tungstenite::http::StatusCode::FORBIDDEN
+        ),
+        "unexpected invalid-origin result: {error}"
+    );
+
+    let mut request = websocket_url
+        .into_client_request()
+        .expect("local WebSocket request");
+    request
+        .headers_mut()
+        .insert("Origin", origin.parse().unwrap());
+    let (mut socket, response) = connect(request).expect("connect local browser terminal");
+    assert_eq!(
+        response.status(),
+        tungstenite::http::StatusCode::SWITCHING_PROTOCOLS
+    );
+    if let MaybeTlsStream::Plain(stream) = socket.get_mut() {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .expect("set WebSocket timeout");
+    }
+    socket
+        .send(WebSocketMessage::Text("resize:100:30".into()))
+        .expect("resize browser terminal");
+
+    let mut transcript = Vec::new();
+    let mut cursor_reports = 0;
+    let mut sent_expression = false;
+    while !String::from_utf8_lossy(&transcript).contains("Out[1]: 2") {
+        let message = socket.read().unwrap_or_else(|error| {
+            panic!(
+                "read browser terminal output: {error}\ntranscript:\n{}",
+                String::from_utf8_lossy(&transcript)
+            )
+        });
+        match message {
+            WebSocketMessage::Binary(bytes) => transcript.extend_from_slice(&bytes),
+            WebSocketMessage::Text(text) => transcript.extend_from_slice(text.as_bytes()),
+            WebSocketMessage::Close(_) => panic!(
+                "browser terminal closed early:\n{}",
+                String::from_utf8_lossy(&transcript)
+            ),
+            WebSocketMessage::Ping(bytes) => {
+                socket
+                    .send(WebSocketMessage::Pong(bytes))
+                    .expect("reply to WebSocket ping");
+            }
+            WebSocketMessage::Pong(_) | WebSocketMessage::Frame(_) => {}
+        }
+        let cursor_queries = transcript
+            .windows(b"\x1b[6n".len())
+            .filter(|window| *window == b"\x1b[6n")
+            .count();
+        while cursor_reports < cursor_queries {
+            // Reedline asks the terminal for its cursor position. xterm.js
+            // answers this automatically; this raw WebSocket test client must
+            // provide the minimum terminal response itself.
+            socket
+                .send(WebSocketMessage::Binary(b"\x1b[1;1R".to_vec().into()))
+                .expect("answer cursor-position query");
+            cursor_reports += 1;
+        }
+        if !sent_expression && String::from_utf8_lossy(&transcript).contains("In [1]:") {
+            socket
+                .send(WebSocketMessage::Binary(b"1 + 1\r".to_vec().into()))
+                .expect("send C expression");
+            sent_expression = true;
+        }
+    }
+    assert!(
+        String::from_utf8_lossy(&transcript)
+            .contains(&format!("c-shell {}", env!("CARGO_PKG_VERSION"))),
+        "PTY did not run the regular interactive REPL:\n{}",
+        String::from_utf8_lossy(&transcript)
+    );
+    assert!(
+        !String::from_utf8_lossy(&transcript).contains("c-shell --web"),
+        "browser PTY repeated the terminal-only web hint:\n{}",
+        String::from_utf8_lossy(&transcript)
+    );
+    let _ = socket.close(None);
 }
 
 #[test]

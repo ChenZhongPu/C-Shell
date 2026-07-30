@@ -4,7 +4,7 @@ Settled architecture decisions, the one big open problem, and the traps buried
 in the code that you must know about before changing it. README is for users;
 this file is for whoever develops the tool next.
 
-Status: v0.2.8 working. ~10500 lines of Rust, 147 tests (101 unit + 46
+Status: v0.3.0 working. ~11000 lines of Rust, 150 tests (103 unit + 47
 end-to-end smoke), clippy/fmt clean, English/Chinese UI. Verified on Linux with gcc
 16.1.1 and clang 22.1.6. CI exercises the default macOS compiler and two
 Windows driver dialects (a GNU-style driver and MSVC); see
@@ -20,6 +20,7 @@ Windows driver dialects (a GNU-style driver and MSVC); see
 | `eval.rs` | trial-compile classification/rebinding, compile, run with timeout, crash diagnosis |
 | `editor.rs` | reedline integration: syntect highlighting, completion menu, multi-line validation, prompt |
 | `main.rs` | CLI, REPL, `-e`, script and piped-input modes |
+| `web.rs` | local-only Axum/WebSocket server, PTY sessions, bundled browser terminal assets |
 | `lex.rs` | byte-level scan: bracket balance, literals/comments, purity and identifier heuristics |
 | `errmap.rs` | diagnostic provenance/remapping, scaffolding removal, stale-warning filtering |
 | `tests/smoke.rs` | end-to-end tests driving the real binary and compiler |
@@ -50,6 +51,14 @@ retained session names), process-local Up/Down recall and numbered-input
 timeout-path tree cleanup for compiler/probe/user-program children, cached
 compiler capability probes, CI for 4 platform configs, and a tag-triggered release
 workflow.
+
+The `--web` mode binds only `127.0.0.1` on an OS-selected port and registers
+all HTTP/WebSocket routes below a fresh 128-bit random path. It validates the
+exact Host and Origin on every upgrade, applies a restrictive CSP, and embeds
+fixed xterm.js assets rather than loading a CDN. Each WebSocket owns one child
+invocation of the same c-shell executable through `portable-pty`, so the normal
+Reedline terminal path remains authoritative. A watch channel closes active
+sessions on server Ctrl-C; socket teardown kills its PTY child.
 
 ---
 

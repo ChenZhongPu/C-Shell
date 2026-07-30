@@ -47,7 +47,7 @@
 Start `c-shell` and type C directly at the prompt:
 
 ```text
-c-shell 0.2.8  ·  cc (GCC) 16.1.1 (default std gnu23)
+c-shell 0.3.0  ·  cc (GCC) 16.1.1 (default std gnu23)
 In [1]: int x = 41;
 In [2]: x + 1
 Out[2]: 42
@@ -77,8 +77,9 @@ Out[5]: 1
   representations and IEEE-754 fields. `%utf8`/`%utf16`/`%utf32` explicitly
   decode Unicode code units, and `%where` identifies the portable standard
   header for an ISO C library name.
-- **Interactive or scriptable.** Use the REPL, `-e`, script files, or piped
-  input with deterministic exit status and diagnostics.
+- **Terminal, browser, or script.** Use the REPL directly, open the same PTY
+  experience in a local browser, or run `-e`, script files, and piped input
+  with deterministic exit status and diagnostics.
 - **Cross-platform compiler drivers.** GNU-style and MSVC-style command lines
   are detected by capability probes rather than executable names.
 
@@ -127,6 +128,8 @@ c-shell                              # auto-detect a compiler
 c-shell --cc clang --std c23         # request compiler and mode; verify the banner
 c-shell --timeout 30                 # deadline for each compilation and program run
 c-shell --lang zh                    # force the Chinese UI (use en for English)
+c-shell --web                        # open a browser terminal on this machine
+c-shell --web --no-open              # print its local URL without opening it
 c-shell -e 'sizeof(long)'            # evaluate and exit: bare value on stdout,
                                      # diagnostics on stderr, exit code on failure
 c-shell --script demo.csh            # run inputs from a file, then exit
@@ -145,6 +148,26 @@ when the system UI locale is Chinese. Use `--lang en` or `--lang zh` to
 override detection. This affects only text written by c-shell: compiler
 diagnostics, compiler version strings, and evaluated program output pass
 through unchanged.
+
+### Local browser terminal
+
+`c-shell --web` starts the regular interactive REPL in a pseudo-terminal and
+opens an xterm.js terminal in the default browser. Completion, colors,
+multi-line editing, Ctrl-C, and program input such as `scanf` therefore follow
+the terminal behavior rather than a separate web implementation.
+
+The server always binds a random port on `127.0.0.1`; there is deliberately no
+option to listen on a LAN or public address. It also generates a new random
+128-bit URL path, accepts WebSocket upgrades only from the exact local page
+origin, and serves bundled assets without a CDN. Each browser tab creates an
+independent c-shell process. Closing the tab terminates that process; pressing
+Ctrl-C in the launching terminal stops the server and its active sessions.
+
+Use `--web --no-open` when you want only the URL. Compiler, standard, timeout,
+language, quiet, and color options are forwarded to every browser session.
+`--web` cannot be combined with `--eval` or `--script`. The random URL is an
+additional local safeguard, not a reason to share it with untrusted local
+processes or users.
 
 The language standard defaults to **whatever your compiler defaults to**
 (gnu23 for gcc 16, gnu17 for clang 22; the banner shows what was detected).

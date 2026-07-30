@@ -16,6 +16,7 @@ mod session;
 mod std_index;
 mod toolchain;
 mod ui;
+mod web;
 
 use anyhow::{Context, Result};
 use clap::{
@@ -84,6 +85,14 @@ struct Args {
     /// UI language; overrides automatic locale detection
     #[arg(long, value_enum, value_name = "LANG")]
     lang: Option<Language>,
+
+    /// Start a browser terminal available only on this machine
+    #[arg(long, conflicts_with_all = ["eval", "script"])]
+    web: bool,
+
+    /// Do not open the browser automatically
+    #[arg(long, requires = "web")]
+    no_open: bool,
 }
 
 /// How results are rendered.
@@ -125,7 +134,9 @@ fn command_for(language: Language) -> clap::Command {
         .mut_arg("no_color", |arg| arg.help(tr("arg-no-color")))
         .mut_arg("lang", |arg| {
             arg.help(tr("arg-lang")).hide_possible_values(true)
-        });
+        })
+        .mut_arg("web", |arg| arg.help(tr("arg-web")))
+        .mut_arg("no_open", |arg| arg.help(tr("arg-no-open")));
     if language.is_chinese() {
         let usage = tr("cli-usage");
         let options = tr("cli-options");
@@ -212,6 +223,31 @@ fn main() -> Result<()> {
     let args = parse_args(language);
     let language = args.lang.unwrap_or(detected_language);
     i18n::set(language);
+
+    if args.web {
+        let mut child_args = Vec::<std::ffi::OsString>::new();
+        if let Some(cc) = &args.cc {
+            child_args.extend(["--cc".into(), cc.into()]);
+        }
+        if let Some(standard) = &args.std {
+            child_args.extend(["--std".into(), standard.into()]);
+        }
+        child_args.extend(["--timeout".into(), args.timeout.to_string().into()]);
+        child_args.extend(["--lang".into(), language.code().into()]);
+        if args.quiet {
+            child_args.push("--quiet".into());
+        }
+        if args.no_color {
+            child_args.push("--no-color".into());
+        }
+        return web::serve(web::Config {
+            child_args,
+            language,
+            open_browser: !args.no_open,
+            quiet: args.quiet,
+        });
+    }
+
     // Auto-detect: no colors when redirected, explicitly opted out, or on a
     // terminal that declared itself unable (TERM=dumb).
     let stdout_is_terminal = std::io::stdout().is_terminal();
@@ -285,6 +321,9 @@ fn main() -> Result<()> {
             ev.tc.describe()
         );
         println!("{}", ui.dim(&ui.text("startup-hint")));
+        if std::env::var_os("C_SHELL_WEB").is_none() {
+            println!("{}", ui.dim(&ui.text("web-launch-hint")));
+        }
     }
 
     // Completion vocabulary, refreshed after every input and shared with the

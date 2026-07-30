@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="{{lang}}">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>c-shell</title>
+    <link rel="stylesheet" href="xterm.css">
+    <link rel="stylesheet" href="app.css">
+    <script defer src="xterm.js"></script>
+    <script defer src="addon-fit.js"></script>
+    <script defer src="app.js"></script>
+  </head>
+  <body
+    data-connecting="{{connecting}}"
+    data-disconnected="{{disconnected}}"
+  >
+    <main id="terminal" aria-label="c-shell"></main>
+    <div id="status" role="status">{{connecting}}</div>
+  </body>
+</html>
