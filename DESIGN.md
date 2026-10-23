@@ -4,7 +4,7 @@ Settled architecture decisions, the one big open problem, and the traps buried
 in the code that you must know about before changing it. README is for users;
 this file is for whoever develops the tool next.
 
-Status: v0.3.1 working. ~13000 lines of Rust, 167 tests (107 unit + 60
+Status: v0.3.1 working. ~13000 lines of Rust, 183 tests (114 unit + 69
 end-to-end smoke), clippy/fmt clean, English/Chinese UI. Verified on Linux with gcc
 16.1.1 and clang 22.1.6. CI exercises the default macOS compiler and two
 Windows driver dialects (a GNU-style driver and MSVC); see
@@ -25,6 +25,7 @@ Windows driver dialects (a GNU-style driver and MSVC); see
 | `errmap.rs` | diagnostic provenance/remapping, scaffolding removal, stale-warning filtering |
 | `tests/smoke.rs` | end-to-end tests driving the real binary and compiler |
 | `proc.rs` | child deadlines, output capture, request-driven stdin tape transport and timeout-path process-tree cleanup |
+| `runtime_checks.rs` | on-demand sanitizer probing, compiler flags and temporary checked execution configuration |
 | `magic.rs` | `%` commands, numbered-input lookup and optional `clang-format` presentation |
 | `std_index.rs` | curated ISO C89–C23 identifier-to-header and availability metadata for `%where` |
 | `codegen.rs` | program assembly, shadowing/replacement variants, `_Generic` runtimes |
@@ -47,7 +48,7 @@ control/do-while/preprocessor continuation, tab completion (magics, C keywords,
 retained session names), process-local Up/Down recall and numbered-input
 `%edit [n]`, `-e`/script/piped-input batch modes,
 `%help [--verbose] %quit %clear %reset %src %header %edit %type %bits %Bits
-%utf8 %utf16 %utf32 %where %time %timeit %cc %std`, deadlines and
+%utf8 %utf16 %utf32 %where %check %time %timeit %cc %std`, deadlines and
 timeout-path tree cleanup for compiler/probe/user-program children, cached
 compiler capability probes, CI for 4 platform configs, and a tag-triggered release
 workflow.

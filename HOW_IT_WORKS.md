@@ -56,3 +56,33 @@ Successful startup probes are cached for seven days under the platform cache dir
 Ordinary inputs and `%time` share output rendering and session commits. In `-e` mode, values and program stdout go to stdout; diagnostics and timing information go to stderr. Failed magic commands contribute to the nonzero exit status in both `-e` and script modes. Returning an exit code through `main` lets generated-source temporary directories clean up on success and failure.
 
 `%timeit` compiles once and passes the loop count as a runtime argument for both calibration and measured samples. Calibration grows in bounded steps of 2x to 10x until a batch reaches roughly 100 ms (less for short execution deadlines), so a single iteration below the host clock resolution cannot trigger an immediate jump to 100 million iterations. Each sample still starts a fresh process and replays the same retained session. Source generation maintains a running line count so recording diagnostic spans does not repeatedly scan the accumulated program.
+
+### 9. On-demand Runtime Checks
+
+`%check [--address | --undefined] <code>` creates a temporary evaluator with
+sanitizer compiler/linker flags, preserving the current compiler, standard,
+timeout, terminal streaming and stdin replay. It never commits checked input
+or consumes an input number. Automatic selection tries ASan+UBSan, then ASan,
+then UBSan; an explicit backend request never falls back to unchecked code.
+No sanitizer probes run during startup or ordinary evaluation.
+
+Each candidate must compile and link, execute a valid program, and terminate
+with the expected report for deliberately faulty memory/arithmetic operations.
+This rejects ignored flags and missing runtime libraries. Results are cached
+only in the evaluator and cleared when `%cc` or `%std` changes the toolchain.
+MSVC flags precede `/link`; `/Z7` keeps compiler debug information in the
+temporary object and linker PDBs remain beside the temporary executable.
+
+Checks stop at the first detected error, and leak detection is disabled for
+session allocations. Sanitizer reports use a private log directory per run,
+separate from program stderr, so live prompts remain immediate and native
+stack traces cannot bypass formatting in the terminal. Some combined GCC
+runtimes still write UBSan reports to stderr: a streaming prefix filter
+withholds those reports across pipe chunks while preserving program prompts,
+and the captured report follows the same formatting path. Probes accept both
+reporting paths. Report reads obey the capture limit.
+Runtime failures are recognized even during retained replay or exit handlers
+after the completion marker. Source locations remain internal; summaries omit
+line numbers and paths in both terminal and batch modes.
+Output explains common findings in two lines. Unknown findings get a brief
+generic message. Messages remain English in every UI language.

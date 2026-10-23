@@ -14,6 +14,13 @@
 
 ## Semantics & Scope
 
+- **Runtime checks are optional and partial.** `%check` uses only sanitizer
+  backends that can compile, link, run and detect a test error with the current
+  toolchain. Available checks differ by target/runtime installation. Checks
+  cover executed paths, not all undefined behavior or logic errors; general
+  uninitialized-value detection is not included. Leak detection is disabled
+  for replayed session allocations. Checked input is never retained, but
+  replay and external effects still occur. Messages are currently English.
 - **Rebinding is C shadowing, not assignment.** A redeclared local lives in a nested block. Its declarator is already in scope during its initializer, so `int x = x + 1;` does not read the outer `x`. File-scope replacement also makes retained earlier calls use the new function when the session replays.
 - **The purity heuristic is conservative.** Any expression containing a function call or a reference to a macro defined in retained input is kept, even if it happens to be pure.
 - **Indeterminate values remain undefined C.** Address-only struct-member formatting prevents `c-shell` from adding a `%s` memory dereference, but it cannot make `struct P p; p` well-defined when members were never initialized; reading an indeterminate pointer or scalar is itself not portable. Initialize structs (for example with `{0}`) when the value matters.

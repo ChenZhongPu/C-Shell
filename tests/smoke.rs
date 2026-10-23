@@ -1729,3 +1729,337 @@ fn timeit_calibrates_gradually_when_a_single_iteration_measures_zero() {
         "benchmark state leaked: {stdout}"
     );
 }
+
+fn runtime_check_output(language: &str, inputs: &[&str]) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_c-shell"));
+    command.args(["--no-color", "--lang", language, "--timeout", "15"]);
+    for input in inputs {
+        command.args(["-e", input]);
+    }
+    command.output().expect("run runtime-check experiment")
+}
+
+/// Sanitizer runtimes are optional installations, even for a supported C
+/// compiler. An unsupported backend must fail explicitly, never claim success.
+fn runtime_check_unavailable(output: &std::process::Output) -> bool {
+    let unavailable = String::from_utf8_lossy(&output.stderr)
+        .contains("is unavailable with the current compiler, target, or runtime installation.");
+    if unavailable {
+        assert!(!output.status.success());
+    }
+    unavailable
+}
+
+#[test]
+fn runtime_checks_are_temporary_and_success_is_quiet() {
+    let output = runtime_check_output(
+        "zh",
+        &["int x = 41;", "%check ++x", "x", "%check x = 99;", "x"],
+    );
+    if runtime_check_unavailable(&output) {
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n41\n41\n");
+    assert!(
+        stderr.is_empty(),
+        "successful checks emitted diagnostics: {stderr}"
+    );
+}
+
+#[test]
+fn runtime_checks_report_undefined_arithmetic_and_leave_session_usable() {
+    let output = runtime_check_output(
+        "en",
+        &[
+            "int x = INT_MAX;",
+            "%check --undefined x + 1",
+            "%check --undefined { volatile int zero = 0; printf(\"%d\", 1 / zero); }",
+            "%check --undefined { volatile int shift = -1; printf(\"%u\", 1u << shift); }",
+            "x == INT_MAX",
+        ],
+    );
+    if runtime_check_unavailable(&output) {
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    for message in [
+        "signed integer overflow",
+        "division by zero",
+        "shift exponent -1",
+    ] {
+        assert!(stderr.contains(message), "missing {message}: {stderr}");
+    }
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n");
+    assert_eq!(stderr.matches("Runtime check:").count(), 3);
+}
+
+#[test]
+fn runtime_checks_detect_heap_bounds_and_freed_memory() {
+    let output = runtime_check_output(
+        "en",
+        &[
+            "int *p = malloc(2 * sizeof *p); if (!p) abort();",
+            "%check --address p[2] = 7;",
+            "%check --address { free(p); printf(\"%d\", *p); }",
+            "%check --address { free(p); free(p); }",
+            "6 * 7",
+        ],
+    );
+    if runtime_check_unavailable(&output) {
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    for message in [
+        "memory access out of bounds",
+        "use after free",
+        "double free",
+    ] {
+        assert!(stderr.contains(message), "missing {message}: {stderr}");
+    }
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n");
+    assert!(!stderr.contains("LeakSanitizer"), "{stderr}");
+}
+
+#[test]
+fn runtime_checks_keep_reports_from_replay_and_exit_handlers() {
+    let replay = runtime_check_output(
+        "en",
+        &[
+            "volatile int x = INT_MAX;",
+            "x += 1;",
+            "%check --undefined 42",
+            "42",
+        ],
+    );
+    if !runtime_check_unavailable(&replay) {
+        let stderr = String::from_utf8_lossy(&replay.stderr);
+        assert!(!replay.status.success());
+        assert!(stderr.contains("signed integer overflow"), "{stderr}");
+        assert!(!stderr.contains("retained code, line"), "{stderr}");
+        assert_eq!(String::from_utf8_lossy(&replay.stdout), "42\n");
+    }
+    let exit = runtime_check_output(
+        "en",
+        &[
+            "void on_exit_check(void) { volatile int x = INT_MAX; x += 1; }",
+            "%check --undefined atexit(on_exit_check)",
+            "42",
+        ],
+    );
+    if runtime_check_unavailable(&exit) {
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&exit.stderr);
+    assert!(!exit.status.success());
+    assert!(stderr.contains("signed integer overflow"), "{stderr}");
+    assert!(stderr.contains("Runtime check:"), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&exit.stdout), "42\n");
+}
+
+#[test]
+fn runtime_checks_reject_invalid_usage_in_english() {
+    for input in [
+        "%check",
+        "%check --address",
+        "%check --bogus 42",
+        "%check --verbose 42",
+    ] {
+        let output = runtime_check_output("zh", &[input, "42"]);
+        assert!(!output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Usage: %check"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_checks_probe_on_demand_cache_results_and_reject_ignored_flags() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let wrapper = dir.path().join("cc-check-probe");
+    let log = dir.path().join("probes");
+    std::fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        -fsanitize=*)
+            printf 'probe\n' >> "$C_SHELL_CHECK_LOG"
+            printf 'warning: ignoring unknown option %s\n' "$arg" >&2
+            exit 0
+            ;;
+    esac
+done
+exec "$C_SHELL_CHECK_CC" "$@"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let run = |inputs: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_c-shell"));
+        command
+            .arg("--cc")
+            .arg(&wrapper)
+            .args(["--lang", "zh"])
+            .env("C_SHELL_CHECK_LOG", &log)
+            .env(
+                "C_SHELL_CHECK_CC",
+                std::env::var_os("CC").unwrap_or_else(|| "cc".into()),
+            );
+        for input in inputs {
+            command.args(["-e", input]);
+        }
+        command.output().unwrap()
+    };
+    let plain = run(&["42"]);
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    assert!(
+        !log.exists(),
+        "ordinary evaluation must not probe sanitizers"
+    );
+    let checked = run(&[
+        "%check --undefined 42",
+        "%check --undefined 43",
+        "%std c17",
+        "%check --undefined 44",
+        "42",
+    ]);
+    assert!(!checked.status.success());
+    let stderr = String::from_utf8_lossy(&checked.stderr);
+    assert_eq!(
+        stderr
+            .matches("UndefinedBehaviorSanitizer is unavailable")
+            .count(),
+        3
+    );
+    assert_eq!(
+        std::fs::read_to_string(log).unwrap().lines().count(),
+        2,
+        "failed probes are cached until the toolchain or standard changes"
+    );
+    assert!(String::from_utf8_lossy(&checked.stdout).ends_with("42\n"));
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_checks_automatically_use_the_available_backend() {
+    let supported = runtime_check_output("en", &["%check --undefined 1 + 1"]);
+    if runtime_check_unavailable(&supported) {
+        return;
+    }
+    assert!(
+        supported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&supported.stderr)
+    );
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let wrapper = dir.path().join("cc-without-address-sanitizer");
+    std::fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        -fsanitize=*address*) printf 'address runtime unavailable\n' >&2; exit 1 ;;
+    esac
+done
+exec "$C_SHELL_CHECK_CC" "$@"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_c-shell"))
+        .arg("--cc")
+        .arg(wrapper)
+        .args([
+            "--lang",
+            "en",
+            "-e",
+            "int x = INT_MAX;",
+            "-e",
+            "%check x + 1",
+            "-e",
+            "42",
+        ])
+        .env(
+            "C_SHELL_CHECK_CC",
+            std::env::var_os("CC").unwrap_or_else(|| "cc".into()),
+        )
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("signed integer overflow"), "{stderr}");
+    assert!(stderr.contains("Runtime check:"), "{stderr}");
+    assert!(!stderr.contains("is unavailable"), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n");
+}
+
+#[test]
+fn runtime_check_reports_are_always_concise() {
+    let supported = runtime_check_output("en", &["%check --undefined 1 + 1"]);
+    if runtime_check_unavailable(&supported) {
+        return;
+    }
+    let concise = runtime_check_output("zh", &["int x = INT_MAX;", "%check x + 1"]);
+    if runtime_check_unavailable(&concise) {
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&concise.stderr);
+    assert!(!concise.status.success());
+    assert!(
+        stderr.contains("Runtime check: signed integer overflow."),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("2147483647 + 1 cannot be represented in type 'int'"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("--verbose"), "{stderr}");
+    assert_eq!(stderr.lines().count(), 2, "{stderr}");
+    assert!(!stderr.contains("not retained"), "{stderr}");
+    for internal in [
+        "#0",
+        "BuildId:",
+        "input.c:",
+        "libc.so",
+        "0x",
+        "(line ",
+        "<input>",
+        "<session>",
+    ] {
+        assert!(
+            !stderr.contains(internal),
+            "unexpected {internal}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn runtime_check_summary_preserves_program_stderr_separately() {
+    let output = runtime_check_output(
+        "en",
+        &[
+            "%check --address { fprintf(stderr, \"program diagnostic\\n\"); volatile int *p = malloc(sizeof *p); if (!p) abort(); p[2] = 7; }",
+            "42",
+        ],
+    );
+    if runtime_check_unavailable(&output) {
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert_eq!(stderr.matches("program diagnostic").count(), 1, "{stderr}");
+    assert!(stderr.contains("memory access out of bounds"), "{stderr}");
+    assert!(!stderr.contains("Shadow bytes"), "{stderr}");
+    assert!(!stderr.contains("AddressSanitizer:"), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n");
+}

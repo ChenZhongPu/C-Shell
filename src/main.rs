@@ -12,6 +12,7 @@ mod i18n;
 mod lex;
 mod magic;
 mod proc;
+mod runtime_checks;
 mod session;
 mod std_index;
 mod toolchain;
@@ -525,7 +526,7 @@ fn submit(
             Ok((false, false, None))
         }
         Eval::Done(o) => Ok((
-            finish_input(raw, o, session, ui, style, external_warning),
+            finish_input(raw, *o, session, ui, style, external_warning),
             false,
             None,
         )),

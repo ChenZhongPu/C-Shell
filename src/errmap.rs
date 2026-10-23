@@ -5,6 +5,66 @@
 //! prompt. Without this remapping the tool is unusable for a beginner: the
 //! error text is right but every location it cites is wrong.
 
+/// Runtime reports contain locations inside stack frames and summaries, not
+/// only at the start of a line. Preserve every report line while mapping any
+/// generated-source locations that the installed symbolizer can provide.
+pub fn remap_runtime(raw: &str, src: &str, program: &crate::codegen::Program) -> String {
+    let map = |line: usize| {
+        let start = program.new_start_line;
+        let count = program.new_line_count;
+        if line >= start && line < start + count {
+            format!("<input>:{}", line - start + 1)
+        } else if program.wrapped && line + 1 == start {
+            "<input>:1".to_string()
+        } else if program.wrapped && line == start + count {
+            format!("<input>:{count}")
+        } else if let Some(&(start, _)) = program
+            .session_line_ranges
+            .iter()
+            .find(|&&(start, count)| line >= start && line < start + count)
+        {
+            format!("<session>:{}", line - start + 1)
+        } else {
+            format!("<runtime>:{line}")
+        }
+    };
+    let mut output = raw.to_string();
+    for path in [src.to_string(), src.replace('\\', "/")] {
+        let mut mapped = String::with_capacity(output.len());
+        let mut remaining = output.as_str();
+        while let Some(index) = remaining.find(&path) {
+            mapped.push_str(&remaining[..index]);
+            remaining = &remaining[index + path.len()..];
+            let (location, parenthesized) = if let Some(tail) = remaining.strip_prefix(':') {
+                (tail, false)
+            } else if let Some(tail) = remaining.strip_prefix('(') {
+                (tail, true)
+            } else {
+                mapped.push_str(&path);
+                continue;
+            };
+            let end = location
+                .find(|ch: char| !ch.is_ascii_digit())
+                .unwrap_or(location.len());
+            if let Ok(line) = location[..end].parse::<usize>() {
+                mapped.push_str(&map(line));
+                remaining = &location[end..];
+                if parenthesized {
+                    // MSVC stack locations commonly use file(line).
+                    if let Some(tail) = remaining.strip_prefix(')') {
+                        remaining = tail;
+                    }
+                }
+            } else {
+                mapped.push_str(&path);
+            }
+        }
+        mapped.push_str(remaining);
+        output = mapped;
+    }
+    output
+}
+
 /// Rewrite `raw` so locations inside the new input become input-relative.
 ///
 /// `src` is the path handed to the compiler, `generated` is its contents,
@@ -383,6 +443,28 @@ fn split_location<'a>(line: &'a str, src: &str) -> Option<(usize, &'a str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_locations_preserve_stack_frames_and_distinguish_replay() {
+        let mut session = crate::session::Session::default();
+        session.commit("int x = 1;", crate::codegen::Slot::Stmt);
+        let program = crate::codegen::build(&session, "x + 1", crate::codegen::Slot::Expr);
+        let start = program.new_start_line;
+        let retained = program.session_line_ranges[0].0;
+        let raw = format!(
+            "/tmp/input.c:{start}:5: runtime error: overflow\n    #0 in main /tmp/input.c:{start}:5\n    #1 in setup /tmp/input.c:{retained}:2\nSUMMARY: error /tmp/input.c:{start}:5 in main\n"
+        );
+        let mapped = remap_runtime(&raw, "/tmp/input.c", &program);
+        assert!(mapped.contains("<input>:1:5: runtime error: overflow"));
+        assert!(mapped.contains("#0 in main <input>:1:5"));
+        assert!(mapped.contains("#1 in setup <session>:1:2"));
+        assert!(mapped.contains("SUMMARY: error <input>:1:5 in main"));
+        let windows = format!("    #0 main C:/tmp/input.c({start})\n");
+        assert_eq!(
+            remap_runtime(&windows, "C:\\tmp\\input.c", &program),
+            "    #0 main <input>:1\n"
+        );
+    }
 
     #[test]
     fn maps_gnu_location_into_input_space() {
