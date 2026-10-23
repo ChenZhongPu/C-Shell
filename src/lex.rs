@@ -63,6 +63,25 @@ pub fn scan(s: &str) -> Scan {
             continue;
         }
 
+        // Preprocessing numbers include C23 digit separators. Consume the
+        // complete token so its apostrophes never open character literals.
+        if c.is_ascii_digit() || (c == b'.' && next.is_some_and(|n| n.is_ascii_digit())) {
+            code[i] = true;
+            i += 1;
+            while i < b.len() {
+                let byte = b[i];
+                let exponent_sign =
+                    matches!(byte, b'+' | b'-') && matches!(b[i - 1], b'e' | b'E' | b'p' | b'P');
+                let separator = byte == b'\'' && b.get(i + 1).is_some_and(|n| is_ident_byte(*n));
+                if !is_ident_byte(byte) && byte != b'.' && !exponent_sign && !separator {
+                    break;
+                }
+                code[i] = true;
+                i += 1;
+            }
+            continue;
+        }
+
         // Plain code from here on.
         match c {
             b'/' if next == Some(b'/') => {
@@ -94,6 +113,77 @@ pub fn scan(s: &str) -> Scan {
 
 fn is_ident_byte(c: u8) -> bool {
     c == b'_' || c.is_ascii_alphanumeric()
+}
+
+/// Trim leading whitespace/comments without changing the remaining source.
+pub fn trim_leading_trivia(src: &str) -> &str {
+    let sc = scan(src);
+    let start = src
+        .bytes()
+        .enumerate()
+        .find(|(i, byte)| sc.code[*i] && !byte.is_ascii_whitespace())
+        .map_or(src.len(), |(i, _)| i);
+    &src[start..]
+}
+
+/// A cheap filter for the compiler's addressable-expression printing trial.
+/// Obvious scalar rvalues and calls keep the ordinary one-compile path.
+pub fn may_be_array_lvalue(src: &str) -> bool {
+    let t = trim_leading_trivia(src).trim_end();
+    if plain_identifier(t).is_some() || t.starts_with('*') || t.starts_with('"') {
+        return true;
+    }
+    let sc = scan(t);
+    let bytes = t.as_bytes();
+    let mut depth = 0i32;
+    for (i, &byte) in bytes.iter().enumerate() {
+        if !sc.code[i] {
+            continue;
+        }
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'.' if depth == 0 && !bytes.get(i + 1).is_some_and(u8::is_ascii_digit) => {
+                return true;
+            }
+            b'-' if depth == 0 && bytes.get(i + 1) == Some(&b'>') => return true,
+            _ => {}
+        }
+    }
+    if t.ends_with([']', '}']) {
+        return true;
+    }
+    if t.starts_with('(') && t.ends_with(')') {
+        let mut depth = 0i32;
+        for (i, &byte) in bytes.iter().enumerate() {
+            if sc.code[i] {
+                match byte {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 && i + 1 != bytes.len() {
+                    return false;
+                }
+            }
+        }
+        return may_be_array_lvalue(&t[1..t.len() - 1]);
+    }
+    false
+}
+
+/// Names defined by retained preprocessing directives. Conditional or later
+/// undefined names may remain here: retaining an extra expression is safe.
+pub fn defined_macros(src: &str) -> Vec<String> {
+    src.lines()
+        .filter_map(|line| {
+            let directive = trim_leading_trivia(line).strip_prefix('#')?;
+            let mut words = identifiers(directive).into_iter();
+            (words.next()?.as_str() == "define")
+                .then(|| words.next())
+                .flatten()
+        })
+        .collect()
 }
 
 /// Whether an exact identifier appears in code rather than a comment/literal.
@@ -645,6 +735,47 @@ pub fn awaits_body(input: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn c23_numbers_keep_digit_separators_out_of_character_literals() {
+        for input in ["1'000", "0xAB'CD", "0b1010'0101", "1.2'3e+4", "0x1'f.fp-2"] {
+            let result = scan(input);
+            assert!(!result.unterminated, "{input}");
+            assert!(result.code.iter().all(|code| *code), "{input}");
+        }
+        assert!(!scan("'1'").unterminated);
+        assert!(scan("'x").unterminated);
+    }
+
+    #[test]
+    fn leading_trivia_and_macro_directives_ignore_comments() {
+        assert_eq!(
+            trim_leading_trivia(" /* one */\n// two\n int f(void) {}"),
+            "int f(void) {}"
+        );
+        assert_eq!(
+            defined_macros("/* note */ #define INC (++x)\n#define ALIAS INC\n// #define BAD 1"),
+            ["INC", "ALIAS"]
+        );
+    }
+
+    #[test]
+    fn array_printing_trial_skips_obvious_rvalues() {
+        for source in [
+            "text",
+            "(text)",
+            "s.a",
+            "p->a",
+            "rows[i++]",
+            "*(char (*)[3])p",
+            "\"literal\"",
+        ] {
+            assert!(may_be_array_lvalue(source), "{source}");
+        }
+        for source in ["42", "1.5", "x + 1", "f()", "(x + 1)"] {
+            assert!(!may_be_array_lvalue(source), "{source}");
+        }
+    }
 
     #[test]
     fn detects_external_replay_risks_without_reading_comments_or_literals() {

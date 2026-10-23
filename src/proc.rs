@@ -50,6 +50,7 @@ pub struct StdinEvent {
 pub enum StdinRequest {
     Replay,
     Current,
+    Finished,
 }
 
 pub struct Captured {
@@ -198,6 +199,7 @@ fn run_inner(
             requests,
             &replay,
             allow_current,
+            &err_thread,
         )?,
         ChildInput::Bytes(bytes) => {
             let _input_thread = child_stdin.map(|mut stdin| {
@@ -263,6 +265,100 @@ fn wait_or_kill(child: &mut Child, timeout: Duration) -> std::io::Result<Option<
     }
 }
 
+/// Temporarily make parent stdin cancellable while a scanf call is active.
+/// The evaluated child receives its own pipe, so this does not change its IO.
+#[cfg(unix)]
+struct StdinMode(Option<i32>);
+
+#[cfg(unix)]
+impl StdinMode {
+    fn new(enabled: bool) -> std::io::Result<Self> {
+        if !enabled {
+            return Ok(Self(None));
+        }
+        let flags = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL) };
+        if flags == -1
+            || unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                == -1
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self(Some(flags)))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StdinMode {
+    fn drop(&mut self) {
+        if let Some(flags) = self.0 {
+            unsafe {
+                libc::fcntl(libc::STDIN_FILENO, libc::F_SETFL, flags);
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct StdinMode;
+
+#[cfg(not(unix))]
+impl StdinMode {
+    fn new(_enabled: bool) -> std::io::Result<Self> {
+        Ok(Self)
+    }
+}
+
+struct PendingInput {
+    request: StdinRequest,
+    supplied: bool,
+    bytes: Vec<u8>,
+}
+
+struct Tape<'a> {
+    replay: &'a [StdinEvent],
+    index: usize,
+    recorded: Vec<StdinEvent>,
+    diverged: bool,
+    stdin: Option<std::process::ChildStdin>,
+}
+
+impl Tape<'_> {
+    fn supply(&mut self, request: StdinRequest, current: StdinEvent, write: bool) {
+        let event = match request {
+            StdinRequest::Replay => match self.replay.get(self.index) {
+                Some(event) => {
+                    self.index += 1;
+                    event.clone()
+                }
+                None => {
+                    self.diverged = true;
+                    StdinEvent {
+                        bytes: Vec::new(),
+                        eof: true,
+                    }
+                }
+            },
+            StdinRequest::Current => {
+                self.recorded.push(current.clone());
+                current
+            }
+            StdinRequest::Finished => unreachable!("completion is not a request"),
+        };
+        if !write {
+            return;
+        }
+        let write_failed = !event.bytes.is_empty()
+            && self.stdin.as_mut().is_none_or(|stdin| {
+                stdin.write_all(&event.bytes).is_err() || stdin.flush().is_err()
+            });
+        // A buffered/no-input conversion may already have returned. A closed
+        // pipe is not a tape-order mismatch; only the requests establish that.
+        if event.eof || write_failed {
+            self.stdin.take();
+        }
+    }
+}
+
 fn wait_with_stdin_tape(
     child: &mut Child,
     stdin: std::process::ChildStdin,
@@ -270,81 +366,141 @@ fn wait_with_stdin_tape(
     requests: mpsc::Receiver<StdinRequest>,
     replay: &[StdinEvent],
     allow_current: bool,
+    stderr_reader: &JoinHandle<()>,
 ) -> std::io::Result<(Option<ExitStatus>, Vec<StdinEvent>, bool)> {
-    let mut replay_index = 0usize;
-    let mut recorded = Vec::new();
-    let mut diverged = false;
-    let mut child_stdin = Some(stdin);
-    let mut deadline = Instant::now() + timeout;
-
-    loop {
-        while let Ok(request) = requests.try_recv() {
-            let event = match request {
-                StdinRequest::Replay => match replay.get(replay_index) {
-                    Some(event) => {
-                        replay_index += 1;
-                        event.clone()
-                    }
-                    None => {
-                        diverged = true;
-                        StdinEvent {
-                            bytes: Vec::new(),
-                            eof: true,
-                        }
-                    }
-                },
-                StdinRequest::Current if allow_current && child_stdin.is_some() => {
-                    let mut bytes = Vec::new();
-                    let read = std::io::stdin().lock().read_until(b'\n', &mut bytes)?;
-                    // Waiting for a human is not execution time. Give the C
-                    // code a fresh deadline after every supplied line.
-                    deadline = Instant::now() + timeout;
-                    let event = StdinEvent {
-                        bytes,
-                        eof: read == 0,
-                    };
-                    recorded.push(event.clone());
-                    event
-                }
-                StdinRequest::Current => {
-                    let event = StdinEvent {
-                        bytes: Vec::new(),
-                        eof: true,
-                    };
-                    recorded.push(event.clone());
-                    event
-                }
-            };
-
-            let write_failed = !event.eof
-                && child_stdin.as_mut().is_none_or(|stdin| {
-                    stdin.write_all(&event.bytes).is_err() || stdin.flush().is_err()
-                });
-            if write_failed {
-                diverged = true;
-            }
-            if event.eof || write_failed {
-                // Dropping the last write handle is how scanf observes EOF.
-                child_stdin.take();
-            }
-        }
-        #[cfg(unix)]
-        let status = if unix::exited_unreaped(child.id())? {
-            unix::kill_group(child.id());
-            Some(child.wait()?)
-        } else {
-            None
-        };
-        #[cfg(not(unix))]
-        let status = child.try_wait()?;
-        if let Some(status) = status {
-            diverged |= replay_index != replay.len();
-            return Ok((Some(status), recorded, diverged));
-        }
-        if Instant::now() >= deadline {
+    let _stdin_mode = match StdinMode::new(allow_current) {
+        Ok(mode) => mode,
+        Err(error) => {
             kill_tree(child);
             let _ = child.wait();
-            return Ok((None, recorded, diverged));
+            return Err(error);
+        }
+    };
+    let mut tape = Tape {
+        replay,
+        index: 0,
+        recorded: Vec::new(),
+        diverged: false,
+        stdin: Some(stdin),
+    };
+    let mut pending: Option<PendingInput> = None;
+    let mut deadline = Instant::now() + timeout;
+    let mut exited = None;
+    loop {
+        // Snapshot before draining so an exiting child cannot outrun its
+        // stderr observer and make the final request disappear from the tape.
+        let requests_complete = stderr_reader.is_finished();
+        let mut completed_call = false;
+        while let Ok(request) = requests.try_recv() {
+            if request == StdinRequest::Finished {
+                completed_call = true;
+                if let Some(input) = pending.take()
+                    && !input.supplied
+                {
+                    // libc completed using its own buffer. Retain the call
+                    // boundary without consuming another parent-input line.
+                    tape.supply(
+                        input.request,
+                        StdinEvent {
+                            bytes: input.bytes,
+                            eof: false,
+                        },
+                        false,
+                    );
+                }
+            } else {
+                pending = Some(PendingInput {
+                    request,
+                    supplied: false,
+                    bytes: Vec::new(),
+                });
+            }
+        }
+        if exited.is_none() {
+            #[cfg(unix)]
+            let status = if unix::exited_unreaped(child.id())? {
+                unix::kill_group(child.id());
+                Some(child.wait()?)
+            } else {
+                None
+            };
+            #[cfg(not(unix))]
+            let status = child.try_wait()?;
+            if let Some(status) = status {
+                exited = Some((status, Instant::now() + Duration::from_millis(500)));
+            }
+        }
+        if let Some((status, drain_deadline)) = exited.as_ref() {
+            if requests_complete || Instant::now() >= *drain_deadline {
+                if let Some(input) = pending.take()
+                    && !input.supplied
+                {
+                    tape.supply(
+                        input.request,
+                        StdinEvent {
+                            bytes: input.bytes,
+                            eof: false,
+                        },
+                        false,
+                    );
+                }
+                tape.diverged |= tape.index != replay.len();
+                return Ok((Some(*status), tape.recorded, tape.diverged));
+            }
+        } else if let Some(input) = pending.as_mut()
+            && !input.supplied
+        {
+            let event = if input.request == StdinRequest::Replay {
+                Some(StdinEvent {
+                    bytes: Vec::new(),
+                    eof: false,
+                })
+            } else if allow_current && tape.stdin.is_some() {
+                match std::io::stdin().lock().read_until(b'\n', &mut input.bytes) {
+                    Ok(read) => {
+                        // Only supplying fresh input restarts the execution
+                        // deadline. Buffered calls and replay must not let an
+                        // infinite scanf loop renew its timeout forever.
+                        deadline = Instant::now() + timeout;
+                        let eof = read == 0 || input.bytes.last() != Some(&b'\n');
+                        Some(StdinEvent {
+                            bytes: std::mem::take(&mut input.bytes),
+                            eof,
+                        })
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        None
+                    }
+                    Err(error) => {
+                        kill_tree(child);
+                        let _ = child.wait();
+                        return Err(error);
+                    }
+                }
+            } else {
+                Some(StdinEvent {
+                    bytes: Vec::new(),
+                    eof: true,
+                })
+            };
+            if let Some(event) = event {
+                tape.supply(input.request, event, true);
+                input.supplied = true;
+            }
+        }
+        let waiting_for_input = pending.as_ref().is_some_and(|input| {
+            input.request == StdinRequest::Current && !input.supplied && allow_current
+        });
+        if exited.is_none() && (completed_call || !waiting_for_input) && Instant::now() >= deadline
+        {
+            kill_tree(child);
+            let _ = child.wait();
+            return Ok((None, tape.recorded, tape.diverged));
         }
         std::thread::sleep(Duration::from_millis(5));
     }

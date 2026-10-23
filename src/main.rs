@@ -97,12 +97,22 @@ struct Args {
 
 /// How results are rendered.
 #[derive(Clone, Copy, PartialEq)]
-enum Style {
+pub(crate) enum Style {
     /// `Out[n]:` labels, notes, everything on stdout — a transcript.
     Repl,
     /// Bare values on stdout, diagnostics on stderr, no notes — for `-e`,
     /// where the output is probably feeding a pipe.
     Bare,
+}
+
+impl Style {
+    pub(crate) fn diagnostic(self, message: &str) {
+        if self == Self::Bare {
+            eprintln!("{message}");
+        } else {
+            println!("{message}");
+        }
+    }
 }
 
 fn command_for(language: Language) -> clap::Command {
@@ -216,7 +226,7 @@ fn parse_args(language: Language) -> Args {
     Args::from_arg_matches(&matches).expect("clap arguments match Args")
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<std::process::ExitCode> {
     let detected_language = i18n::detect();
     let language = i18n::requested_from_args(std::env::args_os()).unwrap_or(detected_language);
     i18n::set(language);
@@ -240,12 +250,13 @@ fn main() -> Result<()> {
         if args.no_color {
             child_args.push("--no-color".into());
         }
-        return web::serve(web::Config {
+        web::serve(web::Config {
             child_args,
             language,
             open_browser: !args.no_open,
             quiet: args.quiet,
-        });
+        })?;
+        return Ok(std::process::ExitCode::SUCCESS);
     }
 
     // Auto-detect: no colors when redirected, explicitly opted out, or on a
@@ -287,7 +298,7 @@ fn main() -> Result<()> {
                 break;
             }
         }
-        std::process::exit(if ok { 0 } else { 1 });
+        return Ok(std::process::ExitCode::from(u8::from(!ok)));
     }
 
     if let Some(path) = &args.script {
@@ -299,7 +310,7 @@ fn main() -> Result<()> {
             )
         })?;
         let ok = run_batch(std::io::BufReader::new(file), &mut session, &mut ev, &ui)?;
-        std::process::exit(if ok { 0 } else { 1 });
+        return Ok(std::process::ExitCode::from(u8::from(!ok)));
     }
 
     if !std::io::stdin().is_terminal() {
@@ -307,7 +318,7 @@ fn main() -> Result<()> {
         // code, like the interactive REPL it substitutes for.
         let stdin = std::io::stdin();
         run_batch(stdin.lock(), &mut session, &mut ev, &ui)?;
-        return Ok(());
+        return Ok(std::process::ExitCode::SUCCESS);
     }
 
     // ---- interactive REPL ------------------------------------------------
@@ -398,7 +409,7 @@ fn main() -> Result<()> {
     }
 
     println!("{}", ui.dim(&ui.text("bye")));
-    Ok(())
+    Ok(std::process::ExitCode::SUCCESS)
 }
 
 /// Feed complete inputs from a reader, accumulating lines until the input is
@@ -480,9 +491,9 @@ fn submit(
         return Ok((true, false, None));
     }
     if raw.starts_with('%') {
-        return match magic::handle(raw, session, ev, ui)? {
+        return match magic::handle(raw, session, ev, ui, style)? {
             magic::Action::Quit => Ok((true, true, None)),
-            magic::Action::Continue => Ok((true, false, None)),
+            magic::Action::Continue(ok) => Ok((ok, false, None)),
             magic::Action::Prefill(input) if interactive_edit => Ok((true, false, Some(input))),
             magic::Action::Prefill(_) => {
                 let message = ui.err(&ui.text("edit-interactive-only"));
@@ -501,6 +512,139 @@ fn submit(
     session.counter = n;
     session.remember_input(n, raw);
 
+    let external_warning = warn_external_replay(raw, session, ui, style);
+
+    match ev.eval(session, raw)? {
+        Eval::CompileError(diag) => {
+            let msg = ui.err(diag.trim_end());
+            if bare {
+                eprintln!("{msg}");
+            } else {
+                println!("{msg}");
+            }
+            Ok((false, false, None))
+        }
+        Eval::Done(o) => Ok((
+            finish_input(raw, o, session, ui, style, external_warning),
+            false,
+            None,
+        )),
+    }
+}
+
+/// Render and commit a C input identically for ordinary evaluation and %time.
+pub(crate) fn finish_input(
+    raw: &str,
+    o: crate::eval::Outcome,
+    session: &mut Session,
+    ui: &Ui,
+    style: Style,
+    external_warning: bool,
+) -> bool {
+    let n = session.counter;
+    let bare = style == Style::Bare;
+
+    // Live output has already been forwarded by Evaluator. If the C
+    // program left a partial line, visibly mark the newline c-shell
+    // inserts to protect the following warning, value or prompt.
+    if o.streamed_output_needs_newline {
+        println!("{}", ui.inserted_newline_marker());
+    }
+    let note = |s: &str| {
+        if !bare {
+            println!("{}", ui.dim(s));
+        }
+    };
+    if o.rewritten.is_some() {
+        note(&ui.text("note-missing-semicolon"));
+    }
+    if o.unprintable {
+        let msg = ui.text("unprintable-value");
+        if bare {
+            eprintln!("{msg}");
+        } else {
+            note(&msg);
+        }
+    }
+    if !o.warnings.trim().is_empty() {
+        let msg = ui.warn(o.warnings.trim_end());
+        if bare {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+    }
+    print!("{}", o.output);
+    // Programs rarely end their output with a newline, and without
+    // this the next prompt would be glued onto the last line.
+    if !o.output.is_empty() && !o.output.ends_with('\n') {
+        println!();
+    }
+    if !o.errors.is_empty() {
+        if bare {
+            eprint!("{}", o.errors);
+        } else {
+            print!("{}", ui.err(&o.errors));
+        }
+    }
+    if let Some(v) = &o.value {
+        if bare {
+            println!("{v}");
+        } else {
+            println!("{}{}", ui.out_label(n), v);
+        }
+    }
+    let committed = o.rewritten.clone().unwrap_or_else(|| raw.to_string());
+    match &o.abnormal {
+        // A crashing input is not kept: every later evaluation
+        // replays the whole session, so committing it would make
+        // the prompt permanently unusable.
+        Some(msg) => {
+            if bare {
+                eprintln!("{msg}");
+            } else {
+                println!("{}", ui.err(msg));
+            }
+            note(&ui.text("note-input-not-kept"));
+        }
+        None => {
+            if let Some(index) = o.file_replacement {
+                session.replace_file(index, &committed);
+                session.attach_stdin_events(o.stdin_events.clone());
+            } else if o.scoped_rebind {
+                session.commit_scoped(&committed);
+                session.attach_stdin_events(o.stdin_events.clone());
+            } else {
+                session.commit_with_stdin(&committed, o.slot, o.stdin_events.clone());
+            }
+            if external_warning {
+                session.mark_external_replay_warning_shown();
+            }
+        }
+    }
+    if o.abnormal.is_none() {
+        if o.file_replacement.is_some() {
+            note(&ui.text("note-replaced-file"));
+        } else if o.slot == Slot::FileScope {
+            note(&ui.text("note-added-file"));
+        }
+        if o.scoped_rebind {
+            note(&ui.text("note-shadowed"));
+        }
+        if !o.stdin_events.is_empty() {
+            let message = ui.text_with(
+                "note-stdin-captured",
+                &[("count", o.stdin_events.len().to_string())],
+            );
+            note(&message);
+        }
+    }
+    o.abnormal.is_none()
+}
+
+/// Emit the once-per-session warning before an input can affect external state.
+pub(crate) fn warn_external_replay(raw: &str, session: &Session, ui: &Ui, style: Style) -> bool {
+    let bare = style == Style::Bare;
     let external_calls = lex::external_replay_calls(raw)
         .into_iter()
         .filter(|name| name != "scanf")
@@ -520,113 +664,5 @@ fn submit(
             println!("{msg}");
         }
     }
-
-    match ev.eval(session, raw)? {
-        Eval::CompileError(diag) => {
-            let msg = ui.err(diag.trim_end());
-            if bare {
-                eprintln!("{msg}");
-            } else {
-                println!("{msg}");
-            }
-            Ok((false, false, None))
-        }
-        Eval::Done(o) => {
-            // Live output has already been forwarded by Evaluator. If the C
-            // program left a partial line, visibly mark the newline c-shell
-            // inserts to protect the following warning, value or prompt.
-            if o.streamed_output_needs_newline {
-                println!("{}", ui.inserted_newline_marker());
-            }
-            let note = |s: &str| {
-                if !bare {
-                    println!("{}", ui.dim(s));
-                }
-            };
-            if o.rewritten.is_some() {
-                note(&ui.text("note-missing-semicolon"));
-            }
-            if o.unprintable {
-                let msg = ui.text("unprintable-value");
-                if bare {
-                    eprintln!("{msg}");
-                } else {
-                    note(&msg);
-                }
-            }
-            if !o.warnings.trim().is_empty() {
-                let msg = ui.warn(o.warnings.trim_end());
-                if bare {
-                    eprintln!("{msg}");
-                } else {
-                    println!("{msg}");
-                }
-            }
-            print!("{}", o.output);
-            // Programs rarely end their output with a newline, and without
-            // this the next prompt would be glued onto the last line.
-            if !o.output.is_empty() && !o.output.ends_with('\n') {
-                println!();
-            }
-            if !o.errors.is_empty() {
-                if bare {
-                    eprint!("{}", o.errors);
-                } else {
-                    print!("{}", ui.err(&o.errors));
-                }
-            }
-            if let Some(v) = &o.value {
-                if bare {
-                    println!("{v}");
-                } else {
-                    println!("{}{}", ui.out_label(n), v);
-                }
-            }
-            let committed = o.rewritten.clone().unwrap_or_else(|| raw.to_string());
-            match &o.abnormal {
-                // A crashing input is not kept: every later evaluation
-                // replays the whole session, so committing it would make
-                // the prompt permanently unusable.
-                Some(msg) => {
-                    if bare {
-                        eprintln!("{msg}");
-                    } else {
-                        println!("{}", ui.err(msg));
-                    }
-                    note(&ui.text("note-input-not-kept"));
-                }
-                None => {
-                    if let Some(index) = o.file_replacement {
-                        session.replace_file(index, &committed);
-                    } else if o.scoped_rebind {
-                        session.commit_scoped(&committed);
-                    } else {
-                        session.commit(&committed, o.slot);
-                    }
-                    if external_warning {
-                        session.mark_external_replay_warning_shown();
-                    }
-                    session.attach_stdin_events(o.stdin_events.clone());
-                }
-            }
-            if o.abnormal.is_none() {
-                if o.file_replacement.is_some() {
-                    note(&ui.text("note-replaced-file"));
-                } else if o.slot == Slot::FileScope {
-                    note(&ui.text("note-added-file"));
-                }
-                if o.scoped_rebind {
-                    note(&ui.text("note-shadowed"));
-                }
-                if !o.stdin_events.is_empty() {
-                    let message = ui.text_with(
-                        "note-stdin-captured",
-                        &[("count", o.stdin_events.len().to_string())],
-                    );
-                    note(&message);
-                }
-            }
-            Ok((o.abnormal.is_none(), false, None))
-        }
-    }
+    external_warning
 }

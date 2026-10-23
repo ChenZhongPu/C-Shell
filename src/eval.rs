@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use crate::codegen::{
-    self, M_DONE, M_NEW, M_STDIN, M_TIME, M_UNICODE, M_UTF8, M_VAL, MAX_ARRAY_DEPTH, Slot,
-    UNPRINTABLE,
+    self, M_DONE, M_NEW, M_STDIN, M_STDIN_DONE, M_TIME, M_UNICODE, M_UTF8, M_VAL, MAX_ARRAY_DEPTH,
+    Slot, UNPRINTABLE,
 };
 use crate::errmap;
 use crate::i18n;
@@ -392,6 +392,15 @@ impl Evaluator {
             &[Slot::Stmt]
         };
         for &slot in slots {
+            if slot == Slot::Expr
+                && (self.tc.family == crate::toolchain::Family::Msvc || session.must_replay(input))
+                && lex::may_be_array_lvalue(input)
+            {
+                let bounded = codegen::build_lvalue_expr(session, input, timed);
+                if let Ok(o) = self.try_program(bounded, slot, session.stdin_tape())? {
+                    return Ok(Ok(self.refine_array(session, input, o, timed)?));
+                }
+            }
             let normal = if timed {
                 codegen::build_timed(session, input, slot)
             } else {
@@ -419,7 +428,16 @@ impl Evaluator {
                         }
                     }
                 }
-                Err(diag) => expr_reported = Some(diag),
+                Err(diag) => {
+                    // GNU typeof rejects bit-fields. A numeric-only wrapper
+                    // preserves their original scalar values without making
+                    // unbounded string printing a fallback for arrays.
+                    let scalar = codegen::build_scalar_expr(session, input, timed);
+                    if let Ok(o) = self.try_program(scalar, slot, session.stdin_tape())? {
+                        return Ok(Ok(o));
+                    }
+                    expr_reported = Some(diag);
+                }
             }
         }
 
@@ -472,7 +490,7 @@ impl Evaluator {
         timed: bool,
     ) -> Result<Outcome> {
         // Re-running the whole session must stay free of consequences.
-        if lex::may_have_side_effects(input) {
+        if session.must_replay(input) {
             return Ok(outcome);
         }
 
@@ -536,6 +554,24 @@ impl Evaluator {
         slot: Slot,
         stdin_tape: &[proc::StdinEvent],
     ) -> Result<std::result::Result<Outcome, String>> {
+        match self.compile_program(&prog) {
+            Ok((exe, warnings)) => Ok(Ok(self.run(
+                &exe,
+                slot,
+                warnings,
+                prog.uses_stdin_tape,
+                stdin_tape,
+            )?)),
+            Err(diag) => Ok(Err(diag)),
+        }
+    }
+
+    /// Compilation is independent of execution, allowing repeated benchmark
+    /// runs to share one executable and the same mapped diagnostics.
+    fn compile_program(
+        &self,
+        prog: &codegen::Program,
+    ) -> std::result::Result<(PathBuf, String), String> {
         let src = self.src_path().display().to_string();
         let (start, count) = (prog.new_start_line, prog.new_line_count);
         match self.compile_text(&prog.src) {
@@ -549,15 +585,9 @@ impl Evaluator {
                     &prog.session_line_ranges,
                     prog.wrapped,
                 ));
-                Ok(Ok(self.run(
-                    &exe,
-                    slot,
-                    warnings,
-                    prog.uses_stdin_tape,
-                    stdin_tape,
-                )?))
+                Ok((exe, warnings))
             }
-            Err(diag) => Ok(Err(errmap::drop_stale_warnings(&errmap::remap(
+            Err(diag) => Err(errmap::drop_stale_warnings(&errmap::remap(
                 &diag,
                 &src,
                 &prog.src,
@@ -565,7 +595,7 @@ impl Evaluator {
                 count,
                 &prog.session_line_ranges,
                 prog.wrapped,
-            )))),
+            ))),
         }
     }
 
@@ -751,15 +781,28 @@ impl Evaluator {
         let mut samples_ns: Vec<f64> = Vec::with_capacity(rounds);
         let mut last_outcome = outcome1;
 
+        let measured = codegen::build_timeit_probe(session, &loop_input, loops);
+        let (exe, warnings) = match self.compile_program(&measured) {
+            Ok(compiled) => compiled,
+            Err(diag) => return Ok(Eval::CompileError(diag)),
+        };
+
         for _ in 0..rounds {
-            let p = codegen::build_timeit_probe(session, &loop_input, loops);
-            if let Ok(Ok(o)) = self.try_program(p, Slot::Expr, session.stdin_tape()) {
-                let ns_val = o.value.as_deref().and_then(|v| v.parse::<u64>().ok());
-                if let Some(ns) = ns_val {
-                    let per_loop_ns = ns as f64 / loops as f64;
-                    samples_ns.push(per_loop_ns);
-                    last_outcome = o;
-                }
+            let o = self.run(
+                &exe,
+                Slot::Expr,
+                warnings.clone(),
+                measured.uses_stdin_tape,
+                session.stdin_tape(),
+            )?;
+            if o.abnormal.is_some() {
+                return Ok(Eval::Done(o));
+            }
+            let ns_val = o.value.as_deref().and_then(|v| v.parse::<u64>().ok());
+            if let Some(ns) = ns_val {
+                let per_loop_ns = ns as f64 / loops as f64;
+                samples_ns.push(per_loop_ns);
+                last_outcome = o;
             }
         }
 
@@ -1189,7 +1232,7 @@ fn split_new(s: &str, has_value: bool) -> SplitOutput {
         Some(i) => (&tail[..i], true),
         None => (tail, false),
     };
-    let mut body = body.replace(M_STDIN, "");
+    let mut body = body.replace(M_STDIN, "").replace(M_STDIN_DONE, "");
     let time_ns = body.rfind(M_TIME).and_then(|i| {
         let payload = body[i + M_TIME.len()..]
             .trim_end_matches(['\r', '\n'])
@@ -1259,7 +1302,16 @@ impl LiveFilter {
                     let request = (!self.stdout)
                         .then(|| find_bytes(&self.pending, M_STDIN.as_bytes()))
                         .flatten();
-                    if request.is_some_and(|r| new.is_none_or(|n| r < n)) {
+                    let finished = (!self.stdout)
+                        .then(|| find_bytes(&self.pending, M_STDIN_DONE.as_bytes()))
+                        .flatten();
+                    if finished
+                        .is_some_and(|f| new.is_none_or(|n| f < n) && request.is_none_or(|r| f < r))
+                    {
+                        let i = finished.expect("checked completion");
+                        self.pending.drain(..i + M_STDIN_DONE.len());
+                        self.stdin_requests.push(proc::StdinRequest::Finished);
+                    } else if request.is_some_and(|r| new.is_none_or(|n| r < n)) {
                         let i = request.expect("checked request");
                         self.pending.drain(..i + M_STDIN.len());
                         self.stdin_requests.push(proc::StdinRequest::Replay);
@@ -1270,7 +1322,11 @@ impl LiveFilter {
                         let markers: &[&[u8]] = if self.stdout {
                             &[M_NEW.as_bytes()]
                         } else {
-                            &[M_NEW.as_bytes(), M_STDIN.as_bytes()]
+                            &[
+                                M_NEW.as_bytes(),
+                                M_STDIN.as_bytes(),
+                                M_STDIN_DONE.as_bytes(),
+                            ]
                         };
                         retain_marker_prefix(&mut self.pending, markers);
                         break;
@@ -1302,6 +1358,11 @@ impl LiveFilter {
                     if let Some(i) = request {
                         next.push((i, M_STDIN.len(), None));
                     }
+                    if !self.stdout
+                        && let Some(i) = find_bytes(&self.pending, M_STDIN_DONE.as_bytes())
+                    {
+                        next.push((i, M_STDIN_DONE.len(), None));
+                    }
                     if let Some((i, marker_len, state)) =
                         next.into_iter().min_by_key(|(i, _, _)| *i)
                     {
@@ -1310,13 +1371,22 @@ impl LiveFilter {
                         if let Some(state) = state {
                             self.state = state;
                         } else {
-                            self.stdin_requests.push(proc::StdinRequest::Current);
+                            self.stdin_requests
+                                .push(if marker_len == M_STDIN_DONE.len() {
+                                    proc::StdinRequest::Finished
+                                } else {
+                                    proc::StdinRequest::Current
+                                });
                         }
                     } else {
                         let markers: &[&[u8]] = if self.stdout {
                             &[M_VAL.as_bytes(), M_TIME.as_bytes(), M_DONE.as_bytes()]
                         } else {
-                            &[M_DONE.as_bytes(), M_STDIN.as_bytes()]
+                            &[
+                                M_DONE.as_bytes(),
+                                M_STDIN.as_bytes(),
+                                M_STDIN_DONE.as_bytes(),
+                            ]
                         };
                         let keep = trailing_marker_prefix(&self.pending, markers);
                         let safe = self.pending.len() - keep;
@@ -1632,7 +1702,7 @@ fn ends_in_possible_compound_literal(input: &str, code: &[bool], close: usize) -
 /// This lexical routing is exclusive: once input has file-scope shape it is
 /// never retried as a statement, because GCC might accept a nested function.
 fn looks_file_scope(input: &str) -> bool {
-    let t = input.trim_start();
+    let t = lex::trim_leading_trivia(input);
     if t.starts_with('#') {
         return true;
     }
@@ -1658,7 +1728,7 @@ fn looks_file_scope(input: &str) -> bool {
     ) {
         return false;
     }
-    if first == "typedef" {
+    if first == "typedef" || lex::function_definition(input).is_some() {
         return true;
     }
     // A type definition, as opposed to a variable of that type: hoisting it
@@ -1666,17 +1736,17 @@ fn looks_file_scope(input: &str) -> bool {
     // apart by what follows the tag — `struct P {` defines, `struct P p`
     // declares.
     if matches!(first.as_str(), "struct" | "union" | "enum") {
-        let after_kw = t[first.len()..].trim_start();
+        let after_kw = lex::trim_leading_trivia(&t[first.len()..]);
         let tag: String = after_kw
             .chars()
             .take_while(|c| c.is_alphanumeric() || *c == '_')
             .collect();
-        if after_kw[tag.len()..].trim_start().starts_with('{') {
+        if lex::trim_leading_trivia(&after_kw[tag.len()..]).starts_with('{') {
             return true;
         }
         return false;
     }
-    !first.is_empty() && lex::function_definition(input).is_some()
+    false
 }
 
 #[cfg(test)]
@@ -1904,7 +1974,8 @@ mod tests {
     #[test]
     fn live_filter_reports_historical_and_current_stdin_requests() {
         let mut filter = LiveFilter::new(false);
-        let wire = format!("old{M_STDIN}{M_NEW}prompt: {M_STDIN}{M_DONE}");
+        let wire =
+            format!("old{M_STDIN}{M_STDIN_DONE}{M_NEW}prompt: {M_STDIN}{M_STDIN_DONE}{M_DONE}");
         let mut visible = Vec::new();
         let mut requests = Vec::new();
         for chunk in wire.as_bytes().chunks(3) {
@@ -1914,7 +1985,12 @@ mod tests {
         assert_eq!(visible, b"prompt: ");
         assert_eq!(
             requests,
-            [proc::StdinRequest::Replay, proc::StdinRequest::Current]
+            [
+                proc::StdinRequest::Replay,
+                proc::StdinRequest::Finished,
+                proc::StdinRequest::Current,
+                proc::StdinRequest::Finished
+            ]
         );
     }
 

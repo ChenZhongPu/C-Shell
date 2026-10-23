@@ -46,7 +46,7 @@ impl Session {
                 return;
             }
             Slot::Stmt => text.to_string(),
-            Slot::Expr if lex::may_have_side_effects(text) => {
+            Slot::Expr if self.must_replay(text) => {
                 // The cast keeps the side effects without tripping a
                 // warning about a computed value going unused.
                 format!("(void)({text});")
@@ -55,6 +55,34 @@ impl Session {
         };
         self.stmts.push(indent(&stored));
         self.stmt_stdin_events.push(0);
+    }
+
+    /// Macro expansion can hide both calls and mutations from the lexical
+    /// heuristic. Treat any retained macro reference conservatively.
+    pub fn references_macro(&self, text: &str) -> bool {
+        let names = self
+            .file_items
+            .iter()
+            .flat_map(|item| lex::defined_macros(item))
+            .collect::<std::collections::BTreeSet<_>>();
+        lex::identifiers(text)
+            .iter()
+            .any(|name| names.contains(name))
+    }
+
+    pub fn must_replay(&self, text: &str) -> bool {
+        lex::may_have_side_effects(text) || self.references_macro(text)
+    }
+
+    /// Fresh stdin events are runtime evidence that the expression must be
+    /// retained, including macros originating in a user header.
+    pub fn commit_with_stdin(&mut self, text: &str, slot: Slot, events: Vec<StdinEvent>) {
+        if slot == Slot::Expr && !events.is_empty() {
+            self.commit(&format!("(void)({text});"), Slot::Stmt);
+        } else {
+            self.commit(text, slot);
+        }
+        self.attach_stdin_events(events);
     }
 
     /// Record a declaration that compiled only after entering a nested block.
@@ -119,6 +147,9 @@ impl Session {
     /// Whether source may affect state, treating retained functions whose
     /// bodies only call other known-pure retained functions as pure.
     pub fn may_have_side_effects(&self, source: &str) -> bool {
+        if self.references_macro(source) {
+            return true;
+        }
         let functions = self
             .file_items
             .iter()
@@ -133,8 +164,11 @@ impl Session {
             let impure = functions
                 .iter()
                 .filter_map(|(name, body)| {
-                    lex::may_have_side_effects_with_pure_calls(body, |called| pure.contains(called))
-                        .then_some(*name)
+                    (self.references_macro(body)
+                        || lex::may_have_side_effects_with_pure_calls(body, |called| {
+                            pure.contains(called)
+                        }))
+                    .then_some(*name)
                 })
                 .collect::<Vec<_>>();
             let old_len = pure.len();

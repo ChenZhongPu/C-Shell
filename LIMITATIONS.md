@@ -9,13 +9,13 @@
 
 ## Stdin & IO Replay
 
-- **The stdin tape currently wraps `scanf`, not every input API.** `fscanf`, `fgets`, `getchar`, raw `read(0, ...)`, an explicit `#undef scanf`, and code inside a precompiled library are not captured yet. One line is supplied per dynamic `scanf` request; programs that require multiple interactive lines in a single call should put the values on one line. In piped-REPL mode stdin is carrying C source, so a current `scanf` receives EOF; use `-e`, `--script`, or an interactive terminal when the evaluated program needs stdin.
+- **The stdin tape currently wraps `scanf`, not every input API.** `fscanf`, `fgets`, `getchar`, raw `read(0, ...)`, an explicit `#undef scanf`, and code inside a precompiled library are not captured yet. An active `scanf` request can receive one line; calls already completed from libc's buffer do not require another line. Programs that require multiple interactive lines in a single call should put the values on one line. In piped-REPL mode stdin is carrying C source, so a current `scanf` receives EOF; use `-e`, `--script`, or an interactive terminal when the evaluated program needs stdin.
 - **Program output is bounded.** When stdin is a real terminal, output from the newest input is streamed immediately, so a prompt before `scanf` is visible. If the program leaves a partial line, `c-shell` appends a dim `↵` marker and the protective newline it inserted; a real `\n` needs no marker. With non-terminal stdin output remains buffered for deterministic transcripts and receives no marker. Capture is limited to 8 MiB per stream; an overflow is reported and the input is not committed.
 
 ## Semantics & Scope
 
 - **Rebinding is C shadowing, not assignment.** A redeclared local lives in a nested block. Its declarator is already in scope during its initializer, so `int x = x + 1;` does not read the outer `x`. File-scope replacement also makes retained earlier calls use the new function when the session replays.
-- **The purity heuristic is conservative.** Any expression containing a function call is kept, even if the function happens to be pure.
+- **The purity heuristic is conservative.** Any expression containing a function call or a reference to a macro defined in retained input is kept, even if it happens to be pure.
 - **Indeterminate values remain undefined C.** Address-only struct-member formatting prevents `c-shell` from adding a `%s` memory dereference, but it cannot make `struct P p; p` well-defined when members were never initialized; reading an indeterminate pointer or scalar is itself not portable. Initialize structs (for example with `{0}`) when the value matters.
 - **Incomplete inputs are not committed.** Besides crashes and timeouts, a successful early `exit(0)`, `_Exit` or top-level `return` is detected by a missing completion marker; committing it would terminate every later replay before the new input runs.
 

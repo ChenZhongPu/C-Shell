@@ -103,7 +103,19 @@ fn web_mode_serves_a_local_pty_repl_behind_a_random_path() {
     let url = first_line
         .split_whitespace()
         .find(|word| word.starts_with("http://127.0.0.1:"))
-        .expect("local browser terminal URL")
+        .unwrap_or_else(|| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let mut status = child.0.try_wait().expect("web server status");
+            while status.is_none() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+                status = child.0.try_wait().expect("web server status");
+            }
+            let mut errors = String::new();
+            if status.is_some() && let Some(mut stderr) = child.0.stderr.take() {
+                let _ = stderr.read_to_string(&mut errors);
+            }
+            panic!("missing local browser terminal URL: {first_line:?}; status: {status:?}; stderr: {errors}");
+        })
         .to_string();
     assert!(
         url.ends_with('/')
@@ -1308,4 +1320,369 @@ fn header_lists_the_default_includes() {
             && out.contains("#include <wchar.h>"),
         "default headers were not listed:\n{out}"
     );
+}
+
+#[test]
+fn macro_expansions_retain_mutations_and_stdin_events() {
+    let output = run_evals_with_stdin(
+        &[
+            "#define READ scanf(\"%*d\")",
+            "READ",
+            "int n = 0;",
+            "#define INC (++n)",
+            "#define ALIAS INC",
+            "ALIAS",
+            "n",
+        ],
+        "7\n",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "0\n1\n1\n");
+}
+
+#[test]
+fn char_array_previews_stop_at_the_array_boundary_and_evaluate_once() {
+    let output = run_evals_with_stdin(
+        &[
+            "struct S { char a[3]; char b[4]; };",
+            "struct S s = {{65,66,67}, {88,89,90,0}};",
+            "s.a",
+            "char rows[2][3] = {{65,66,67}, {88,89,90}};",
+            "int next = 0;",
+            "rows[next++]",
+            "next",
+            "char *text = \"longer than a pointer\";",
+            "text",
+            "\"literal\"",
+        ],
+        "",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "\"ABC\"\n\"ABC\"\n1\n\"longer than a pointer\"\n\"literal\"\n"
+    );
+}
+
+#[test]
+fn scanf_buffered_and_empty_conversions_replay_without_divergence() {
+    for (codes, input, expected) in [
+        (
+            vec![
+                "int a=0,b=0,c=0;",
+                "scanf(\"%d\",&a);",
+                "scanf(\"%d\",&b);",
+                "scanf(\"%d\",&c);",
+                "a+b+c",
+            ],
+            "10 20\n99\n",
+            "129\n",
+        ),
+        (
+            vec![
+                "char a=0,b=0;",
+                "scanf(\"%c\",&a);",
+                "scanf(\"%c\",&b);",
+                "(int)b",
+            ],
+            "a\nb\n",
+            "10\n",
+        ),
+        (vec!["scanf(\"\");", "42"], "unused\n", "42\n"),
+        (vec!["int n=0;", "scanf(\"%d\",&n);", "n"], "7", "7\n"),
+    ] {
+        let output = run_evals_with_stdin(&codes, input);
+        assert!(
+            output.status.success(),
+            "{codes:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            expected,
+            "{codes:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn buffered_scanf_does_not_wait_for_another_parent_input_line() {
+    for codes in [
+        vec![
+            "char a=0,b=0;",
+            "scanf(\"%c\",&a);",
+            "scanf(\"%c\",&b);",
+            "(int)b",
+        ],
+        vec!["scanf(\"\");", "10"],
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_c-shell"));
+        command.args(["--lang", "en", "--no-color"]);
+        for code in &codes {
+            command.args(["-e", code]);
+        }
+        let mut child = ChildGuard(
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        // Keep the pipe open: an unnecessary read must not be rescued by EOF.
+        let mut input = child.0.stdin.take().unwrap();
+        input.write_all(b"a\n").unwrap();
+        input.flush().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success(), "buffered scanf failed: {codes:?}");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "buffered scanf stalled: {codes:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut stdout = String::new();
+        child
+            .0
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        assert_eq!(stdout, "10\n");
+    }
+}
+
+#[test]
+fn leading_and_interleaved_comments_preserve_file_scope() {
+    let output = run_evals_with_stdin(
+        &[
+            "/* type */ struct /* tag */ S /* body */ { int n; };",
+            "/* function */ int f(void) { return 42; }",
+            "int g(void) { struct S s={f()}; return s.n; }",
+            "g()",
+        ],
+        "",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n");
+}
+
+#[test]
+fn c23_digit_separators_do_not_join_independent_batch_inputs() {
+    let probe = Command::new(env!("CARGO_BIN_EXE_c-shell"))
+        .args(["--std", "c23", "-e", "1'000"])
+        .output()
+        .unwrap();
+    // The host must implement this C23 feature (MSVC may not do so yet).
+    if !probe.status.success() {
+        return;
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_c-shell"))
+        .args(["--std", "c23", "--lang", "en", "--no-color"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"1'000\n2+2\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "Out[1]: 1000\nOut[2]: 4\n"
+    );
+}
+
+#[test]
+fn magic_failures_set_exit_status_and_route_diagnostics_to_stderr() {
+    for code in [
+        "%type nonexistent_name",
+        "%bits",
+        "%utf8 -n 4097 text",
+        "%unknown",
+        "%where nonexistent_name",
+        "%std impossible-standard",
+        "%cc nonexistent-c-compiler",
+        "%edit 999",
+        "%time nonexistent_name",
+        "%timeit nonexistent_name",
+        "%help invalid",
+        "%src invalid",
+    ] {
+        let output = run_evals_with_stdin(&[code], "");
+        assert!(!output.status.success(), "magic succeeded: {code}");
+        assert!(
+            output.stdout.is_empty(),
+            "magic error on stdout: {code}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(!output.stderr.is_empty(), "missing diagnostic: {code}");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("failure.csh");
+    std::fs::write(&script, "%type nonexistent_name\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_c-shell"))
+        .arg("--script")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "script ignored failed magic");
+}
+
+#[test]
+fn timed_inputs_preserve_program_output_and_bare_value_formatting() {
+    let output = run_evals_with_stdin(&["%time puts(\"hello\");", "%time 40+2"], "");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "hello\n42\n");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr)
+            .matches("Wall time:")
+            .count(),
+        2
+    );
+    let transcript = run(&["%time puts(\"hello\");"]);
+    assert_eq!(transcript.matches("hello").count(), 1);
+    assert!(transcript.contains("Wall time:"));
+}
+
+#[test]
+fn eval_and_script_modes_clean_up_generated_files_even_after_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = dir.path().join("scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    let script = dir.path().join("example.csh");
+    for code in ["42", "int broken = ;"] {
+        std::fs::write(&script, format!("{code}\n")).unwrap();
+        for script_mode in [false, true] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_c-shell"));
+            command
+                .env("TMPDIR", &scratch)
+                .env("TMP", &scratch)
+                .env("TEMP", &scratch);
+            if script_mode {
+                command.arg("--script").arg(&script);
+            } else {
+                command.args(["-e", code]);
+            }
+            let output = command.output().unwrap();
+            assert_eq!(output.status.success(), code == "42");
+            let leftovers = std::fs::read_dir(&scratch).unwrap().collect::<Vec<_>>();
+            assert!(
+                leftovers.is_empty(),
+                "temporary files survived: {leftovers:?}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn timeit_compiles_the_measured_program_once_for_all_rounds() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let wrapper = dir.path().join("cc-logger");
+    let log = dir.path().join("compilations");
+    std::fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        */input.c) printf 'compile\n' >> "$C_SHELL_TEST_LOG" ;;
+    esac
+done
+exec "${C_SHELL_TEST_CC:-cc}" "$@"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_c-shell"))
+        .arg("--cc")
+        .arg(&wrapper)
+        .args(["--lang", "en", "-e", "%timeit 1+1"])
+        .env("C_SHELL_TEST_LOG", &log)
+        .env(
+            "C_SHELL_TEST_CC",
+            std::env::var_os("CC").unwrap_or_else(|| "cc".into()),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("5 runs"));
+    assert_eq!(
+        std::fs::read_to_string(log).unwrap().lines().count(),
+        2,
+        "expected one calibration compile and one measured compile"
+    );
+}
+
+#[test]
+fn completed_scanf_calls_cannot_keep_renewing_the_execution_timeout() {
+    for input in [
+        "while (1) { scanf(\"\"); }",
+        "while (1) { scanf(\"%d\", &n); }",
+    ] {
+        let output = run_with_timeout(1, &["int n=0;", input, "42"]);
+        assert!(
+            output.contains("killed after 1s"),
+            "missing deadline: {output}"
+        );
+        assert!(
+            output.contains("Out[3]: 42"),
+            "REPL failed to recover: {output}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn variable_length_character_array_expressions_are_evaluated_once() {
+    let output = run_evals_with_stdin(
+        &[
+            "int n=3;",
+            "char rows[2][n];",
+            "memset(rows,65,sizeof rows);",
+            "int next=0;",
+            "rows[next++]",
+            "next",
+        ],
+        "",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "\"AAA\"\n1\n");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("sequence-point"));
 }

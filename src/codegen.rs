@@ -24,6 +24,8 @@ pub const M_TIME: &str = "\x01\x02c-shell/time\x02\x01";
 pub const M_DONE: &str = "\x01\x02c-shell/done\x02\x01";
 /// A wrapped stdin call requests one recorded or live line from the parent.
 pub const M_STDIN: &str = "\x01\x02c-shell/stdin\x02\x01";
+/// A scanf call completed, possibly using bytes already buffered by libc.
+pub const M_STDIN_DONE: &str = "\x01\x02c-shell/stdin-end\x02\x01";
 /// Prefix for a bounded hexadecimal byte payload returned by the explicit
 /// UTF-8 array probe. Rust validates and renders it before it reaches the UI.
 pub const M_UTF8: &str = "\x01\x02c-shell/utf8\x02\x01";
@@ -90,14 +92,24 @@ static inline void cs_time_once_stop(void)
 #define CS_VAL() fputs(CS_M_VAL, stdout)
 #endif
 
-static inline void cs_p_b (_Bool v)              { CS_VAL(); printf("%s\n", v ? "true" : "false"); }
-static inline void cs_p_c (char v)               { CS_VAL(); printf("'%c' (%d)\n", (v >= 32 && v < 127) ? v : '?', (int)v); }
-static inline void cs_p_i (long long v)          { CS_VAL(); printf("%lld\n", v); }
-static inline void cs_p_u (unsigned long long v) { CS_VAL(); printf("%llu\n", v); }
-static inline void cs_p_d (double v)             { CS_VAL(); printf("%.17g\n", v); }
-static inline void cs_p_ld(long double v)        { CS_VAL(); printf("%.21Lg\n", v); }
-static inline void cs_p_s (const char *v)        { CS_VAL(); if (v) printf("\"%s\"\n", v); else printf("NULL\n"); }
-static inline void cs_p_p (const void *v)        { CS_VAL(); if (v) printf("0x%" PRIxPTR "\n", (uintptr_t)v); else printf("NULL\n"); }
+static inline void cs_p_b (_Bool v, size_t n)              { (void)n; CS_VAL(); printf("%s\n", v ? "true" : "false"); }
+static inline void cs_p_c (char v, size_t n)               { (void)n; CS_VAL(); printf("'%c' (%d)\n", (v >= 32 && v < 127) ? v : '?', (int)v); }
+static inline void cs_p_i (long long v, size_t n)          { (void)n; CS_VAL(); printf("%lld\n", v); }
+static inline void cs_p_u (unsigned long long v, size_t n) { (void)n; CS_VAL(); printf("%llu\n", v); }
+static inline void cs_p_d (double v, size_t n)             { (void)n; CS_VAL(); printf("%.17g\n", v); }
+static inline void cs_p_ld(long double v, size_t n)        { (void)n; CS_VAL(); printf("%.21Lg\n", v); }
+static inline void cs_p_s_bounded(const void *object, size_t size)
+{
+    const char *v = (const char *)object;
+    size_t i;
+    CS_VAL();
+    if (!v) { puts("NULL"); return; }
+    putchar('"');
+    for (i = 0; i < size && v[i]; ++i) putchar((unsigned char)v[i]);
+    puts("\"");
+}
+static inline void cs_p_s(const char *v, size_t size) { cs_p_s_bounded(v, size); }
+static inline void cs_p_p(const void *v, size_t n) { (void)n; CS_VAL(); if (v) printf("0x%" PRIxPTR "\n", (uintptr_t)v); else printf("NULL\n"); }
 
 #ifdef CS_ENABLE_BITS
 static inline int cs_bits_little_endian(void)
@@ -357,7 +369,14 @@ static inline void cs_m_unknown(const volatile void *v)          { (void)v; fput
     else printf("(void *)0x%" PRIxPTR, (uintptr_t)(x));                 \
 } while (0)
 
-#define CS_PRINT(x) _Generic((x),                                        \
+#if defined(__GNUC__) || defined(__clang__)
+#define CS_STRING_BOUND(x) _Generic((__typeof__(x) *)0,                  \
+    char (*)[]: sizeof(x), const char (*)[]: sizeof(x), default: SIZE_MAX)
+#else
+#define CS_STRING_BOUND(x) SIZE_MAX
+#endif
+
+#define CS_PRINT_WITH_BOUND(x, n) _Generic((x),                          \
     _Bool: cs_p_b,              char: cs_p_c,                            \
     signed char: cs_p_i,        unsigned char: cs_p_u,                   \
     short: cs_p_i,              unsigned short: cs_p_u,                  \
@@ -368,7 +387,33 @@ static inline void cs_m_unknown(const volatile void *v)          { (void)v; fput
     long double: cs_p_ld,                                                \
     char *: cs_p_s,             const char *: cs_p_s,                    \
     CS_AGG_PRINT_ASSOCIATIONS                                            \
-    default: cs_p_p)(x)
+    default: cs_p_p)(x, n)
+#define CS_PRINT(x) CS_PRINT_WITH_BOUND(x, CS_STRING_BOUND(x))
+
+/* typeof cannot name a bit-field. Unary + proves this fallback is numeric,
+   so it can never accidentally bypass the bound on a character array. */
+#define CS_PRINT_SCALAR(x) do {                                         \
+    (void)sizeof(+(x));                                                  \
+    CS_PRINT_WITH_BOUND(x, SIZE_MAX);                                   \
+} while (0)
+
+/* Capture addressable expressions before inspecting a variably modified
+   type: sizeof/typeof may evaluate a VLA operand. Pointer capture preserves
+   single evaluation even for rows[index++] where each row is a VLA. */
+#if defined(__GNUC__) || defined(__clang__)
+#define CS_PRINT_LVALUE(x) do {                                          \
+    __auto_type _cs_print_address = &(x);                               \
+    if (_Generic(_cs_print_address, char (*)[]: 1, const char (*)[]: 1, default: 0)) \
+        cs_p_s_bounded((const void *)_cs_print_address, sizeof(*_cs_print_address)); \
+    else CS_PRINT(*_cs_print_address);                                  \
+} while (0)
+#else
+#define CS_PRINT_LVALUE(x) do {                                          \
+    if (_Generic(&(x), char (*)[]: 1, const char (*)[]: 1, default: 0))  \
+        cs_p_s_bounded((const void *)&(x), sizeof(x));                   \
+    else CS_PRINT(x);                                                   \
+} while (0)
+#endif
 
 /* An array decays to a pointer before _Generic can see it, so array-ness is
    settled at run time instead: an array object begins at its first element,
@@ -593,6 +638,8 @@ static int cs_taped_scanf(const char *format, ...)
     va_start(args, format);
     result = vscanf(format, args);
     va_end(args);
+    fputs(CS_M_STDIN_DONE, stderr);
+    fflush(stderr);
     return result;
 }
 #ifdef scanf
@@ -671,6 +718,8 @@ pub struct Program {
 #[derive(Clone, Copy)]
 enum BuildFlavor {
     Normal(Slot),
+    LvalueExpr,
+    ScalarExpr,
     SilentExpr,
     TypeProbe,
     BitsProbe(bool),
@@ -697,6 +746,8 @@ impl BuildFlavor {
         match self {
             Self::Normal(slot) => slot,
             Self::SilentExpr
+            | Self::LvalueExpr
+            | Self::ScalarExpr
             | Self::TypeProbe
             | Self::BitsProbe(_)
             | Self::TimeitProbe(_)
@@ -749,6 +800,16 @@ pub fn build(session: &Session, input: &str, slot: Slot) -> Program {
 /// before the timer starts.
 pub fn build_timed(session: &Session, input: &str, slot: Slot) -> Program {
     build_inner(session, input, BuildFlavor::Normal(slot), true)
+}
+
+/// Try bounded character-array printing before executing a possible array.
+/// Non-addressable expressions are retried with the ordinary value wrapper.
+pub fn build_lvalue_expr(session: &Session, input: &str, timed: bool) -> Program {
+    build_inner(session, input, BuildFlavor::LvalueExpr, timed)
+}
+
+pub fn build_scalar_expr(session: &Session, input: &str, timed: bool) -> Program {
+    build_inner(session, input, BuildFlavor::ScalarExpr, timed)
 }
 
 /// Retry a block-scope declaration inside a fresh nested scope. If the real
@@ -847,6 +908,36 @@ pub fn build_timeit_probe(session: &Session, input: &str, loops: u64) -> Program
     build_inner(session, input, BuildFlavor::TimeitProbe(loops), false)
 }
 
+/// Track source locations while appending instead of rescanning the complete
+/// accumulated program for every retained item.
+struct Source {
+    text: String,
+    newlines: usize,
+}
+
+impl Source {
+    fn new() -> Self {
+        Self {
+            text: String::with_capacity(4096),
+            newlines: 0,
+        }
+    }
+
+    fn push_str(&mut self, text: &str) {
+        self.newlines += text.bytes().filter(|byte| *byte == b'\n').count();
+        self.text.push_str(text);
+    }
+
+    fn push(&mut self, character: char) {
+        self.newlines += usize::from(character == '\n');
+        self.text.push(character);
+    }
+
+    fn line_count(&self) -> usize {
+        self.newlines + usize::from(!self.text.is_empty() && !self.text.ends_with('\n'))
+    }
+}
+
 fn build_inner(session: &Session, input: &str, flavor: BuildFlavor, timed: bool) -> Program {
     let slot = flavor.slot();
     let silent_expr = matches!(flavor, BuildFlavor::SilentExpr);
@@ -884,7 +975,7 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor, timed: bool)
         .map(String::as_str)
         .chain(std::iter::once(input))
         .any(|source| lex::contains_code_identifier(source, "scanf"));
-    let mut src = String::with_capacity(4096);
+    let mut src = Source::new();
     let mut new_start_line = 1usize;
     let mut session_line_ranges = Vec::new();
 
@@ -895,6 +986,10 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor, timed: bool)
     src.push_str(&format!("#define CS_M_TIME \"{}\"\n", escape(M_TIME)));
     src.push_str(&format!("#define CS_M_DONE \"{}\"\n", escape(M_DONE)));
     src.push_str(&format!("#define CS_M_STDIN \"{}\"\n", escape(M_STDIN)));
+    src.push_str(&format!(
+        "#define CS_M_STDIN_DONE \"{}\"\n",
+        escape(M_STDIN_DONE)
+    ));
     src.push_str(&format!("#define CS_M_UTF8 \"{}\"\n", escape(M_UTF8)));
     src.push_str(&format!("#define CS_M_UNICODE \"{}\"\n", escape(M_UNICODE)));
     if bits_uppercase.is_some() {
@@ -907,10 +1002,10 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor, timed: bool)
 
     for (index, item) in session.file_items.iter().enumerate() {
         if file_replacement == Some(index) {
-            new_start_line = src.lines().count() + 1;
+            new_start_line = src.line_count() + 1;
             src.push_str(input);
         } else {
-            let start = src.lines().count() + 1;
+            let start = src.line_count() + 1;
             src.push_str(item);
             session_line_ranges.push((start, item.lines().count().max(1)));
         }
@@ -918,16 +1013,16 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor, timed: bool)
     }
 
     if slot == Slot::FileScope && file_replacement.is_none() {
-        new_start_line = src.lines().count() + 1;
+        new_start_line = src.line_count() + 1;
         src.push_str(input);
         src.push('\n');
     }
 
-    let aggregate_printers = build_aggregate_printers(&src);
+    let aggregate_printers = build_aggregate_printers(&src.text);
     src.push_str(&aggregate_printers);
     src.push_str("\nint main(void)\n{\n");
     for stmt in &session.stmts {
-        let start = src.lines().count() + 1;
+        let start = src.line_count() + 1;
         src.push_str(stmt);
         session_line_ranges.push((start, stmt.lines().count().max(1)));
         src.push('\n');
@@ -943,14 +1038,14 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor, timed: bool)
             if scoped_stmt {
                 src.push_str("    {\n");
             }
-            new_start_line = src.lines().count() + 1;
+            new_start_line = src.line_count() + 1;
             src.push_str(input);
             src.push('\n');
         }
         Slot::Expr => {
             // The input sits on a line of its own so a diagnostic inside it
             // lands on text the user actually typed, at the column they see.
-            new_start_line = src.lines().count() + if type_probe { 3 } else { 2 };
+            new_start_line = src.line_count() + if type_probe { 3 } else { 2 };
             if type_probe {
                 let aggregates = aggregate_types(session, input);
                 src.push_str("    CS_VAL();\n");
@@ -1003,6 +1098,10 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor, timed: bool)
                 ));
             } else if let Some(depth) = array_depth {
                 src.push_str(&format!("    CS_PRINT_ARRAY{depth}((\n{input}\n    ));\n"));
+            } else if matches!(flavor, BuildFlavor::LvalueExpr) {
+                src.push_str(&format!("    CS_PRINT_LVALUE((\n{input}\n    ));\n"));
+            } else if matches!(flavor, BuildFlavor::ScalarExpr) {
+                src.push_str(&format!("    CS_PRINT_SCALAR((\n{input}\n    ));\n"));
             } else {
                 src.push_str(&format!("    CS_PRINT((\n{input}\n    ));\n"));
             }
@@ -1022,7 +1121,7 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor, timed: bool)
     src.push_str("    return 0;\n}\n");
     let new_line_count = input.lines().count().max(1);
     Program {
-        src,
+        src: src.text,
         new_start_line,
         new_line_count,
         session_line_ranges,
@@ -1083,7 +1182,10 @@ fn build_aggregate_printers(source: &str) -> String {
             "static void cs_m_ag_{index}(const volatile {} *);\n",
             printer.ty
         ));
-        out.push_str(&format!("static void cs_p_ag_{index}({});\n", printer.ty));
+        out.push_str(&format!(
+            "static void cs_p_ag_{index}({}, size_t);\n",
+            printer.ty
+        ));
     }
 
     out.push_str("#undef CS_AGG_PRINT_ASSOCIATIONS\n");
@@ -1109,7 +1211,7 @@ fn build_aggregate_printers(source: &str) -> String {
             emit_struct_formatter(&mut out, index, printer);
         }
         out.push_str(&format!(
-            "static void cs_p_ag_{index}({ty} v) {{ CS_VAL(); cs_aggregate_depth = 0; cs_m_ag_{index}(&v); putchar('\\n'); }}\n",
+            "static void cs_p_ag_{index}({ty} v, size_t n) {{ (void)n; CS_VAL(); cs_aggregate_depth = 0; cs_m_ag_{index}(&v); putchar('\\n'); }}\n",
             ty = printer.ty
         ));
     }

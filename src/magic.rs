@@ -9,6 +9,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use crate::Style;
 use crate::codegen::{self, Slot};
 use crate::eval::{Eval, Evaluator, UnicodeEncoding};
 use crate::i18n;
@@ -18,7 +19,7 @@ use crate::std_index;
 use crate::ui::Ui;
 
 pub enum Action {
-    Continue,
+    Continue(bool),
     Quit,
     /// Pre-populate the next interactive prompt without evaluating anything.
     Prefill(String),
@@ -83,15 +84,18 @@ fn edit_input(args: &[&str], session: &Session) -> std::result::Result<Option<St
     }
 }
 
-fn render_probe(result: Eval, ui: &Ui, missing: &str) {
+fn render_probe(result: Eval, ui: &Ui, missing: &str, style: Style) -> bool {
     match result {
-        Eval::CompileError(diag) => println!("{}", ui.err(diag.trim_end())),
+        Eval::CompileError(diag) => {
+            style.diagnostic(&ui.err(diag.trim_end()));
+            false
+        }
         Eval::Done(o) => {
             if o.streamed_output_needs_newline {
-                println!();
+                println!("{}", ui.inserted_newline_marker());
             }
             if !o.warnings.trim().is_empty() {
-                println!("{}", ui.warn(o.warnings.trim_end()));
+                style.diagnostic(&ui.warn(o.warnings.trim_end()));
             }
             if !o.output.is_empty() {
                 print!("{}", o.output);
@@ -100,14 +104,21 @@ fn render_probe(result: Eval, ui: &Ui, missing: &str) {
                 }
             }
             if !o.errors.is_empty() {
-                print!("{}", ui.err(&o.errors));
+                if style == Style::Bare {
+                    eprint!("{}", o.errors);
+                } else {
+                    print!("{}", ui.err(&o.errors));
+                }
             }
             if let Some(msg) = o.abnormal {
-                println!("{}", ui.err(&msg));
+                style.diagnostic(&ui.err(&msg));
+                false
             } else if let Some(value) = o.value {
                 println!("{value}");
+                true
             } else {
-                println!("{}", ui.err(missing));
+                style.diagnostic(&ui.err(missing));
+                false
             }
         }
     }
@@ -315,11 +326,11 @@ fn localized_index_note(note: &str, ui: &Ui) -> String {
     ui.text(key)
 }
 
-fn render_where(name: &str, ev: &Evaluator, ui: &Ui) {
+fn render_where(name: &str, ev: &Evaluator, ui: &Ui, style: Style) -> bool {
     let Some(found) = std_index::lookup(name) else {
         let message = ui.text_with("where-not-found", &[("name", name.to_string())]);
-        println!("{}", ui.err(&message));
-        return;
+        style.diagnostic(&ui.err(&message));
+        return false;
     };
 
     println!("{} {}", ui.text("where-name"), found.name);
@@ -412,9 +423,16 @@ fn render_where(name: &str, ev: &Evaluator, ui: &Ui) {
             localized_index_note(note, ui)
         );
     }
+    true
 }
 
-pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) -> Result<Action> {
+pub fn handle(
+    line: &str,
+    session: &mut Session,
+    ev: &mut Evaluator,
+    ui: &Ui,
+    style: Style,
+) -> Result<Action> {
     let body = line.trim().trim_start_matches('%');
     let mut parts = body.split_whitespace();
     let cmd = parts.next().unwrap_or("");
@@ -422,6 +440,12 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
     // Unlike compiler paths/standards, a type query may itself contain spaces;
     // preserve its spelling rather than rebuilding it from split words.
     let tail = body.get(cmd.len()..).unwrap_or("").trim();
+
+    let mut ok = true;
+    let fail = |message: String| {
+        style.diagnostic(&ui.err(&message));
+        false
+    };
 
     match cmd {
         "help" | "h" | "?" => match rest.as_slice() {
@@ -433,7 +457,7 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
                 ui.text("magic-help"),
                 ui.text("magic-help-notes")
             ),
-            _ => println!("{}", ui.err(&ui.text("help-usage"))),
+            _ => ok = fail(ui.text("help-usage")),
         },
         "quit" | "exit" | "q" => return Ok(Action::Quit),
 
@@ -460,20 +484,25 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
                 let prog = codegen::build(session, "", Slot::Stmt);
                 println!("{}", format_c(&prog.src));
             }
-            _ => println!("{}", ui.err(&ui.text("src-usage"))),
+            _ => ok = fail(ui.text("src-usage")),
         },
 
         "edit" => match edit_input(&rest, session) {
             Ok(Some(input)) => return Ok(Action::Prefill(input)),
             Ok(None) => println!("{}", ui.dim(&ui.text("nothing-to-edit"))),
-            Err(message) => println!("{}", ui.err(&message)),
+            Err(message) => ok = fail(message),
         },
 
         "type" => {
             if tail.is_empty() {
-                println!("{}", ui.err(&ui.text("type-usage")));
+                ok = fail(ui.text("type-usage"));
             } else {
-                render_probe(ev.type_of(session, tail)?, ui, &ui.text("type-no-result"));
+                ok = render_probe(
+                    ev.type_of(session, tail)?,
+                    ui,
+                    &ui.text("type-no-result"),
+                    style,
+                );
             }
         }
 
@@ -481,7 +510,7 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
             let uppercase = bits_command == "Bits";
             if tail.is_empty() {
                 let usage = ui.text_with("bits-usage", &[("command", bits_command.to_string())]);
-                println!("{}", ui.err(&usage));
+                ok = fail(usage);
             } else {
                 let result = ev.bits_of(session, tail, uppercase)?;
                 match result {
@@ -490,9 +519,9 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
                             "bits-unsupported",
                             &[("command", bits_command.to_string())],
                         );
-                        println!("{}", ui.err(&message));
+                        ok = fail(message);
                     }
-                    result => render_probe(result, ui, &ui.text("bits-no-result")),
+                    result => ok = render_probe(result, ui, &ui.text("bits-no-result"), style),
                 }
             }
         }
@@ -513,7 +542,7 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
                             ("message", message),
                         ],
                     );
-                    println!("{}", ui.err(&usage));
+                    ok = fail(usage);
                 }
                 Ok((count, expression)) => {
                     let result = ev.unicode_of(session, expression, encoding, count)?;
@@ -523,10 +552,10 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
                                 "unicode-unsupported",
                                 &[("command", unicode_command.to_string())],
                             );
-                            println!("{}", ui.err(&message));
+                            ok = fail(message);
                         }
                         result => {
-                            render_probe(result, ui, &ui.text("unicode-no-result"));
+                            ok = render_probe(result, ui, &ui.text("unicode-no-result"), style);
                         }
                     }
                 }
@@ -534,64 +563,30 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
         }
 
         "where" => match rest.as_slice() {
-            [name] if is_c_identifier(name) => render_where(name, ev, ui),
-            _ => println!("{}", ui.err(&ui.text("where-usage"))),
+            [name] if is_c_identifier(name) => ok = render_where(name, ev, ui, style),
+            _ => ok = fail(ui.text("where-usage")),
         },
 
         "time" => {
             if tail.is_empty() {
-                println!("{}", ui.err(&ui.text("time-usage")));
+                ok = fail(ui.text("time-usage"));
             } else {
                 let n = session.counter + 1;
                 session.counter = n;
                 session.remember_input(n, tail);
-
+                let warning = crate::warn_external_replay(tail, session, ui, style);
                 match ev.time(session, tail)? {
-                    Eval::CompileError(diag) => println!("{}", ui.err(diag.trim_end())),
+                    Eval::CompileError(diag) => ok = fail(diag.trim_end().to_string()),
                     Eval::Done(o) => {
-                        if o.streamed_output_needs_newline {
-                            println!("{}", ui.inserted_newline_marker());
-                        }
-                        let note = |s: &str| println!("{}", ui.dim(s));
-                        if o.rewritten.is_some() {
-                            note(&ui.text("note-missing-semicolon"));
-                        }
-                        if !o.warnings.trim().is_empty() {
-                            println!("{}", ui.warn(o.warnings.trim_end()));
-                        }
-
-                        if !o.errors.is_empty() {
-                            print!("{}", ui.err(&o.errors));
-                        }
-                        if let Some(v) = &o.value {
-                            println!("{}{}", ui.out_label(n), v);
-                        }
-                        let committed = o.rewritten.clone().unwrap_or_else(|| tail.to_string());
-                        match &o.abnormal {
-                            Some(msg) => {
-                                println!("{}", ui.err(msg));
-                                note(&ui.text("note-input-not-kept"));
+                        let duration = o.timed_duration;
+                        ok = crate::finish_input(tail, o, session, ui, style, warning);
+                        let message = match duration {
+                            Some(duration) => {
+                                format!("{} {}", ui.text("wall-time"), format_duration(duration))
                             }
-                            None => {
-                                if let Some(index) = o.file_replacement {
-                                    session.replace_file(index, &committed);
-                                } else if o.scoped_rebind {
-                                    session.commit_scoped(&committed);
-                                } else {
-                                    session.commit(&committed, o.slot);
-                                }
-                                session.attach_stdin_events(o.stdin_events.clone());
-                            }
-                        }
-                        if let Some(duration) = o.timed_duration {
-                            let label = ui.text("wall-time");
-                            println!(
-                                "{}",
-                                ui.dim(&format!("{label} {}", format_duration(duration)))
-                            );
-                        } else {
-                            println!("{}", ui.dim(&ui.text("wall-time-unavailable")));
-                        }
+                            None => ui.text("wall-time-unavailable"),
+                        };
+                        style.diagnostic(&ui.dim(&message));
                     }
                 }
             }
@@ -599,25 +594,17 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
 
         "timeit" => {
             if tail.is_empty() {
-                println!("{}", ui.err(&ui.text("timeit-usage")));
+                ok = fail(ui.text("timeit-usage"));
             } else {
                 if session.may_have_side_effects(tail) {
-                    println!("{}", ui.warn(&ui.text("timeit-state-warning")));
+                    style.diagnostic(&ui.warn(&ui.text("timeit-state-warning")));
                 }
-                match ev.timeit(session, tail)? {
-                    Eval::CompileError(diag) => println!("{}", ui.err(diag.trim_end())),
-                    Eval::Done(o) => {
-                        if o.streamed_output_needs_newline {
-                            println!("{}", ui.inserted_newline_marker());
-                        }
-
-                        if let Some(msg) = o.abnormal {
-                            println!("{}", ui.err(&msg));
-                        } else if let Some(report) = o.value {
-                            println!("{report}");
-                        }
-                    }
-                }
+                ok = render_probe(
+                    ev.timeit(session, tail)?,
+                    ui,
+                    &ui.text("wall-time-unavailable"),
+                    style,
+                );
             }
         }
 
@@ -636,7 +623,7 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
                         ev.set_toolchain(tc);
                         println!("{}", ev.tc.describe());
                     }
-                    Err(e) => println!("{}", ui.err(&format!("{e}"))),
+                    Err(e) => ok = fail(format!("{e}")),
                 }
             }
         }
@@ -655,22 +642,20 @@ pub fn handle(line: &str, session: &mut Session, ev: &mut Evaluator, ui: &Ui) ->
                         ev.set_toolchain(new);
                         println!("{}", ev.tc.describe());
                     }
-                    _ => println!(
-                        "{}",
-                        ui.err(
-                            &ui.text_with("std-unsupported", &[("standard", want.to_string())],)
-                        )
-                    ),
+                    _ => {
+                        ok =
+                            fail(ui.text_with("std-unsupported", &[("standard", want.to_string())]))
+                    }
                 }
             }
         }
 
         other => {
             let message = ui.text_with("unknown-command", &[("command", other.to_string())]);
-            println!("{}", ui.err(&message));
+            ok = fail(message);
         }
     }
-    Ok(Action::Continue)
+    Ok(Action::Continue(ok))
 }
 
 #[cfg(test)]
