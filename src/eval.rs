@@ -607,7 +607,24 @@ impl Evaluator {
         uses_stdin_tape: bool,
         stdin_tape: &[proc::StdinEvent],
     ) -> Result<Outcome> {
-        let mut cmd = Command::new(exe);
+        self.run_command(
+            Command::new(exe),
+            slot,
+            warnings,
+            uses_stdin_tape,
+            stdin_tape,
+        )
+    }
+
+    fn run_command(
+        &self,
+        mut cmd: Command,
+        slot: Slot,
+        warnings: String,
+        uses_stdin_tape: bool,
+        stdin_tape: &[proc::StdinEvent],
+    ) -> Result<Outcome> {
+        let executable = cmd.get_program().to_os_string();
         let taped = uses_stdin_tape || !stdin_tape.is_empty();
         let (request_tx, request_rx) = mpsc::channel();
         let live =
@@ -635,7 +652,7 @@ impl Evaluator {
         .with_context(|| {
             i18n::text_with(
                 "program-start-error",
-                &[("path", exe.display().to_string())],
+                &[("path", executable.to_string_lossy().into_owned())],
             )
         })?;
         let process_duration = start_time.elapsed();
@@ -711,103 +728,77 @@ impl Evaluator {
 
     /// Benchmark an expression or statement without committing it to the session.
     pub fn timeit(&self, session: &Session, input: &str) -> Result<Eval> {
-        let mut loop_input = input.to_string();
-        let mut prog = codegen::build_timeit_probe(session, &loop_input, 1);
-        let res = match self.try_program(prog, Slot::Expr, session.stdin_tape())? {
-            Ok(o) => Ok(o),
-            Err(_) if !input.trim_end().ends_with(';') => {
-                loop_input = format!("{};", input.trim_end());
-                prog = codegen::build_timeit_probe(session, &loop_input, 1);
-                self.try_program(prog, Slot::Expr, session.stdin_tape())?
-            }
-            Err(e) => Err(e),
-        };
-
-        let outcome1 = match res {
-            Ok(o) => o,
-            Err(diag) => return Ok(Eval::CompileError(diag)),
-        };
-
-        if outcome1.abnormal.is_some() {
-            return Ok(Eval::Done(outcome1));
-        }
-
-        let elapsed_ns_1: u64 = outcome1
-            .value
-            .as_deref()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-
-        let target_ns: u64 = 100_000_000;
-        let ladder: &[u64] = &[
-            1,
-            2,
-            5,
-            10,
-            20,
-            50,
-            100,
-            200,
-            500,
-            1_000,
-            2_000,
-            5_000,
-            10_000,
-            20_000,
-            50_000,
-            100_000,
-            200_000,
-            500_000,
-            1_000_000,
-            2_000_000,
-            5_000_000,
-            10_000_000,
-            20_000_000,
-            50_000_000,
-            100_000_000,
-        ];
-
-        let loops = if elapsed_ns_1 >= target_ns {
-            1
-        } else {
-            let needed = target_ns / elapsed_ns_1.max(1);
-            *ladder
-                .iter()
-                .find(|&&n| n >= needed)
-                .unwrap_or(&100_000_000)
-        };
-
-        let rounds = 5;
-        let mut samples_ns: Vec<f64> = Vec::with_capacity(rounds);
-        let mut last_outcome = outcome1;
-
-        let measured = codegen::build_timeit_probe(session, &loop_input, loops);
-        let (exe, warnings) = match self.compile_program(&measured) {
+        let mut prog = codegen::build_timeit_probe(session, input);
+        let (exe, warnings) = match self.compile_program(&prog) {
             Ok(compiled) => compiled,
+            Err(_) if !input.trim_end().ends_with(';') => {
+                let patched = format!("{};", input.trim_end());
+                prog = codegen::build_timeit_probe(session, &patched);
+                match self.compile_program(&prog) {
+                    Ok(compiled) => compiled,
+                    Err(diag) => return Ok(Eval::CompileError(diag)),
+                }
+            }
             Err(diag) => return Ok(Eval::CompileError(diag)),
         };
-
-        for _ in 0..rounds {
-            let o = self.run(
-                &exe,
+        let run = |loops: u64| {
+            let mut command = Command::new(&exe);
+            command.arg(loops.to_string());
+            self.run_command(
+                command,
                 Slot::Expr,
                 warnings.clone(),
-                measured.uses_stdin_tape,
+                prog.uses_stdin_tape,
                 session.stdin_tape(),
-            )?;
-            if o.abnormal.is_some() {
-                return Ok(Eval::Done(o));
+            )
+        };
+
+        // A single fast iteration may measure zero on a coarse host clock.
+        // Reuse this executable and grow by at most 10x per calibration run,
+        // rather than extrapolating zero nanoseconds into 100 million calls.
+        let target_ns = (self.timeout.as_nanos() / 10).clamp(1, 100_000_000) as u64;
+        let mut loops = 1;
+        let mut calibration = run(loops)?;
+        loop {
+            if calibration.abnormal.is_some() {
+                return Ok(Eval::Done(calibration));
             }
-            let ns_val = o.value.as_deref().and_then(|v| v.parse::<u64>().ok());
-            if let Some(ns) = ns_val {
-                let per_loop_ns = ns as f64 / loops as f64;
-                samples_ns.push(per_loop_ns);
-                last_outcome = o;
-            }
+            let elapsed_ns = calibration
+                .value
+                .as_deref()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let Some(next) = next_timeit_loops(loops, elapsed_ns, target_ns) else {
+                break;
+            };
+            loops = next;
+            calibration = run(loops)?;
         }
 
+        let rounds = 5;
+        let mut samples_ns = Vec::with_capacity(rounds);
+        let mut last_outcome = calibration;
+        for _ in 0..rounds {
+            let outcome = run(loops)?;
+            if outcome.abnormal.is_some() {
+                return Ok(Eval::Done(outcome));
+            }
+            if let Some(ns) = outcome
+                .value
+                .as_deref()
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                samples_ns.push(ns as f64 / loops as f64);
+                last_outcome = outcome;
+            }
+        }
         if samples_ns.is_empty() {
-            samples_ns.push(elapsed_ns_1 as f64);
+            let elapsed_ns = last_outcome
+                .value
+                .as_deref()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            samples_ns.push(elapsed_ns as f64 / loops as f64);
         }
 
         let count = samples_ns.len() as f64;
@@ -863,6 +854,23 @@ impl Evaluator {
             timed_duration: None,
         }))
     }
+}
+
+/// Bound calibration growth even when the host clock reports zero or a very
+/// small duration. Integer arithmetic also avoids floating-point overflow.
+fn next_timeit_loops(loops: u64, elapsed_ns: u64, target_ns: u64) -> Option<u64> {
+    const MAX_LOOPS: u64 = 100_000_000;
+    if elapsed_ns >= target_ns || loops >= MAX_LOOPS {
+        return None;
+    }
+    let estimate = (u128::from(target_ns) * u128::from(loops))
+        .div_ceil(u128::from(elapsed_ns.max(1)))
+        .min(u128::from(MAX_LOOPS)) as u64;
+    Some(
+        estimate
+            .max(loops.saturating_mul(2).min(MAX_LOOPS))
+            .min(loops.saturating_mul(10).min(MAX_LOOPS)),
+    )
 }
 
 fn render_utf8_payload(value: &str) -> Option<String> {
@@ -1752,6 +1760,20 @@ fn looks_file_scope(input: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeit_calibration_bounds_growth_and_honors_target_and_limit() {
+        assert_eq!(next_timeit_loops(1, 0, 100_000_000), Some(10));
+        assert_eq!(next_timeit_loops(100, 1, 100_000_000), Some(1000));
+        assert_eq!(next_timeit_loops(1000, 50_000_000, 100_000_000), Some(2000));
+        assert_eq!(next_timeit_loops(100, 99_999_999, 100_000_000), Some(200));
+        assert_eq!(next_timeit_loops(1, 100_000_000, 100_000_000), None);
+        assert_eq!(next_timeit_loops(100_000_000, 0, 100_000_000), None);
+        assert_eq!(
+            next_timeit_loops(90_000_000, 0, 100_000_000),
+            Some(100_000_000)
+        );
+    }
 
     #[test]
     fn skips_impossible_expression_trials_without_losing_compound_literals() {

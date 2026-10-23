@@ -408,8 +408,11 @@ static inline void cs_m_unknown(const volatile void *v)          { (void)v; fput
     else CS_PRINT(*_cs_print_address);                                  \
 } while (0)
 #else
+/* MSVC's generic selection does not reliably match a fixed-size array
+   pointer against a pointer to an unspecified-size array. Use the complete
+   character-array type of exactly this object's byte size instead. */
 #define CS_PRINT_LVALUE(x) do {                                          \
-    if (_Generic(&(x), char (*)[]: 1, const char (*)[]: 1, default: 0))  \
+    if (_Generic(&(x), char (*)[sizeof(x)]: 1, const char (*)[sizeof(x)]: 1, default: 0)) \
         cs_p_s_bounded((const void *)&(x), sizeof(x));                   \
     else CS_PRINT(x);                                                   \
 } while (0)
@@ -723,7 +726,7 @@ enum BuildFlavor {
     SilentExpr,
     TypeProbe,
     BitsProbe(bool),
-    TimeitProbe(u64),
+    TimeitProbe,
     /// Print an expression through the array-aware printer, indexing to the
     /// given nesting depth.
     ArrayExpr(usize),
@@ -750,7 +753,7 @@ impl BuildFlavor {
             | Self::ScalarExpr
             | Self::TypeProbe
             | Self::BitsProbe(_)
-            | Self::TimeitProbe(_)
+            | Self::TimeitProbe
             | Self::ArrayExpr(_)
             | Self::Utf8ArrayExpr
             | Self::UnicodeProbe { .. } => Slot::Expr,
@@ -903,9 +906,10 @@ pub fn build_unicode_probe(
     )
 }
 
-/// Build a program that benchmarks an expression or statement over `loops` iterations.
-pub fn build_timeit_probe(session: &Session, input: &str, loops: u64) -> Program {
-    build_inner(session, input, BuildFlavor::TimeitProbe(loops), false)
+/// Build a benchmark whose loop count is supplied as a process argument, so
+/// calibration and measured samples can share the same executable.
+pub fn build_timeit_probe(session: &Session, input: &str) -> Program {
+    build_inner(session, input, BuildFlavor::TimeitProbe, false)
 }
 
 /// Track source locations while appending instead of rescanning the complete
@@ -960,10 +964,7 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor, timed: bool)
         } => Some((expected_width, limit, exact)),
         _ => None,
     };
-    let timeit_loops = match flavor {
-        BuildFlavor::TimeitProbe(loops) => Some(loops),
-        _ => None,
-    };
+    let timeit = matches!(flavor, BuildFlavor::TimeitProbe);
     let file_replacement = match flavor {
         BuildFlavor::ReplaceFile(index) => Some(index),
         _ => None,
@@ -1020,7 +1021,11 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor, timed: bool)
 
     let aggregate_printers = build_aggregate_printers(&src.text);
     src.push_str(&aggregate_printers);
-    src.push_str("\nint main(void)\n{\n");
+    if timeit {
+        src.push_str("\nint main(int _cs_argc, char **_cs_argv)\n{\n");
+    } else {
+        src.push_str("\nint main(void)\n{\n");
+    }
     for stmt in &session.stmts {
         let start = src.line_count() + 1;
         src.push_str(stmt);
@@ -1070,16 +1075,22 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor, timed: bool)
                     "CS_BITS"
                 };
                 src.push_str(&format!("    {macro_name}((\n{input}\n    ));\n"));
-            } else if let Some(loops) = timeit_loops {
+            } else if timeit {
                 src.push_str("    CS_VAL();\n");
                 src.push_str("    {\n");
-                src.push_str(&format!("        uint64_t _cs_loops = {loops}ULL;\n"));
+                src.push_str("        uint64_t _cs_loops = _cs_argc > 1 ? (uint64_t)strtoull(_cs_argv[1], NULL, 10) : 1;\n");
                 src.push_str("        uint64_t _cs_start = cs_timeit_now_ns();\n");
                 src.push_str("        for (uint64_t _cs_i = 0; _cs_i < _cs_loops; ++_cs_i) {\n");
                 if crate::eval::should_try_expr(input) {
-                    src.push_str(&format!("            (void)(\n{input}\n            );\n"));
+                    src.push_str("            (void)(\n");
+                    new_start_line = src.line_count() + 1;
+                    src.push_str(input);
+                    src.push_str("\n            );\n");
                 } else {
-                    src.push_str(&format!("            {{\n{input}\n            }}\n"));
+                    src.push_str("            {\n");
+                    new_start_line = src.line_count() + 1;
+                    src.push_str(input);
+                    src.push_str("\n            }\n");
                 }
                 src.push_str("        }\n");
                 src.push_str("        uint64_t _cs_end = cs_timeit_now_ns();\n");
@@ -1126,7 +1137,7 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor, timed: bool)
         new_line_count,
         session_line_ranges,
         uses_stdin_tape,
-        wrapped: slot == Slot::Expr && !silent_expr && timeit_loops.is_none(),
+        wrapped: slot == Slot::Expr && !silent_expr && !timeit,
     }
 }
 

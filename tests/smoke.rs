@@ -1355,6 +1355,10 @@ fn char_array_previews_stop_at_the_array_boundary_and_evaluate_once() {
             "int next = 0;",
             "rows[next++]",
             "next",
+            "char eight[8] = {65,66,67,68,69,70,71,72};",
+            "eight",
+            "const char constant[3] = {68,69,70};",
+            "constant",
             "char *text = \"longer than a pointer\";",
             "text",
             "\"literal\"",
@@ -1368,7 +1372,7 @@ fn char_array_previews_stop_at_the_array_boundary_and_evaluate_once() {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "\"ABC\"\n\"ABC\"\n1\n\"longer than a pointer\"\n\"literal\"\n"
+        "\"ABC\"\n\"ABC\"\n1\n\"ABCDEFGH\"\n\"DEF\"\n\"longer than a pointer\"\n\"literal\"\n"
     );
 }
 
@@ -1611,7 +1615,7 @@ fn eval_and_script_modes_clean_up_generated_files_even_after_errors() {
 
 #[cfg(unix)]
 #[test]
-fn timeit_compiles_the_measured_program_once_for_all_rounds() {
+fn timeit_compiles_once_for_calibration_and_all_rounds() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let wrapper = dir.path().join("cc-logger");
@@ -1648,8 +1652,8 @@ exec "${C_SHELL_TEST_CC:-cc}" "$@"
     assert!(String::from_utf8_lossy(&output.stdout).contains("5 runs"));
     assert_eq!(
         std::fs::read_to_string(log).unwrap().lines().count(),
-        2,
-        "expected one calibration compile and one measured compile"
+        1,
+        "calibration and all measured rounds must share one executable"
     );
 }
 
@@ -1692,4 +1696,36 @@ fn variable_length_character_array_expressions_are_evaluated_once() {
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "\"AAA\"\n1\n");
     assert!(!String::from_utf8_lossy(&output.stderr).contains("sequence-point"));
+}
+
+#[test]
+fn timeit_calibrates_gradually_when_a_single_iteration_measures_zero() {
+    // Model a coarse clock deterministically. One iteration is below its
+    // resolution; larger batches measure 1 us/iteration. Jumping straight to
+    // 100 million iterations makes this otherwise valid benchmark fail.
+    let output = run_evals_with_stdin(
+        &[
+            "struct TimerState { uint64_t iterations; } timer_state = {0};",
+            "uint64_t coarse_clock(void) { return timer_state.iterations <= 1 ? 0 : timer_state.iterations * 1000; }",
+            "#define cs_timeit_now_ns coarse_clock",
+            "%timeit if (++timer_state.iterations > 100000) exit(77);",
+            "timer_state.iterations",
+        ],
+        "",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("per loop"), "missing benchmark: {stdout}");
+    assert!(
+        stdout.contains("5 runs, 100,000 loops each"),
+        "bad calibration: {stdout}"
+    );
+    assert!(
+        stdout.ends_with("\n0\n"),
+        "benchmark state leaked: {stdout}"
+    );
 }
