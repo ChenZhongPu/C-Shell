@@ -1560,7 +1560,14 @@ fn timed_inputs_preserve_program_output_and_bare_value_formatting() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "hello\n42\n");
+    // C stdout is forwarded verbatim: puts uses CRLF on Windows, while
+    // the bare value is rendered by Rust with LF on every platform.
+    let expected = if cfg!(windows) {
+        "hello\r\n42\n"
+    } else {
+        "hello\n42\n"
+    };
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
     assert_eq!(
         String::from_utf8_lossy(&output.stderr)
             .matches("Wall time:")
