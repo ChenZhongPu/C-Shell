@@ -47,7 +47,7 @@
 Start `c-shell` and type C directly at the prompt:
 
 ```text
-c-shell 0.3.1  ·  cc (GCC) 16.1.1 (default std gnu23)
+c-shell 0.3.2  ·  cc (GCC) 16.1.1 (default std gnu23)
 In [1]: int x = 41;
 In [2]: x + 1
 Out[2]: 42
