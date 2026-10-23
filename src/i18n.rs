@@ -120,10 +120,7 @@ pub fn requested_from_args(args: impl IntoIterator<Item = OsString>) -> Option<L
         if let Some(value) = arg.strip_prefix("--lang=") {
             return parse_language(value);
         }
-        if matches!(
-            arg,
-            "-e" | "--eval" | "--cc" | "--std" | "--script" | "--timeout"
-        ) {
+        if matches!(arg, "-e" | "--eval" | "--cc" | "--std" | "--timeout") {
             let _ = args.next();
         }
     }

@@ -4,7 +4,7 @@ Settled architecture decisions, the one big open problem, and the traps buried
 in the code that you must know about before changing it. README is for users;
 this file is for whoever develops the tool next.
 
-Status: v0.3.1 working. ~13000 lines of Rust, 183 tests (114 unit + 69
+Status: v0.3.1 working. ~13000 lines of Rust, 184 tests (114 unit + 70
 end-to-end smoke), clippy/fmt clean, English/Chinese UI. Verified on Linux with gcc
 16.1.1 and clang 22.1.6. CI exercises the default macOS compiler and two
 Windows driver dialects (a GNU-style driver and MSVC); see
@@ -19,7 +19,7 @@ Windows driver dialects (a GNU-style driver and MSVC); see
 | `toolchain.rs` | compiler detection, cached capability probing, GNU/Clang/MSVC flag dialects, default-std detection, `_Generic` floor |
 | `eval.rs` | trial-compile classification/rebinding, compile, run with timeout, crash diagnosis |
 | `editor.rs` | reedline integration: syntect highlighting, completion menu, multi-line validation, prompt |
-| `main.rs` | CLI, REPL, `-e`, script and piped-input modes |
+| `main.rs` | CLI, REPL, `-e`, redirected and piped-input modes |
 | `web.rs` | local-only Axum/WebSocket server, PTY sessions, bundled browser terminal assets |
 | `lex.rs` | byte-level scan: bracket balance, literals/comments, purity and identifier heuristics |
 | `errmap.rs` | diagnostic provenance/remapping, scaffolding removal, stale-warning filtering |
@@ -46,7 +46,7 @@ shadowing and file-scope replacement, blank-line
 confirmation for a completed interactive `if`, `if`/`else` batch lookahead,
 control/do-while/preprocessor continuation, tab completion (magics, C keywords,
 retained session names), process-local Up/Down recall and numbered-input
-`%edit [n]`, `-e`/script/piped-input batch modes,
+`%edit [n]`, `-e`/redirected/piped-input batch modes,
 `%help [--verbose] %quit %clear %reset %src %header %edit %type %bits %Bits
 %utf8 %utf16 %utf32 %where %check %time %timeit %cc %std`, deadlines and
 timeout-path tree cleanup for compiler/probe/user-program children, cached
@@ -145,7 +145,7 @@ marks the run divergent and never falls through to real stdin. This first
 portable adapter deliberately covers direct standard `scanf`, one line per
 call—not `fscanf`, `fgets`, `getchar`, raw fd reads, `#undef scanf`, or calls
 inside precompiled libraries. Piped-REPL stdin is C source and cannot also be
-program input; TTY, `-e`, and script modes can supply current lines.
+program input; TTY and `-e` modes can supply current lines.
 
 **Warn once before other known external side effects can enter replay.**
 `lex::external_replay_calls` recognizes a conservative list of standard/POSIX
@@ -193,7 +193,7 @@ re-enters the normal submit/evaluate/commit path and receives a fresh number;
 even an unchanged buffer is not submitted by `%edit` itself, and the original
 archive entry is never mutated. Ctrl-C or an emptied buffer cancels through the
 ordinary line-editor path. The submitted block naturally enters process-local
-Up/Down recall. Batch, script and `-e` modes reject a valid prefill request
+Up/Down recall. Batch and `-e` modes reject a valid prefill request
 because they have no interactive edit buffer.
 
 **The language standard follows the compiler's default; `_Generic` is the
@@ -593,7 +593,7 @@ interactive `if` adds blank-line confirmation so it can still receive `else`;
 functions and ordinary closed blocks submit immediately. Batch mode instead
 holds a complete leading `if` for one physical line of lookahead and submits it
 before an unrelated next line. Reusing the
-interactive blank-line policy in scripts would accidentally merge the next C
+interactive blank-line policy in batch input would accidentally merge the next C
 statement into the same input.
 
 **The line editor is reedline, for the IPython-style completion menu.**

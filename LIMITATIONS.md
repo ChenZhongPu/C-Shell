@@ -9,7 +9,7 @@
 
 ## Stdin & IO Replay
 
-- **The stdin tape currently wraps `scanf`, not every input API.** `fscanf`, `fgets`, `getchar`, raw `read(0, ...)`, an explicit `#undef scanf`, and code inside a precompiled library are not captured yet. An active `scanf` request can receive one line; calls already completed from libc's buffer do not require another line. Programs that require multiple interactive lines in a single call should put the values on one line. In piped-REPL mode stdin is carrying C source, so a current `scanf` receives EOF; use `-e`, `--script`, or an interactive terminal when the evaluated program needs stdin.
+- **The stdin tape currently wraps `scanf`, not every input API.** `fscanf`, `fgets`, `getchar`, raw `read(0, ...)`, an explicit `#undef scanf`, and code inside a precompiled library are not captured yet. An active `scanf` request can receive one line; calls already completed from libc's buffer do not require another line. Programs that require multiple interactive lines in a single call should put the values on one line. With piped or redirected source stdin is carrying C code, so a current `scanf` receives EOF; use `-e` or an interactive terminal when the evaluated program needs stdin.
 - **Program output is bounded.** When stdin is a real terminal, output from the newest input is streamed immediately, so a prompt before `scanf` is visible. If the program leaves a partial line, `c-shell` appends a dim `↵` marker and the protective newline it inserted; a real `\n` needs no marker. With non-terminal stdin output remains buffered for deterministic transcripts and receives no marker. Capture is limited to 8 MiB per stream; an overflow is reported and the input is not committed.
 
 ## Semantics & Scope

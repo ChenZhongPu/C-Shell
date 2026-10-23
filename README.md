@@ -77,8 +77,8 @@ Out[5]: 1
   representations and IEEE-754 fields. `%utf8`/`%utf16`/`%utf32` explicitly
   decode Unicode code units, and `%where` identifies the portable standard
   header for an ISO C library name.
-- **Terminal, browser, or script.** Use the REPL directly, open the same PTY
-  experience in a local browser, or run `-e`, script files, and piped input
+- **Terminal, browser, or batch input.** Use the REPL directly, open the same PTY
+  experience in a local browser, or run `-e` and redirected or piped input
   with deterministic exit status and diagnostics.
 - **Cross-platform compiler drivers.** GNU-style and MSVC-style command lines
   are detected by capability probes rather than executable names.
@@ -132,16 +132,15 @@ c-shell --web                        # open a browser terminal on this machine
 c-shell --web --no-open              # print its local URL without opening it
 c-shell -e 'sizeof(long)'            # evaluate and exit: bare value on stdout,
                                      # diagnostics on stderr, exit code on failure
-c-shell --script demo.csh            # run inputs from a file, then exit
-c-shell --quiet                      # interactive, but skip the banner
+c-shell < demo.csh                   # read inputs from standard input, then exit
 echo '1 + 1' | c-shell               # piped input: transcript output, no banner
 ```
 
 Terminal handling is automatic: when stdout is not a terminal (or
 `TERM=dumb`, or `NO_COLOR` is set) colors are off; when stdin is not a
 terminal the banner, prompts and farewell are suppressed and input is read
-in batch mode — which also accumulates multi-line definitions, so scripts
-and pipes can contain full function bodies.
+in batch mode — which also accumulates multi-line definitions, so redirected
+files and pipes can contain full function bodies.
 
 The c-shell interface defaults to English and automatically selects Chinese
 when the system UI locale is Chinese. Use `--lang en` or `--lang zh` to
@@ -165,8 +164,8 @@ independent c-shell process. Closing the tab terminates that process; pressing
 Ctrl-C in the launching terminal stops the server and its active sessions.
 
 Use `--web --no-open` when you want only the URL. Compiler, standard, timeout,
-language, quiet, and color options are forwarded to every browser session.
-`--web` cannot be combined with `--eval` or `--script`. The random URL is an
+language and color options are forwarded to every browser session.
+`--web` cannot be combined with `--eval`. The random URL is an
 additional local safeguard, not a reason to share it with untrusted local
 processes or users.
 
@@ -201,8 +200,8 @@ required closing syntax is entered. A braced `struct`, `union` or `enum`
 definition remains open after `}` until its mandatory declaration semicolon is
 entered. Control headers with their body on the next line, mandatory
 `do ... while`, and conditional preprocessor groups through `#endif` are
-accumulated automatically. In scripts
-and pipes, one-line lookahead attaches `else` without requiring a blank line.
+accumulated automatically. In redirected or piped input, one-line lookahead
+attaches `else` without requiring a blank line.
 
 c-shell generates its own `main` to host session locals and the output
 protocol. Pasting a complete program such as `int main() { puts("hi"); }`

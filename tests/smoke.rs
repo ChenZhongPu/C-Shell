@@ -701,7 +701,7 @@ fn eval_flag_failure_sets_exit_code_and_uses_stderr() {
 }
 
 #[test]
-fn script_mode_accumulates_multi_line_definitions() {
+fn redirected_file_input_accumulates_multi_line_definitions() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("t.csh");
     std::fs::write(
@@ -714,19 +714,50 @@ int mul(int a, int b)
 mul(6, 7)
 ",
     )
-    .expect("write script");
+    .expect("write redirected input");
     let out = Command::new(env!("CARGO_BIN_EXE_c-shell"))
         .args(["--lang", "en"])
-        .arg("--script")
-        .arg(&path)
+        .stdin(std::fs::File::open(&path).expect("open redirected input"))
         .output()
-        .expect("run c-shell --script");
+        .expect("run c-shell with redirected input");
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("Out[2]: 42"),
         "unexpected output:\n{stdout}"
     );
+}
+
+#[test]
+fn removed_script_and_quiet_options_are_not_advertised_or_accepted() {
+    for language in ["en", "zh"] {
+        let help = Command::new(env!("CARGO_BIN_EXE_c-shell"))
+            .args(["--lang", language, "--help"])
+            .output()
+            .unwrap();
+        assert!(help.status.success());
+        let help = String::from_utf8_lossy(&help.stdout);
+        for option in ["--script", "--quiet", "-q,"] {
+            assert!(!help.contains(option), "removed option in help: {help}");
+        }
+        for option in ["--script", "--quiet", "-q"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_c-shell"))
+                .args(["--lang", language, option])
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(2), "{option} was not rejected");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(option), "{stderr}");
+            assert!(
+                stderr.contains(if language == "zh" {
+                    "无法识别参数"
+                } else {
+                    "unexpected argument"
+                }),
+                "{stderr}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1124,7 +1155,7 @@ fn program_output_is_shown_once() {
     assert_eq!(hits, 1, "output replayed {hits} times:\n{out}");
 
     // The visible partial-line marker is terminal UI, never program output in
-    // a deterministic script/pipe transcript.
+    // a deterministic batch transcript.
     let partial = run(&["printf(\"partial\");", "1 + 1"]);
     assert!(
         partial.contains("partial\n"),
@@ -1545,15 +1576,6 @@ fn magic_failures_set_exit_status_and_route_diagnostics_to_stderr() {
         );
         assert!(!output.stderr.is_empty(), "missing diagnostic: {code}");
     }
-    let dir = tempfile::tempdir().unwrap();
-    let script = dir.path().join("failure.csh");
-    std::fs::write(&script, "%type nonexistent_name\n").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_c-shell"))
-        .arg("--script")
-        .arg(script)
-        .output()
-        .unwrap();
-    assert!(!output.status.success(), "script ignored failed magic");
 }
 
 #[test]
@@ -1584,26 +1606,34 @@ fn timed_inputs_preserve_program_output_and_bare_value_formatting() {
 }
 
 #[test]
-fn eval_and_script_modes_clean_up_generated_files_even_after_errors() {
+fn eval_and_redirected_input_clean_up_generated_files_even_after_errors() {
     let dir = tempfile::tempdir().unwrap();
     let scratch = dir.path().join("scratch");
     std::fs::create_dir(&scratch).unwrap();
-    let script = dir.path().join("example.csh");
+    let input = dir.path().join("example.csh");
     for code in ["42", "int broken = ;"] {
-        std::fs::write(&script, format!("{code}\n")).unwrap();
-        for script_mode in [false, true] {
+        std::fs::write(&input, format!("{code}\n")).unwrap();
+        for redirected_input in [false, true] {
             let mut command = Command::new(env!("CARGO_BIN_EXE_c-shell"));
             command
                 .env("TMPDIR", &scratch)
                 .env("TMP", &scratch)
                 .env("TEMP", &scratch);
-            if script_mode {
-                command.arg("--script").arg(&script);
+            if redirected_input {
+                command.stdin(std::fs::File::open(&input).unwrap());
             } else {
                 command.args(["-e", code]);
             }
             let output = command.output().unwrap();
-            assert_eq!(output.status.success(), code == "42");
+            assert_eq!(output.status.success(), redirected_input || code == "42");
+            if code != "42" {
+                let diagnostics = if redirected_input {
+                    &output.stdout
+                } else {
+                    &output.stderr
+                };
+                assert!(String::from_utf8_lossy(diagnostics).contains("error"));
+            }
             let leftovers = std::fs::read_dir(&scratch).unwrap().collect::<Vec<_>>();
             assert!(
                 leftovers.is_empty(),

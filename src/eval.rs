@@ -144,7 +144,7 @@ impl Evaluator {
     }
 
     /// Whether the newest input may request real stdin. Disabled when stdin is
-    /// itself carrying piped C source; enabled for a TTY, `-e`, and scripts.
+    /// itself carrying piped C source; enabled for a TTY and `-e`.
     pub fn set_program_stdin(&mut self, enabled: bool) {
         self.allow_program_stdin = enabled;
     }

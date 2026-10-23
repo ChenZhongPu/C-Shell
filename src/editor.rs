@@ -289,7 +289,7 @@ impl Highlighter for CHighlighter {
 }
 
 /// Is this input grammatically forced to continue? Unlike `is_incomplete`,
-/// this has no interactive blank-line policy and is suitable for scripts.
+/// this has no interactive blank-line policy and is suitable for batch input.
 pub fn is_structurally_incomplete(input: &str) -> bool {
     let t = input.trim();
     if t.is_empty() || t.starts_with('%') {

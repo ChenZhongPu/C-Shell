@@ -19,7 +19,7 @@ mod toolchain;
 mod ui;
 mod web;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{
     Arg, ArgAction, CommandFactory, FromArgMatches, Parser,
     error::{ContextKind, ErrorKind},
@@ -59,21 +59,8 @@ struct Args {
 
     /// Evaluate CODE and exit (repeatable). Values print bare, diagnostics
     /// go to stderr, and a failing input sets a nonzero exit code
-    #[arg(
-        short = 'e',
-        long = "eval",
-        value_name = "CODE",
-        conflicts_with = "script"
-    )]
+    #[arg(short = 'e', long = "eval", value_name = "CODE")]
     eval: Vec<String>,
-
-    /// Run inputs from FILE and exit; nonzero exit code on any failure
-    #[arg(long, value_name = "FILE")]
-    script: Option<std::path::PathBuf>,
-
-    /// Suppress the banner and hints
-    #[arg(short = 'q', long)]
-    quiet: bool,
 
     /// Seconds each compilation or program run may take
     #[arg(long, value_name = "SECS", default_value_t = 10)]
@@ -88,7 +75,7 @@ struct Args {
     lang: Option<Language>,
 
     /// Start a browser terminal available only on this machine
-    #[arg(long, conflicts_with_all = ["eval", "script"])]
+    #[arg(long, conflicts_with = "eval")]
     web: bool,
 
     /// Do not open the browser automatically
@@ -137,8 +124,6 @@ fn command_for(language: Language) -> clap::Command {
         .mut_arg("cc", |arg| arg.help(tr("arg-cc")))
         .mut_arg("std", |arg| arg.help(tr("arg-std")))
         .mut_arg("eval", |arg| arg.help(tr("arg-eval")))
-        .mut_arg("script", |arg| arg.help(tr("arg-script")))
-        .mut_arg("quiet", |arg| arg.help(tr("arg-quiet")))
         .mut_arg("timeout", |arg| {
             arg.help(tr("arg-timeout")).hide_default_value(true)
         })
@@ -245,9 +230,6 @@ fn main() -> Result<std::process::ExitCode> {
         }
         child_args.extend(["--timeout".into(), args.timeout.to_string().into()]);
         child_args.extend(["--lang".into(), language.code().into()]);
-        if args.quiet {
-            child_args.push("--quiet".into());
-        }
         if args.no_color {
             child_args.push("--no-color".into());
         }
@@ -255,7 +237,6 @@ fn main() -> Result<std::process::ExitCode> {
             child_args,
             language,
             open_browser: !args.no_open,
-            quiet: args.quiet,
         })?;
         return Ok(std::process::ExitCode::SUCCESS);
     }
@@ -283,9 +264,9 @@ fn main() -> Result<std::process::ExitCode> {
     // so prompts before scanf are visible. Batch transcripts remain buffered.
     let stdin_is_terminal = std::io::stdin().is_terminal();
     ev.set_stream_output(stdin_is_terminal);
-    // Piped REPL mode consumes stdin as C source. A TTY, `-e`, or a script
+    // Piped REPL mode consumes stdin as C source. A TTY or `-e`
     // leaves stdin available as the evaluated program's input.
-    ev.set_program_stdin(stdin_is_terminal || !args.eval.is_empty() || args.script.is_some());
+    ev.set_program_stdin(stdin_is_terminal || !args.eval.is_empty());
     let mut session = Session::default();
 
     // ---- non-interactive modes -------------------------------------------
@@ -302,18 +283,6 @@ fn main() -> Result<std::process::ExitCode> {
         return Ok(std::process::ExitCode::from(u8::from(!ok)));
     }
 
-    if let Some(path) = &args.script {
-        let file = std::fs::File::open(path).with_context(|| {
-            i18n::text_with_for(
-                language,
-                "script-open-error",
-                &[("path", path.display().to_string())],
-            )
-        })?;
-        let ok = run_batch(std::io::BufReader::new(file), &mut session, &mut ev, &ui)?;
-        return Ok(std::process::ExitCode::from(u8::from(!ok)));
-    }
-
     if !std::io::stdin().is_terminal() {
         // Piped input: a transcript without prompts or banner. Tolerant exit
         // code, like the interactive REPL it substitutes for.
@@ -324,7 +293,7 @@ fn main() -> Result<std::process::ExitCode> {
 
     // ---- interactive REPL ------------------------------------------------
 
-    if !args.quiet && std::io::stdout().is_terminal() {
+    if std::io::stdout().is_terminal() {
         print!("{}", ui.banner());
         println!(
             "{} {}  ·  {}",
@@ -414,7 +383,7 @@ fn main() -> Result<std::process::ExitCode> {
 }
 
 /// Feed complete inputs from a reader, accumulating lines until the input is
-/// syntactically finished — a function definition in a script spans many
+/// syntactically finished — a function definition in redirected input spans many
 /// lines. Returns whether every input succeeded.
 fn run_batch<R: BufRead>(
     reader: R,

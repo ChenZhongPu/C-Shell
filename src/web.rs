@@ -36,7 +36,6 @@ pub struct Config {
     pub child_args: Vec<OsString>,
     pub language: Language,
     pub open_browser: bool,
-    pub quiet: bool,
 }
 
 #[derive(Clone)]
@@ -202,9 +201,7 @@ async fn serve_async(config: Config) -> Result<()> {
         "{}",
         i18n::text_with_for(config.language, "web-listening", &[("url", url.clone())])
     );
-    if !config.quiet {
-        println!("{}", i18n::text_for(config.language, "web-stop-hint"));
-    }
+    println!("{}", i18n::text_for(config.language, "web-stop-hint"));
     std::io::stdout().flush()?;
 
     if config.open_browser && webbrowser::open(&url).is_err() {
