@@ -47,7 +47,7 @@
 启动 `c-shell --lang zh`，然后直接在提示符中输入 C 代码：
 
 ```text
-c-shell 0.3.2  ·  cc (GCC) 16.1.1 (默认标准 gnu23)
+c-shell 0.4.0  ·  cc (GCC) 16.1.1 (默认标准 gnu23)
 In [1]: int x = 41;
 In [2]: x + 1
 Out[2]: 42

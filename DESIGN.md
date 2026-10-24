@@ -4,7 +4,7 @@ Settled architecture decisions, the one big open problem, and the traps buried
 in the code that you must know about before changing it. README is for users;
 this file is for whoever develops the tool next.
 
-Status: v0.3.2 working, English/Chinese UI. The default test run has 118 unit
+Status: v0.4.0 working, English/Chinese UI. The default test run has 118 unit
 tests and 79 end-to-end smoke tests; a real-compiler performance benchmark is
 ignored by default. Verified locally on Linux with GCC 16.2.1 and Clang
 22.1.8. Native CI covers Linux GCC/Clang, macOS Clang and Windows CL; see
