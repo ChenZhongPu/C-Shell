@@ -55,6 +55,26 @@ struct PtySession {
     child: Box<dyn Child + Send + Sync>,
 }
 
+fn pty_command(executable: &std::path::Path, config: &Config) -> CommandBuilder {
+    let mut command = CommandBuilder::new(executable);
+    #[cfg(windows)]
+    {
+        // portable-pty 0.9 overlays the process environment with registry
+        // values on Windows, replacing the Developer Command Prompt PATH.
+        // Preserve the caller's complete environment, including CL's SDK,
+        // include/library settings and dynamically configured tool paths.
+        command.env_clear();
+        for (key, value) in std::env::vars_os() {
+            command.env(key, value);
+        }
+    }
+    command.args(config.child_args.iter());
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+    command.env("C_SHELL_WEB", "1");
+    command
+}
+
 impl PtySession {
     fn spawn(config: &Config) -> Result<Self> {
         let executable =
@@ -68,11 +88,7 @@ impl PtySession {
             })
             .context("cannot create a pseudo-terminal")?;
 
-        let mut command = CommandBuilder::new(executable);
-        command.args(config.child_args.iter());
-        command.env("TERM", "xterm-256color");
-        command.env("COLORTERM", "truecolor");
-        command.env("C_SHELL_WEB", "1");
+        let command = pty_command(&executable, config);
         let child = pair
             .slave
             .spawn_command(command)
@@ -435,6 +451,37 @@ fn html_escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn pty_command_preserves_the_developer_environment() {
+        let config = Config {
+            child_args: vec!["--lang".into(), "en".into()],
+            language: Language::English,
+            open_browser: false,
+        };
+        let command = pty_command(std::path::Path::new("c-shell.exe"), &config);
+        for name in [
+            "PATH",
+            "INCLUDE",
+            "LIB",
+            "LIBPATH",
+            "ComSpec",
+            "SystemRoot",
+            "TEMP",
+            "TMP",
+        ] {
+            assert_eq!(
+                command.get_env(name),
+                std::env::var_os(name).as_deref(),
+                "{name} was changed before spawning the PTY child"
+            );
+        }
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(std::ffi::OsStr::new("xterm-256color"))
+        );
+    }
 
     #[test]
     fn generated_token_is_128_bit_lowercase_hex() {

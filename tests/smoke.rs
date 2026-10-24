@@ -155,24 +155,40 @@ fn interactive_terminal_recovers_from_interrupts_in_edit_compile_run_and_input()
             std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
     }
-    let mut command = Command::new(env!("CARGO_BIN_EXE_c-shell"));
-    command
-        .arg("--cc")
-        .arg(&wrapper)
-        .env(
-            "C_SHELL_TEST_CC",
-            std::env::var_os("CC").unwrap_or_else(|| {
-                if cfg!(windows) {
-                    "cl".into()
-                } else {
-                    "cc".into()
-                }
-            }),
-        )
-        .env("C_SHELL_SLOW_TRIGGER", &trigger)
-        .env("C_SHELL_SLOW_READY", &ready)
-        .env("C_SHELL_SLOW_SURVIVED", &survived);
-    let mut terminal = WebTerminal::start(&mut command);
+    let compiler_name = std::env::var_os("CC").unwrap_or_else(|| {
+        if cfg!(windows) {
+            "cl".into()
+        } else {
+            "cc".into()
+        }
+    });
+    let compiler =
+        which::which(&compiler_name).expect("resolve the real compiler before wrapping it");
+    let make_command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_c-shell"));
+        command
+            .arg("--cc")
+            .arg(&wrapper)
+            .env("C_SHELL_TEST_CC", &compiler)
+            .env("C_SHELL_SLOW_TRIGGER", &trigger)
+            .env("C_SHELL_SLOW_READY", &ready)
+            .env("C_SHELL_SLOW_SURVIVED", &survived);
+        command
+    };
+    // Distinguish a broken wrapper from a PTY environment problem without
+    // waiting for a missing first prompt and a WebSocket read timeout.
+    let preflight = make_command()
+        .args(["--lang", "en", "-e", "1 + 1"])
+        .output()
+        .expect("run compiler wrapper preflight");
+    assert!(
+        preflight.status.success(),
+        "compiler wrapper preflight failed:\n{}\n{}",
+        String::from_utf8_lossy(&preflight.stdout),
+        String::from_utf8_lossy(&preflight.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&preflight.stdout), "2\n");
+    let mut terminal = WebTerminal::start(&mut make_command());
     terminal.until(0, "In [1]:");
     let editing = terminal.transcript.len();
     terminal.send(b"int discarded = 1\x03");
