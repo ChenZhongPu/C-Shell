@@ -27,6 +27,7 @@ cli-more-info = For more information, try "--help".
 startup-hint = Type C code to evaluate it · %help for commands · Ctrl-D to exit
 web-launch-hint = Tip: use `c-shell --web` to launch the browser UI
 bye = bye
+program-interrupted = interrupted
 web-listening = Browser terminal: {$url}
 web-stop-hint = Available only on this machine · press Ctrl-C to stop
 web-open-failed = could not open the default browser; open the URL above manually

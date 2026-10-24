@@ -93,7 +93,27 @@ static inline void cs_time_once_stop(void)
 #endif
 
 static inline void cs_p_b (_Bool v, size_t n)              { (void)n; CS_VAL(); printf("%s\n", v ? "true" : "false"); }
-static inline void cs_p_c (char v, size_t n)               { (void)n; CS_VAL(); printf("'%c' (%d)\n", (v >= 32 && v < 127) ? v : '?', (int)v); }
+static inline void cs_escape_byte(unsigned char value, int quote)
+{
+    switch (value) {
+    case '\n': fputs("\\n", stdout); break;
+    case '\r': fputs("\\r", stdout); break;
+    case '\t': fputs("\\t", stdout); break;
+    case '\b': fputs("\\b", stdout); break;
+    case '\f': fputs("\\f", stdout); break;
+    case '\v': fputs("\\v", stdout); break;
+    case '\a': fputs("\\a", stdout); break;
+    case '\\': fputs("\\\\", stdout); break;
+    default:
+        if (value == (unsigned char)quote) { putchar('\\'); putchar(value); }
+        else if (value < 32 || value == 127) printf("\\%03o", (unsigned)value);
+        else putchar(value);
+    }
+}
+static inline void cs_p_c (char v, size_t n) {
+    (void)n; CS_VAL(); putchar('\''); cs_escape_byte((unsigned char)v, '\'');
+    printf("' (%d)\n", (int)v);
+}
 static inline void cs_p_i (long long v, size_t n)          { (void)n; CS_VAL(); printf("%lld\n", v); }
 static inline void cs_p_u (unsigned long long v, size_t n) { (void)n; CS_VAL(); printf("%llu\n", v); }
 static inline void cs_p_d (double v, size_t n)             { (void)n; CS_VAL(); printf("%.17g\n", v); }
@@ -105,7 +125,7 @@ static inline void cs_p_s_bounded(const void *object, size_t size)
     CS_VAL();
     if (!v) { puts("NULL"); return; }
     putchar('"');
-    for (i = 0; i < size && v[i]; ++i) putchar((unsigned char)v[i]);
+    for (i = 0; i < size && v[i]; ++i) cs_escape_byte((unsigned char)v[i], '"');
     puts("\"");
 }
 static inline void cs_p_s(const char *v, size_t size) { cs_p_s_bounded(v, size); }
@@ -650,6 +670,45 @@ static int cs_taped_scanf(const char *format, ...)
 #endif
 #define scanf cs_taped_scanf
 
+/* The same dynamic call boundaries preserve libc buffering, pushback and EOF
+   when character and line reads are mixed with scanf. Non-stdin files retain
+   their native behavior and are never fed by the parent stdin tape. */
+static int cs_taped_fgetc(FILE *stream)
+{
+    int result;
+    if (stream != stdin) return fgetc(stream);
+    fputs(CS_M_STDIN, stderr); fflush(stderr);
+    result = fgetc(stream);
+    fputs(CS_M_STDIN_DONE, stderr); fflush(stderr);
+    return result;
+}
+static int cs_taped_getchar(void) { return cs_taped_fgetc(stdin); }
+static char *cs_taped_fgets(char *text, int size, FILE *stream)
+{
+    char *result;
+    if (stream != stdin) return fgets(text, size, stream);
+    fputs(CS_M_STDIN, stderr); fflush(stderr);
+    result = fgets(text, size, stream);
+    fputs(CS_M_STDIN_DONE, stderr); fflush(stderr);
+    return result;
+}
+#ifdef fgetc
+#undef fgetc
+#endif
+#ifdef getc
+#undef getc
+#endif
+#ifdef getchar
+#undef getchar
+#endif
+#ifdef fgets
+#undef fgets
+#endif
+#define fgetc cs_taped_fgetc
+#define getc cs_taped_fgetc
+#define getchar cs_taped_getchar
+#define fgets cs_taped_fgets
+
 static inline uint64_t cs_timeit_now_ns(void) {
 #if defined(_WIN32)
 #if defined(TIME_UTC)
@@ -768,15 +827,15 @@ impl BuildFlavor {
 /// protocol markers belong to `%src --raw`, not the default source view.
 pub fn build_user_view(session: &Session) -> String {
     let mut src = String::new();
-    for item in &session.file_items {
+    for item in session.file_items() {
         src.push_str(item);
         src.push('\n');
     }
-    if !session.file_items.is_empty() {
+    if !session.file_items().is_empty() {
         src.push('\n');
     }
     src.push_str("int main(void)\n{\n");
-    for (index, stmt) in session.stmts.iter().enumerate() {
+    for (index, stmt) in session.stmts().iter().enumerate() {
         let events = session.stmt_stdin_event_count(index);
         if events > 0 {
             src.push_str(&format!(
@@ -969,13 +1028,7 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor, timed: bool)
         BuildFlavor::ReplaceFile(index) => Some(index),
         _ => None,
     };
-    let uses_stdin_tape = session
-        .file_items
-        .iter()
-        .chain(session.stmts.iter())
-        .map(String::as_str)
-        .chain(std::iter::once(input))
-        .any(|source| lex::contains_code_identifier(source, "scanf"));
+    let uses_stdin_tape = session.uses_stdin_tape() || lex::mentions_stdin_api(input);
     let mut src = Source::new();
     let mut new_start_line = 1usize;
     let mut session_line_ranges = Vec::new();
@@ -1001,7 +1054,7 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor, timed: bool)
     }
     src.push_str(RUNTIME);
 
-    for (index, item) in session.file_items.iter().enumerate() {
+    for (index, item) in session.file_items().iter().enumerate() {
         if file_replacement == Some(index) {
             new_start_line = src.line_count() + 1;
             src.push_str(input);
@@ -1026,7 +1079,7 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor, timed: bool)
     } else {
         src.push_str("\nint main(void)\n{\n");
     }
-    for stmt in &session.stmts {
+    for stmt in session.stmts() {
         let start = src.line_count() + 1;
         src.push_str(stmt);
         session_line_ranges.push((start, stmt.lines().count().max(1)));
@@ -1703,9 +1756,9 @@ enum TypeToken {
 fn aggregate_types(session: &Session, input: &str) -> Vec<(String, &'static str)> {
     let mut found = BTreeSet::new();
     for src in session
-        .file_items
+        .file_items()
         .iter()
-        .chain(session.stmts.iter())
+        .chain(session.stmts().iter())
         .map(String::as_str)
         .chain(std::iter::once(input))
     {
@@ -1851,8 +1904,8 @@ mod tests {
     #[test]
     fn type_probe_adds_session_aggregate_associations() {
         let mut session = Session::default();
-        session.file_items.push("struct Pair { int x, y; };".into());
-        session.stmts.push("struct Pair pair = { 1, 2 };".into());
+        session.commit("struct Pair { int x, y; };", Slot::FileScope);
+        session.commit("struct Pair pair = { 1, 2 };", Slot::Stmt);
         let program = build_type_probe(&session, "pair");
         assert!(program.src.contains("struct Pair: \"Struct Pair\""));
     }
@@ -1893,7 +1946,7 @@ mod tests {
     #[test]
     fn single_input_timer_starts_after_replay_and_reports_after_input() {
         let mut session = Session::default();
-        session.stmts.push("replayed();".into());
+        session.commit("replayed();", Slot::Stmt);
         let source = build_timed(&session, "measured()", Slot::Expr).src;
 
         let replay = source.find("replayed();").expect("retained replay");
@@ -2040,10 +2093,8 @@ mod tests {
     #[test]
     fn scoped_statements_and_file_replacements_preserve_program_shape() {
         let mut session = Session::default();
-        session.file_items.push("int f(void) { return 1; }".into());
-        session
-            .file_items
-            .push("int g(void) { return f(); }".into());
+        session.commit("int f(void) { return 1; }", Slot::FileScope);
+        session.commit("int g(void) { return f(); }", Slot::FileScope);
 
         let replacement = build_file_replacement(&session, "int f(void) { return 2; }", 0).src;
         let new_f = replacement.find("return 2").expect("replacement present");

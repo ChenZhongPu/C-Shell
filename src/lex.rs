@@ -17,6 +17,14 @@ pub struct Scan {
     pub code: Vec<bool>,
 }
 
+pub const STDIN_APIS: &[&str] = &["scanf", "getchar", "fgets", "fgetc", "getc"];
+
+pub fn mentions_stdin_api(source: &str) -> bool {
+    identifiers(source)
+        .iter()
+        .any(|name| STDIN_APIS.contains(&name.as_str()))
+}
+
 pub fn scan(s: &str) -> Scan {
     let b = s.as_bytes();
     let mut code = vec![false; b.len()];

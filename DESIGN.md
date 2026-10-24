@@ -4,11 +4,12 @@ Settled architecture decisions, the one big open problem, and the traps buried
 in the code that you must know about before changing it. README is for users;
 this file is for whoever develops the tool next.
 
-Status: v0.3.2 working. ~13000 lines of Rust, 184 tests (114 unit + 70
-end-to-end smoke), clippy/fmt clean, English/Chinese UI. Verified on Linux with gcc
-16.1.1 and clang 22.1.6. CI exercises the default macOS compiler and two
-Windows driver dialects (a GNU-style driver and MSVC); see
-`.github/workflows/ci.yml` for the exact matrix.
+Status: v0.3.2 working, English/Chinese UI. The default test run has 118 unit
+tests and 79 end-to-end smoke tests; a real-compiler performance benchmark is
+ignored by default. Verified locally on Linux with GCC 16.2.1 and Clang
+22.1.8. Native CI covers Linux GCC/Clang, macOS Clang and Windows CL; see
+`.github/workflows/ci.yml` for the exact matrix and required sanitizer backends.
+Windows is validated in its native CL CI job, without local cross-builds.
 
 ---
 
@@ -40,7 +41,7 @@ pass-through, diagnostic remapping, completion-marker validation, live
 terminal output with bounded capture, crash reporting and timeout handling,
 one-per-session external-side-effect replay warnings, missing-semicolon repair,
 syntax-impossible expression-trial elision, generated-diagnostic sanitizing,
-pointer-safe recursive struct printing, request-driven `scanf` stdin replay,
+pointer-safe recursive struct printing, request-driven stdin replay,
 actionable rejection of user-defined `main`, compiler-validated local
 shadowing and file-scope replacement, blank-line
 confirmation for a completed interactive `if`, `if`/`else` batch lookahead,
@@ -132,25 +133,30 @@ the winner. Neither form is reversible: the session only moves forward, and
 new `x` in its initializer), and retained earlier calls bind to a replaced
 function; both consequences are shown honestly by `%src`.
 
-**Direct `scanf` uses a request-driven, session-local stdin tape.** RUNTIME
-rebinds `scanf` to `cs_taped_scanf`, which emits `M_STDIN` before delegating to
-`vscanf`. `LiveFilter` classifies each request as historical (before `M_NEW`)
+**Common direct reads use a request-driven, session-local stdin tape.** RUNTIME
+wraps `scanf`, `getchar`, `getc(stdin)`, `fgetc(stdin)` and
+`fgets(..., stdin)`, emitting `M_STDIN` and `M_STDIN_DONE` around libc calls.
+Other file streams keep their native behavior. `LiveFilter` classifies each request as historical (before `M_NEW`)
 or current. `proc` gives the child a pipe rather than the real terminal:
 historical requests receive `Session::stdin_tape` events, while a current
-request synchronously reads and records one fresh line. Human wait time resets
+request polls and records one fresh line. Buffered calls retain empty call
+boundaries without consuming another line. Unix nonblocking reads and Windows
+console/pipe readiness checks let completion markers and interrupts cancel
+pending input. Human wait time resets
 the execution deadline. Events attach only after `M_DONE`, are discarded by
 `%reset`, stay memory-only, and `%src` exposes only a redacted count.
 Functions and loops work because requests are dynamic; a changed request count
-marks the run divergent and never falls through to real stdin. This first
-portable adapter deliberately covers direct standard `scanf`, one line per
-call—not `fscanf`, `fgets`, `getchar`, raw fd reads, `#undef scanf`, or calls
+marks the run divergent and never falls through to real stdin. The
+adapter supplies at most one fresh line per call; it does not cover
+`fscanf`, `fread`, raw fd reads, removed wrapper macros, or calls
 inside precompiled libraries. Piped-REPL stdin is C source and cannot also be
 program input; TTY and `-e` modes can supply current lines.
 
 **Warn once before other known external side effects can enter replay.**
 `lex::external_replay_calls` recognizes a conservative list of standard/POSIX
 file, input, environment and process APIs while ignoring comments and string
-literals; supported direct `scanf` is removed from that warning. `submit`
+literals; direct `scanf` and `getchar` are removed from that warning.
+Stream-taking APIs are still conservatively included. `submit`
 prints an English warning before evaluation; the Session flag is set only
 after that input completes and is retained, so a failed or crashing attempt
 cannot consume the warning. `%reset` starts a fresh warning epoch. This is
@@ -340,8 +346,8 @@ best effort and can never prevent startup.
 
 ### Symptom
 
-Accumulate-and-replay replays side effects. Direct `scanf` now consumes a
-private recorded line tape instead of prompting again, but other input APIs
+Accumulate-and-replay replays side effects. Common direct stdin reads consume a
+private recorded line tape instead of prompting again, but unsupported input APIs
 and file/process writes still repeat, and `%src` is an ever-growing ledger
 rather than the current state. Known external APIs trigger a one-time warning,
 but that cannot make replay safe. (`rand()` is fine: without
@@ -440,11 +446,10 @@ Three traps already identified for that design:
 3. **VLAs cannot persist** (size unknown at compile time — no slot for them);
    block-scope ones that die within a step are unaffected.
 
-Staging: v0.2.x broadens the current direct-`scanf` tape to a real stdin
-stream adapter + journal polish (the recovery layer — nothing wasted regardless of
-what follows) → v0.3 tree-sitter declaration parsing
-(first used for better classification, exact aliases and declarator-aware
-rewrites) → v0.4 the slot-runner hot path, feature-gated alongside replay.
+Possible staging after the common-read stdin tape: broader stream support
+and journal polish → declaration parsing (first used for better
+classification, exact aliases and declarator-aware rewrites) → a slot-runner
+hot path, feature-gated alongside replay. These remain design proposals.
 
 References: [crepl](https://l-m.dev/cs/crepl/)
 ([source](https://github.com/l1mey112/crepl)),

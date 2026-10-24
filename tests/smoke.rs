@@ -2,8 +2,8 @@
 //!
 //! The unit tests are all pure functions, so this file is the only place the
 //! toolchain detection, MSVC flag dialect, crash isolation and value printing
-//! actually get exercised. In CI it runs on Linux (gcc), macOS (clang) and
-//! Windows (MinGW and MSVC), which is precisely the coverage a dev machine
+//! actually get exercised. In CI it runs on Linux (gcc/clang), macOS (clang) and
+//! Windows (CL), which is precisely the coverage a dev machine
 //! cannot provide.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -21,6 +21,308 @@ impl Drop for ChildGuard {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+struct WebTerminal {
+    _server: ChildGuard,
+    _stdout: BufReader<std::process::ChildStdout>,
+    socket: tungstenite::WebSocket<MaybeTlsStream<TcpStream>>,
+    transcript: Vec<u8>,
+    cursor_reports: usize,
+}
+
+impl WebTerminal {
+    fn start(command: &mut Command) -> Self {
+        let mut child = command
+            .args(["--web", "--no-open", "--lang", "en", "--no-color"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        let url = line
+            .split_whitespace()
+            .find(|word| word.starts_with("http://127.0.0.1:"))
+            .expect("browser terminal URL");
+        let origin = url
+            .strip_prefix("http://")
+            .unwrap()
+            .split('/')
+            .next()
+            .unwrap();
+        let mut request = format!("{}ws", url.replacen("http://", "ws://", 1))
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("Origin", format!("http://{origin}").parse().unwrap());
+        let (mut socket, _) = connect(request).unwrap();
+        if let MaybeTlsStream::Plain(stream) = socket.get_mut() {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .unwrap();
+        }
+        Self {
+            _server: ChildGuard(child),
+            _stdout: stdout,
+            socket,
+            transcript: Vec::new(),
+            cursor_reports: 0,
+        }
+    }
+
+    fn send(&mut self, bytes: &[u8]) {
+        self.socket
+            .send(WebSocketMessage::Binary(bytes.to_vec().into()))
+            .unwrap();
+    }
+
+    fn until(&mut self, from: usize, needle: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(25);
+        while !String::from_utf8_lossy(&self.transcript[from..])
+            .replace("\r\n", "\n")
+            .contains(needle)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "missing {needle}: {}",
+                String::from_utf8_lossy(&self.transcript)
+            );
+            match self.socket.read().unwrap_or_else(|error| {
+                panic!(
+                    "{error}; missing {needle}: {}",
+                    String::from_utf8_lossy(&self.transcript)
+                )
+            }) {
+                WebSocketMessage::Binary(bytes) => self.transcript.extend(bytes),
+                WebSocketMessage::Text(text) => self.transcript.extend(text.as_bytes()),
+                WebSocketMessage::Ping(bytes) => {
+                    self.socket.send(WebSocketMessage::Pong(bytes)).unwrap()
+                }
+                WebSocketMessage::Close(_) => panic!(
+                    "terminal closed before {needle}: {}",
+                    String::from_utf8_lossy(&self.transcript)
+                ),
+                _ => {}
+            }
+            let queries = self
+                .transcript
+                .windows(4)
+                .filter(|bytes| *bytes == b"\x1b[6n")
+                .count();
+            while self.cursor_reports < queries {
+                self.send(b"\x1b[1;1R");
+                self.cursor_reports += 1;
+            }
+        }
+    }
+
+    fn evaluate(&mut self, code: &str, expected: &str) {
+        let start = self.transcript.len();
+        self.send(format!("{code}\r").as_bytes());
+        self.until(start, expected);
+    }
+}
+
+impl Drop for WebTerminal {
+    fn drop(&mut self) {
+        let _ = self.socket.send(WebSocketMessage::Binary(vec![3].into()));
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = self.socket.close(None);
+    }
+}
+
+#[test]
+fn interactive_terminal_recovers_from_interrupts_in_edit_compile_run_and_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let wrapper = dir.path().join(if cfg!(windows) {
+        "cl.cmd"
+    } else {
+        "cc-interrupt"
+    });
+    let trigger = dir.path().join("slow");
+    let ready = dir.path().join("ready");
+    let survived = dir.path().join("survived");
+    if cfg!(windows) {
+        std::fs::write(&wrapper, "@echo off\r\nif exist \"%C_SHELL_SLOW_TRIGGER%\" (\r\n echo ready>\"%C_SHELL_SLOW_READY%\"\r\n powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 2; Set-Content -LiteralPath $env:C_SHELL_SLOW_SURVIVED -Value leaked; Start-Sleep -Seconds 30\"\r\n)\r\n\"%C_SHELL_TEST_CC%\" %*\r\n").unwrap();
+    } else {
+        std::fs::write(&wrapper, "#!/bin/sh\nif [ -f \"$C_SHELL_SLOW_TRIGGER\" ]; then\n printf ready > \"$C_SHELL_SLOW_READY\"\n sleep 2\n printf leaked > \"$C_SHELL_SLOW_SURVIVED\"\n sleep 30\nfi\nexec \"$C_SHELL_TEST_CC\" \"$@\"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+    let mut command = Command::new(env!("CARGO_BIN_EXE_c-shell"));
+    command
+        .arg("--cc")
+        .arg(&wrapper)
+        .env(
+            "C_SHELL_TEST_CC",
+            std::env::var_os("CC").unwrap_or_else(|| {
+                if cfg!(windows) {
+                    "cl".into()
+                } else {
+                    "cc".into()
+                }
+            }),
+        )
+        .env("C_SHELL_SLOW_TRIGGER", &trigger)
+        .env("C_SHELL_SLOW_READY", &ready)
+        .env("C_SHELL_SLOW_SURVIVED", &survived);
+    let mut terminal = WebTerminal::start(&mut command);
+    terminal.until(0, "In [1]:");
+    let editing = terminal.transcript.len();
+    terminal.send(b"int discarded = 1\x03");
+    terminal.until(editing, "\x1b[6n");
+    let query = editing
+        + terminal.transcript[editing..]
+            .windows(4)
+            .rposition(|bytes| bytes == b"\x1b[6n")
+            .unwrap();
+    terminal.until(query + 4, "In [1]:");
+    terminal.evaluate("1 + 1", "Out[1]: 2");
+    terminal.until(0, "In [2]:");
+
+    std::fs::write(&trigger, "slow").unwrap();
+    terminal.send(b"2 + 2\r");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !ready.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "compiler wrapper never started"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::remove_file(&trigger).unwrap();
+    let start = terminal.transcript.len();
+    terminal.send(b"\x03");
+    terminal.until(start, "interrupted");
+    terminal.until(start, "In [3]:");
+    terminal.evaluate("3 + 3", "Out[3]: 6");
+    terminal.until(0, "In [4]:");
+
+    terminal.evaluate(
+        "{ puts(\"loop-ready\"); fflush(stdout); for (;;) {} }",
+        "loop-ready\n",
+    );
+    let start = terminal.transcript.len();
+    terminal.send(b"\x03");
+    terminal.until(start, "In [5]:");
+    terminal.evaluate("40 + 2", "Out[5]: 42");
+    terminal.until(0, "In [6]:");
+
+    terminal.evaluate(
+        "{ int value; fputs(\"input-ready\\n\", stderr); fflush(stderr); scanf(\"%d\", &value); }",
+        "input-ready\n",
+    );
+    let start = terminal.transcript.len();
+    terminal.send(b"\x03");
+    terminal.until(start, "In [7]:");
+    terminal.evaluate("6 * 7", "Out[7]: 42");
+    terminal.until(0, "In [8]:");
+    terminal.evaluate("char text[16];", "In [9]:");
+    terminal.evaluate(
+        "fputs(\"line-ready\\n\", stderr); fflush(stderr); fgets(text, sizeof text, stdin);",
+        "line-ready\n",
+    );
+    terminal.send(b"hello\r");
+    terminal.until(0, "In [10]:");
+    terminal.evaluate("text", "Out[10]: \"hello\\n\"");
+    terminal.until(0, "In [11]:");
+    terminal.evaluate(
+        "%check fprintf(stderr, \"runtime error: demo\\n\");",
+        "runtime error: demo\n",
+    );
+    let start = terminal.transcript.len();
+    terminal.evaluate(
+        "%check fprintf(stderr, \"example.c:1:2: runtime error: demo\\n\");",
+        "example.c:1:2: runtime error: demo\n",
+    );
+    assert!(!String::from_utf8_lossy(&terminal.transcript[start..]).contains("Runtime check:"));
+    terminal.until(start, "In [11]:");
+    let start = terminal.transcript.len();
+    terminal.evaluate(
+        "%check { int n = 0; fprintf(stderr, \"example.c:1:2: runtime error: demo\\n\"); puts(\"checked-input-ready\"); fflush(stdout); scanf(\"%d\", &n); printf(\"read=%d\\n\", n); }",
+        "checked-input-ready\n",
+    );
+    terminal.send(b"42\r");
+    terminal.until(start, "read=42\n");
+    terminal.until(start, "example.c:1:2: runtime error: demo\n");
+    terminal.until(start, "In [11]:");
+    let current = String::from_utf8_lossy(&terminal.transcript[start..]).replace("\r\n", "\n");
+    assert_eq!(
+        current
+            .matches("example.c:1:2: runtime error: demo\n")
+            .count(),
+        1,
+        "{current}"
+    );
+    assert!(!current.contains("Runtime check:"), "{current}");
+    std::thread::sleep(Duration::from_millis(2100));
+    assert!(
+        !survived.exists(),
+        "interrupted compiler descendants kept running"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn expression_strategy_cache_saves_compilations_and_invalidates_on_context_changes() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let wrapper = dir.path().join("cc-plans");
+    let log = dir.path().join("compiles");
+    std::fs::write(&wrapper, "#!/bin/sh\nfor arg in \"$@\"; do\n case \"$arg\" in */input.c) printf 'compile\\n' >> \"$C_SHELL_PLAN_LOG\" ;; esac\ndone\nexec \"$C_SHELL_PLAN_CC\" \"$@\"\n").unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_c-shell"));
+    command
+        .arg("--cc")
+        .arg(&wrapper)
+        .args(["--lang", "en"])
+        .env("C_SHELL_PLAN_LOG", &log)
+        .env(
+            "C_SHELL_PLAN_CC",
+            std::env::var_os("CC").unwrap_or_else(|| "cc".into()),
+        );
+    for input in [
+        "int matrix[2][2] = {{1,2},{3,4}};",
+        "matrix",
+        "matrix",
+        "int matrix[3] = {7,8,9};",
+        "matrix",
+        "matrix",
+        "%std c17",
+        "matrix",
+    ] {
+        command.args(["-e", input]);
+    }
+    let output = command.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rows = stdout
+        .lines()
+        .filter(|line| line.starts_with('{'))
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 5, "{stdout}");
+    assert_eq!(rows[0], rows[1]);
+    assert_eq!(rows[2], rows[3]);
+    assert_eq!(rows[3], rows[4]);
+    assert_ne!(
+        rows[0], rows[2],
+        "a stale array-dimension plan survived shadowing"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap().lines().count(),
+        12,
+        "expected cold/warm matrix queries 3/1, shadowing 2 compiles, new array queries 2/1, and standard-change query 2"
+    );
 }
 
 /// Feed `lines` to c-shell on stdin, return everything it printed to stdout.
@@ -1772,10 +2074,19 @@ fn runtime_check_output(language: &str, inputs: &[&str]) -> std::process::Output
 /// Sanitizer runtimes are optional installations, even for a supported C
 /// compiler. An unsupported backend must fail explicitly, never claim success.
 fn runtime_check_unavailable(output: &std::process::Output) -> bool {
-    let unavailable = String::from_utf8_lossy(&output.stderr)
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    let unavailable = diagnostic
         .contains("is unavailable with the current compiler, target, or runtime installation.");
     if unavailable {
         assert!(!output.status.success());
+        let required = std::env::var("C_SHELL_TEST_REQUIRE_SANITIZERS").unwrap_or_default();
+        let required_backend = required == "all"
+            || (required == "address" && !diagnostic.contains("UndefinedBehaviorSanitizer"))
+            || (required == "undefined" && !diagnostic.contains("AddressSanitizer"));
+        assert!(
+            !required_backend,
+            "CI required {required} checks but a backend was unavailable: {diagnostic}"
+        );
     }
     unavailable
 }
@@ -2092,4 +2403,219 @@ fn runtime_check_summary_preserves_program_stderr_separately() {
     assert!(!stderr.contains("Shadow bytes"), "{stderr}");
     assert!(!stderr.contains("AddressSanitizer:"), "{stderr}");
     assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n");
+}
+
+#[test]
+fn runtime_check_does_not_mistake_program_messages_for_sanitizer_reports() {
+    let output = runtime_check_output(
+        "en",
+        &[
+            "%check fprintf(stderr, \"runtime error: demo\\n\");",
+            "%check fprintf(stderr, \"ERROR: AddressSanitizer is ordinary text\\n\");",
+            "%check fprintf(stderr, \"example.c:1:2: runtime error: demo\\n\");",
+            "42",
+        ],
+    );
+    if runtime_check_unavailable(&output) {
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let newline = if cfg!(windows) { "\r\n" } else { "\n" };
+    assert_eq!(
+        stderr,
+        format!(
+            "runtime error: demo{newline}ERROR: AddressSanitizer is ordinary text{newline}example.c:1:2: runtime error: demo{newline}"
+        )
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n");
+}
+
+#[test]
+fn runtime_check_diagnostic_examples_do_not_block_stdin_requests() {
+    let output = run_evals_with_stdin(
+        &[
+            "%check { int n = 0; fprintf(stderr, \"example.c:1:2: runtime error: demo\\n\"); scanf(\"%d\", &n); printf(\"read=%d\\n\", n); }",
+            "42",
+        ],
+        "7\n",
+    );
+    if runtime_check_unavailable(&output) {
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let newline = if cfg!(windows) { "\r\n" } else { "\n" };
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("read=7{newline}42\n")
+    );
+    assert!(
+        stderr.contains(&format!("example.c:1:2: runtime error: demo{newline}")),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Runtime check"), "{stderr}");
+}
+
+#[test]
+fn string_previews_escape_controls_without_changing_program_output() {
+    let output = run_evals_with_stdin(
+        &[
+            r#""line\n\t\r\"\\\033[2J""#,
+            "(char)'\\n'",
+            r#"puts("real\noutput");"#,
+            r#""\xe4\xbd\xa0\xe5\xa5\xbd""#,
+        ],
+        "",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let newline = if cfg!(windows) { "\r\n" } else { "\n" };
+    let expected = format!(
+        "\"line\\n\\t\\r\\\"\\\\\\033[2J\"\n'\\n' (10)\nreal{newline}output{newline}\"你好\"\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+}
+
+#[test]
+fn piped_input_lines_survive_separate_evaluations_and_reset() {
+    let output = run_evals_with_stdin(
+        &[
+            "int first = 0; scanf(\"%d\", &first);",
+            "first",
+            "int second = 0; scanf(\"%d\", &second);",
+            "second",
+            "%reset",
+            "int third = 0; scanf(\"%d\", &third);",
+            "third",
+        ],
+        "11\n22\n33\n",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "11\n22\nsession cleared\n33\n"
+    );
+}
+
+#[test]
+fn character_and_line_input_replay_preserves_buffering_pushback_and_eof() {
+    let output = run_evals_with_stdin(
+        &[
+            "int first = getchar();",
+            "int second = getc(stdin);",
+            "int pushed = ungetc('X', stdin);",
+            "int third = fgetc(stdin);",
+            "char line[32];",
+            "fgets(line, sizeof line, stdin);",
+            "first",
+            "second",
+            "third",
+            "line",
+            "int number = 0; scanf(\"%d\", &number);",
+            "int separator = getchar();",
+            "char small[3]; fgets(small, sizeof small, stdin);",
+            "char rest[16]; fgets(rest, sizeof rest, stdin);",
+            "number",
+            "separator",
+            "small",
+            "rest",
+            "int end = getchar();",
+            "end == EOF",
+            "feof(stdin) != 0",
+            "clearerr(stdin);",
+            "getchar() == EOF",
+        ],
+        "ab tail\n42\nlonger\n",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert_eq!(
+        stdout,
+        "97\n98\n88\n\" tail\\n\"\n42\n10\n\"lo\"\n\"nger\\n\"\n1\n1\n1\n"
+    );
+    assert!(!stderr.contains("diverged"), "{stderr}");
+}
+
+#[test]
+fn taped_input_leaves_other_file_streams_with_native_behavior() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.txt");
+    let path = path.to_str().unwrap().replace('\\', "\\\\");
+    let open = format!("FILE *stream = fopen(\"{path}\", \"w+\"); if (!stream) abort();");
+    let output = run_evals_with_stdin(
+        &[
+            &open,
+            "fputs(\"ABCDE\\n\", stream); rewind(stream);",
+            "char line[3]; fgets(line, sizeof line, stream);",
+            "line",
+            "fgetc(stream)",
+            "getc(stream)",
+            "int from_stdin = getchar();",
+            "from_stdin",
+            "char rest[8]; fgets(rest, sizeof rest, stream);",
+            "rest",
+        ],
+        "Z\n",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "\"AB\"\n67\n68\n90\n\"E\\n\"\n"
+    );
+}
+
+#[test]
+fn buffered_character_reads_do_not_wait_for_another_input_line() {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_c-shell"));
+    command.args(["--lang", "en", "--timeout", "2", "-e",
+        "int a = getchar(); int b = getchar(); int c = getchar(); printf(\"%d %d %d\\n\", a, b, c);",
+        "-e", "42"]);
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    input.write_all(b"ab\n").unwrap();
+    input.flush().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("buffered getchar requested another input line");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let newline = if cfg!(windows) { "\r\n" } else { "\n" };
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("97 98 10{newline}42\n")
+    );
 }

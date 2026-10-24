@@ -138,17 +138,21 @@ impl Checks {
             // A replay process intentionally loses all session allocations at
             // exit. Leak checking would diagnose unfinished exercises rather
             // than the operation the learner asked to check.
+            // Summaries need no stack symbols; avoid starting an external
+            // symbolizer (and possible symbol-server lookups) for each error.
             append_options(
                 command,
                 "ASAN_OPTIONS",
-                &format!("detect_leaks=0:halt_on_error=1:abort_on_error=0:exitcode=1:{logging}"),
+                &format!(
+                    "detect_leaks=0:halt_on_error=1:abort_on_error=0:exitcode=1:symbolize=0:{logging}"
+                ),
             );
         }
         if self.undefined {
             append_options(
                 command,
                 "UBSAN_OPTIONS",
-                &format!("halt_on_error=1:print_stacktrace=1:{logging}"),
+                &format!("halt_on_error=1:print_stacktrace=0:symbolize=0:{logging}"),
             );
         }
         Ok(report)
@@ -205,9 +209,10 @@ impl Checks {
         ] {
             if enabled
                 && !run(Some(argument)).is_some_and(|(c, output)| {
+                    let diagnostics = format!("{output}{}", String::from_utf8_lossy(&c.stderr));
                     c.status.is_some_and(|s| !s.success())
-                        && (output.contains(report)
-                            || String::from_utf8_lossy(&c.stderr).contains(report))
+                        && has_report(&diagnostics)
+                        && diagnostics.contains(report)
                 })
             {
                 return false;
@@ -226,7 +231,10 @@ pub struct ReportCapture {
 /// GCC's combined ASan/UBSan runtime can still send UBSan findings to stderr.
 /// Separate that trailing report from ordinary program stderr as a fallback.
 pub fn split_stderr<'a>(stderr: &'a str, source: &str) -> (&'a str, Option<&'a str>) {
-    let Some(marker) = stderr.find("runtime error:") else {
+    let Some(marker) = stderr
+        .match_indices("runtime error:")
+        .find_map(|(index, _)| has_location_suffix(&stderr[..index]).then_some(index))
+    else {
         return (stderr, None);
     };
     let line_start = stderr[..marker].rfind('\n').map_or(0, |index| index + 1);
@@ -248,33 +256,50 @@ pub fn split_stderr<'a>(stderr: &'a str, source: &str) -> (&'a str, Option<&'a s
     (&stderr[..start], Some(&stderr[start..]))
 }
 
+/// A native UBSan header contains a source location before its message. The
+/// words "runtime error:" alone are ordinary program output, not evidence.
+fn has_location_suffix(prefix: &str) -> bool {
+    let Some(location) = prefix.trim_end().strip_suffix(':') else {
+        return false;
+    };
+    let Some((file_or_line, number)) = location.rsplit_once(':') else {
+        return false;
+    };
+    !file_or_line.is_empty()
+        && !number.is_empty()
+        && number.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 /// Withhold report prefixes across arbitrary chunks before the terminal sees
 /// a generated path or trace. Program prompts still stream without a newline.
 pub struct StderrFilter {
-    markers: [Vec<u8>; 3],
+    sources: [Vec<u8>; 2],
     pending: Vec<u8>,
     reporting: bool,
+    suppressed: Vec<u8>,
 }
 
 impl StderrFilter {
     pub fn new(source: &str) -> Self {
         Self {
-            markers: [
+            sources: [
                 source.as_bytes().to_vec(),
                 source.replace('\\', "/").into_bytes(),
-                b"runtime error:".to_vec(),
             ],
             pending: Vec::new(),
             reporting: false,
+            suppressed: Vec::new(),
         }
     }
 
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
         if self.reporting {
+            self.suppress(chunk);
             return Vec::new();
         }
         self.pending.extend_from_slice(chunk);
-        let location = self.markers[..2]
+        let location = self
+            .sources
             .iter()
             .filter_map(|marker| {
                 self.pending
@@ -284,50 +309,95 @@ impl StderrFilter {
             .min();
         let header = self
             .pending
-            .windows(self.markers[2].len())
-            .position(|window| window == self.markers[2]);
+            .windows(b"runtime error:".len())
+            .enumerate()
+            .find_map(|(index, window)| {
+                (window == b"runtime error:"
+                    && has_location_suffix(&String::from_utf8_lossy(&self.pending[..index])))
+                .then_some(index)
+            });
         if let Some(header) = header {
-            let start = location.filter(|&index| index <= header).unwrap_or(header);
+            let start = location
+                .filter(|&index| index <= header)
+                .unwrap_or_else(|| location_candidate_start(&self.pending[..header]));
             self.reporting = true;
             let visible = self.pending[..start].to_vec();
-            self.pending.clear();
+            let pending = std::mem::take(&mut self.pending);
+            self.suppress(&pending[start..]);
             return visible;
         }
-        if let Some(location) = location {
-            let candidate = &self.pending[location..];
-            let protocol = [
-                crate::codegen::M_NEW,
-                crate::codegen::M_DONE,
-                crate::codegen::M_STDIN,
-            ];
-            if candidate.len() < 4096
-                && !candidate.contains(&b'\n')
-                && !protocol.iter().any(|marker| {
-                    candidate
-                        .windows(marker.len())
-                        .any(|bytes| bytes == marker.as_bytes())
-                })
-            {
-                return self.pending.drain(..location).collect();
-            }
-        }
-        let keep = self
-            .markers
-            .iter()
-            .map(|marker| {
-                (1..=self.pending.len().min(marker.len() - 1))
-                    .rev()
-                    .find(|&length| self.pending.ends_with(&marker[..length]))
-                    .unwrap_or(0)
+        // Retain both known generated paths and a possible foreign-file
+        // location. A header's path/line/column can arrive before the words
+        // "runtime error:" in separate reads, including one byte at a time.
+        let known = location
+            .filter(|&index| {
+                !self.pending[index..]
+                    .iter()
+                    .any(|byte| byte.is_ascii_control() && *byte != b'\t')
             })
-            .max()
-            .unwrap_or(0);
-        self.pending.drain(..self.pending.len() - keep).collect()
+            .unwrap_or_else(|| {
+                self.pending.len()
+                    - self
+                        .sources
+                        .iter()
+                        .map(|marker| {
+                            (1..=self.pending.len().min(marker.len() - 1))
+                                .rev()
+                                .find(|&length| self.pending.ends_with(&marker[..length]))
+                                .unwrap_or(0)
+                        })
+                        .max()
+                        .unwrap_or(0)
+            });
+        let start = known.min(location_candidate_start(&self.pending));
+        let start = start.max(self.pending.len().saturating_sub(4096));
+        self.pending.drain(..start).collect()
     }
 
     pub fn finish(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pending)
     }
+
+    fn suppress(&mut self, bytes: &[u8]) {
+        let keep = bytes
+            .len()
+            .min(proc::MAX_CAPTURE_BYTES - self.suppressed.len());
+        self.suppressed.extend_from_slice(&bytes[..keep]);
+    }
+
+    pub fn take_suppressed(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.suppressed)
+    }
+}
+
+/// Keep the current potential filename/location, but release ordinary prompts
+/// at whitespace or punctuation. Paths with separators/extensions may contain
+/// spaces. The caller bounds the lookahead to avoid buffering unbounded lines.
+fn location_candidate_start(bytes: &[u8]) -> usize {
+    let mut start = 0;
+    let mut path = false;
+    for (index, &byte) in bytes.iter().enumerate() {
+        if byte == b'\n' || byte == b'\r' || byte.is_ascii_control() && byte != b'\t' {
+            start = index + 1;
+            path = false;
+        } else if byte.is_ascii_whitespace() {
+            if !path || bytes[..index].ends_with(b":") {
+                if has_location_suffix(&String::from_utf8_lossy(&bytes[start..index])) {
+                    path = true;
+                } else {
+                    start = index + 1;
+                    path = false;
+                }
+            }
+        } else if byte.is_ascii_alphanumeric() || byte >= 128 || b"_./\\:-~<>()[]+".contains(&byte)
+        {
+            path |= matches!(byte, b'.' | b'/' | b'\\');
+        } else {
+            start = index + 1;
+            path = false;
+        }
+    }
+    start
 }
 
 impl ReportCapture {
@@ -518,6 +588,7 @@ mod tests {
         let source = "/tmp/test/input.c";
         let mut filter = StderrFilter::new(source);
         assert_eq!(filter.feed(b"value? "), b"value? ");
+        assert_eq!(filter.feed(b"log.txt: "), b"log.txt: ");
         let report =
             format!("{source}:642:5: runtime error: signed integer overflow\n#0 0x123 main\n");
         let visible = report
@@ -537,6 +608,45 @@ mod tests {
         let (program, diagnostic) = split_stderr(&stderr, source);
         assert!(program.ends_with("prompt? "));
         assert_eq!(diagnostic, Some(report.as_str()));
+        let ordinary = "runtime error: demo\nERROR: AddressSanitizer is just some text\n";
+        assert_eq!(split_stderr(ordinary, source), (ordinary, None));
+        let mut plain = StderrFilter::new(source);
+        let mut visible = ordinary
+            .bytes()
+            .flat_map(|byte| plain.feed(&[byte]))
+            .collect::<Vec<_>>();
+        visible.extend(plain.finish());
+        assert_eq!(visible, ordinary.as_bytes());
+    }
+
+    #[test]
+    fn live_fallback_withholds_foreign_locations_at_every_chunk_boundary() {
+        for location in [
+            "/tmp/helper.h:7:3:",
+            "C:\\SDK Files\\helper.h:7:3:",
+            "helper.h:7:3:",
+            "<header>:7:3:",
+            "helper:7:",
+        ] {
+            let report = format!("{location} runtime error: signed integer overflow\n#0 trace\n");
+            let wire = format!("value? {report}");
+            for split in 0..=wire.len() {
+                let mut filter = StderrFilter::new("/tmp/input.c");
+                let mut visible = filter.feed(&wire.as_bytes()[..split]);
+                visible.extend(filter.feed(&wire.as_bytes()[split..]));
+                visible.extend(filter.finish());
+                assert_eq!(visible, b"value? ", "{location}, split {split}");
+                assert_eq!(filter.take_suppressed(), report.as_bytes());
+            }
+            let mut filter = StderrFilter::new("/tmp/input.c");
+            let mut visible = Vec::new();
+            for byte in wire.bytes() {
+                visible.extend(filter.feed(&[byte]));
+            }
+            visible.extend(filter.finish());
+            assert_eq!(visible, b"value? ", "{location}, byte chunks");
+            assert_eq!(filter.take_suppressed(), report.as_bytes());
+        }
     }
 
     #[test]
@@ -549,6 +659,22 @@ mod tests {
         let report = capture.read().unwrap();
         assert!(report.ends_with("(Runtime report truncated.)\n"));
         assert!(report.len() < proc::MAX_CAPTURE_BYTES + 100);
+
+        let mut filter = StderrFilter::new("/tmp/input.c");
+        assert!(
+            filter
+                .feed(b"helper.h:7:3: runtime error: demo\n")
+                .is_empty()
+        );
+        assert!(
+            filter
+                .feed(&vec![b'x'; proc::MAX_CAPTURE_BYTES + 100])
+                .is_empty()
+        );
+        assert_eq!(filter.take_suppressed().len(), proc::MAX_CAPTURE_BYTES);
+        let mut plain = StderrFilter::new("/tmp/input.c");
+        plain.feed(&vec![b'x'; 8192]);
+        assert!(plain.pending.len() <= 4096);
     }
 
     #[test]

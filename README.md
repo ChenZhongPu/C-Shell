@@ -274,7 +274,7 @@ interprets differently. `%reset` clears the complete session.
 `%help` lists the commands and nothing else, so it stays a one-screen
 reference. `%help --verbose` appends the usage notes: which inputs are
 retained, how continuation and rebinding behave, what the value printer and
-`%type` and `%bits`/`%Bits` cover, and how the `scanf` tape replays.
+`%type` and `%bits`/`%Bits` cover, and how the stdin tape replays.
 
 `%time` executes the specified input once and measures only that input inside
 the generated C process; compilation, process startup and retained-session
@@ -531,9 +531,15 @@ file. The separate current-session input archive exists only for direct
 c-shell works by reassembling your session and passing complete C files to your
 real host compiler (GNU GCC, LLVM/Apple Clang, or MSVC).
 
-For full technical details on accumulation and replay, the `scanf` stdin tape,
+Direct `scanf`, `getchar`, `getc(stdin)`, `fgetc(stdin)` and
+`fgets(..., stdin)` reuse recorded input during replay. Value previews escape
+control characters and quotes; explicit program output keeps its native format.
+
+For full technical details on accumulation and replay, the stdin tape,
 `_Generic` value printers, diagnostic remapping, and capability caching, see
 **[HOW_IT_WORKS.md](HOW_IT_WORKS.md)**.
+Repeated-query compilation measurements and cache rules are in
+[PERFORMANCE.md](PERFORMANCE.md).
 
 ## Known limitations
 

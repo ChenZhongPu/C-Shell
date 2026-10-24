@@ -18,8 +18,8 @@ use reedline::{
     ReedlineEvent, ReedlineRawEvent, Span, StyledText, Suggestion, ValidationResult, Validator,
 };
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{Theme, ThemeSet};
-use syntect::parsing::{SyntaxReference, SyntaxSet};
+use syntect::highlighting::{HighlightState, Theme, ThemeSet};
+use syntect::parsing::{ParseState, SyntaxReference, SyntaxSet};
 
 use crate::lex;
 use crate::ui::Ui;
@@ -133,6 +133,20 @@ pub struct CHighlighter {
     /// Shared edit-buffer snapshot, updated on every repaint so that
     /// [`CEditMode`] can read both the text and cursor position.
     state: Arc<Mutex<EditState>>,
+    cache: Mutex<HighlightCache>,
+}
+
+#[derive(Default)]
+struct HighlightCache {
+    lines: Vec<HighlightedLine>,
+    #[cfg(test)]
+    parse_count: usize,
+}
+
+struct HighlightedLine {
+    text: String,
+    styled: StyledText,
+    state: (HighlightState, ParseState),
 }
 
 impl CHighlighter {
@@ -151,6 +165,7 @@ impl CHighlighter {
             theme,
             color,
             state,
+            cache: Mutex::new(HighlightCache::default()),
         }
     }
 }
@@ -240,6 +255,7 @@ impl Highlighter for CHighlighter {
         state.buffer.clear();
         state.buffer.push_str(line);
         state.cursor = cursor;
+        drop(state);
 
         let mut styled = StyledText::new();
         // Without color, or for a magic line (which is not C), emit one flat
@@ -253,13 +269,27 @@ impl Highlighter for CHighlighter {
             styled.push((NuStyle::new().fg(NuColor::Cyan), line.to_string()));
             return styled;
         }
-        // syntect highlights one physical line at a time; rejoin the lines
-        // with explicit newline segments so the painter still sees them.
-        for (i, physical) in line.split('\n').enumerate() {
-            if i > 0 {
-                styled.push((NuStyle::new(), "\n".to_string()));
-            }
-            let mut h = HighlightLines::new(&self.syntax, &self.theme);
+        // Preserve lexical state across physical lines. Reparse only from
+        // the first changed line; cursor movement reuses the whole cache.
+        let mut cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
+        let lines = line.split_inclusive('\n').collect::<Vec<_>>();
+        let unchanged = cache
+            .lines
+            .iter()
+            .zip(&lines)
+            .take_while(|(cached, text)| cached.text == **text)
+            .count();
+        cache.lines.truncate(unchanged);
+        for physical in lines.into_iter().skip(unchanged) {
+            let mut h = match cache.lines.last() {
+                Some(previous) => HighlightLines::from_state(
+                    &self.theme,
+                    previous.state.0.clone(),
+                    previous.state.1.clone(),
+                ),
+                None => HighlightLines::new(&self.syntax, &self.theme),
+            };
+            let mut rendered = StyledText::new();
             match h.highlight_line(physical, &self.syntaxes) {
                 Ok(ranges) => {
                     for (syn, text) in ranges {
@@ -278,11 +308,23 @@ impl Highlighter for CHighlighter {
                         } else {
                             NuStyle::new().fg(NuColor::Rgb(r, g, b))
                         };
-                        styled.push((style, text.to_string()));
+                        rendered.push((style, text.to_string()));
                     }
                 }
-                Err(_) => styled.push((NuStyle::new(), physical.to_string())),
+                Err(_) => rendered.push((NuStyle::new(), physical.to_string())),
             }
+            cache.lines.push(HighlightedLine {
+                text: physical.to_string(),
+                styled: rendered,
+                state: h.state(),
+            });
+            #[cfg(test)]
+            {
+                cache.parse_count += 1;
+            }
+        }
+        for cached in &cache.lines {
+            styled.buffer.extend(cached.styled.buffer.iter().cloned());
         }
         styled
     }
@@ -939,6 +981,57 @@ impl Prompt for CPrompt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiline_highlighting_preserves_comments_and_reuses_unchanged_lines() {
+        let highlighter = CHighlighter::new(true, Arc::new(Mutex::new(EditState::default())));
+        let source = "/* comment\nreturn 1;\n*/\nreturn 2;";
+        let rendered = highlighter.highlight(source, source.len());
+        assert_eq!(
+            rendered
+                .buffer
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<String>(),
+            source
+        );
+        let style_at = |offset: usize| {
+            let mut end = 0;
+            rendered
+                .buffer
+                .iter()
+                .find_map(|(style, text)| {
+                    let start = end;
+                    end += text.len();
+                    (offset >= start && offset < end).then_some(*style)
+                })
+                .unwrap()
+        };
+        assert_ne!(
+            style_at(source.find("return").unwrap()),
+            style_at(source.rfind("return").unwrap())
+        );
+        assert_eq!(highlighter.cache.lock().unwrap().parse_count, 4);
+        highlighter.highlight(source, 0);
+        assert_eq!(
+            highlighter.cache.lock().unwrap().parse_count,
+            4,
+            "cursor movement reparsed the buffer"
+        );
+        highlighter.highlight("/* comment\nreturn 1;\n*/\nreturn 3;", 0);
+        assert_eq!(
+            highlighter.cache.lock().unwrap().parse_count,
+            5,
+            "editing the last line reparsed its unchanged prefix"
+        );
+        let changed = highlighter.highlight("int value;\nreturn 1;\n*/\nreturn 3;", 0);
+        let fresh = CHighlighter::new(true, Arc::new(Mutex::new(EditState::default())))
+            .highlight("int value;\nreturn 1;\n*/\nreturn 3;", 0);
+        assert_eq!(
+            changed.buffer, fresh.buffer,
+            "editing a comment opener left stale syntax state"
+        );
+    }
     use reedline::IdeMenu;
 
     #[test]

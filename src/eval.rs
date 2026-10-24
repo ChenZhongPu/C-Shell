@@ -73,6 +73,22 @@ pub enum UnicodeEncoding {
     Utf32,
 }
 
+#[derive(Clone, Copy)]
+enum ExprPlan {
+    Normal,
+    Lvalue,
+    Scalar,
+    Array(usize),
+    Utf8,
+    Silent,
+}
+
+#[derive(Default)]
+struct ExprPlans {
+    revision: u64,
+    entries: std::collections::HashMap<(String, bool), ExprPlan>,
+}
+
 impl UnicodeEncoding {
     fn label(self) -> &'static str {
         match self {
@@ -104,6 +120,8 @@ impl UnicodeEncoding {
 }
 
 pub struct Evaluator {
+    #[cfg(test)]
+    compile_count: std::cell::Cell<usize>,
     pub tc: crate::toolchain::Toolchain,
     dir: tempfile::TempDir,
     pub timeout: Duration,
@@ -111,12 +129,15 @@ pub struct Evaluator {
     allow_program_stdin: bool,
     runtime_checks: Option<Checks>,
     check_cache: std::collections::HashMap<Request, std::result::Result<Checks, String>>,
+    expr_plans: std::cell::RefCell<ExprPlans>,
 }
 
 impl Evaluator {
     pub fn new(tc: crate::toolchain::Toolchain, timeout: Duration) -> Result<Self> {
         let dir = tempfile::tempdir().context(i18n::text("temp-dir-error"))?;
         Ok(Evaluator {
+            #[cfg(test)]
+            compile_count: std::cell::Cell::new(0),
             tc,
             dir,
             timeout,
@@ -124,6 +145,7 @@ impl Evaluator {
             allow_program_stdin: false,
             runtime_checks: None,
             check_cache: std::collections::HashMap::new(),
+            expr_plans: std::cell::RefCell::new(ExprPlans::default()),
         })
     }
 
@@ -153,6 +175,7 @@ impl Evaluator {
     pub fn set_toolchain(&mut self, tc: crate::toolchain::Toolchain) {
         self.tc = tc;
         self.check_cache.clear();
+        self.expr_plans.get_mut().entries.clear();
     }
 
     /// Check one input in a temporary instrumented evaluator. Neither valid
@@ -183,6 +206,11 @@ impl Evaluator {
     /// compiler (pathological macro expansion, compiler bug) must not freeze
     /// the REPL any more than a hung program may.
     fn compile_text(&self, text: &str) -> std::result::Result<(PathBuf, String), String> {
+        if proc::interrupted() {
+            return Err(i18n::text("program-interrupted"));
+        }
+        #[cfg(test)]
+        self.compile_count.set(self.compile_count.get() + 1);
         let src = self.src_path();
         let exe = self.exe_path();
         if let Err(e) = std::fs::write(&src, text) {
@@ -215,6 +243,9 @@ impl Evaluator {
                 &[("mib", (proc::MAX_CAPTURE_BYTES / (1024 * 1024)).to_string())],
             ));
             d.push('\n');
+        }
+        if cap.interrupted {
+            return Err(i18n::text("program-interrupted"));
         }
         match cap.status {
             Some(st) if st.success() => Ok((exe, d)),
@@ -375,6 +406,35 @@ impl Evaluator {
         input: &str,
         timed: bool,
     ) -> Result<std::result::Result<Outcome, String>> {
+        // Cache compiler-confirmed rendering strategies, never executables or
+        // values. Every query still recompiles and executes the current code.
+        // Explicit headers can change outside the session; leave those fresh.
+        let cacheable = !session.file_items().iter().any(|item| {
+            lex::contains_code_identifier(item, "include")
+                || lex::contains_code_identifier(item, "include_next")
+        });
+        let key = (input.to_string(), timed);
+        let cached = {
+            let mut plans = self.expr_plans.borrow_mut();
+            if plans.revision != session.revision() {
+                plans.entries.clear();
+                plans.revision = session.revision();
+            }
+            cacheable
+                .then(|| plans.entries.get(&key).copied())
+                .flatten()
+        };
+        if let Some(plan) = cached {
+            let program = self.expression_program(session, input, timed, plan);
+            if let Ok(mut outcome) = self.try_program(program, Slot::Expr, session.stdin_tape())? {
+                if matches!(plan, ExprPlan::Silent) {
+                    outcome.unprintable = true;
+                    outcome.value = None;
+                }
+                return Ok(Ok(outcome));
+            }
+            self.expr_plans.borrow_mut().entries.remove(&key);
+        }
         if looks_file_scope(input) {
             let normal = if timed {
                 codegen::build_timed(session, input, Slot::FileScope)
@@ -399,8 +459,8 @@ impl Evaluator {
             // replacing the matching item does; the compiler remains the name
             // and compatibility oracle. Preprocessor directives are not
             // candidates because dropping an #include is not rebinding.
-            for index in (0..session.file_items.len()).rev() {
-                if session.file_items[index].trim_start().starts_with('#') {
+            for index in (0..session.file_items().len()).rev() {
+                if session.file_items()[index].trim_start().starts_with('#') {
                     continue;
                 }
                 let prog = if timed {
@@ -431,7 +491,14 @@ impl Evaluator {
             {
                 let bounded = codegen::build_lvalue_expr(session, input, timed);
                 if let Ok(o) = self.try_program(bounded, slot, session.stdin_tape())? {
-                    return Ok(Ok(self.refine_array(session, input, o, timed)?));
+                    return self.finish_expression(
+                        session,
+                        input,
+                        o,
+                        timed,
+                        ExprPlan::Lvalue,
+                        cacheable,
+                    );
                 }
             }
             let normal = if timed {
@@ -441,7 +508,14 @@ impl Evaluator {
             };
             match self.try_program(normal, slot, session.stdin_tape())? {
                 Ok(o) if slot == Slot::Expr => {
-                    return Ok(Ok(self.refine_array(session, input, o, timed)?));
+                    return self.finish_expression(
+                        session,
+                        input,
+                        o,
+                        timed,
+                        ExprPlan::Normal,
+                        cacheable,
+                    );
                 }
                 Ok(o) => return Ok(Ok(o)),
                 Err(diag) if slot == Slot::Stmt => {
@@ -467,6 +541,9 @@ impl Evaluator {
                     // unbounded string printing a fallback for arrays.
                     let scalar = codegen::build_scalar_expr(session, input, timed);
                     if let Ok(o) = self.try_program(scalar, slot, session.stdin_tape())? {
+                        if cacheable {
+                            self.remember_plan(input, timed, ExprPlan::Scalar);
+                        }
                         return Ok(Ok(o));
                     }
                     expr_reported = Some(diag);
@@ -487,6 +564,9 @@ impl Evaluator {
             if let Ok(mut o) = self.try_program(prog, Slot::Expr, session.stdin_tape())? {
                 o.value = None;
                 o.unprintable = true;
+                if cacheable {
+                    self.remember_plan(input, timed, ExprPlan::Silent);
+                }
                 return Ok(Ok(o));
             }
         }
@@ -521,10 +601,11 @@ impl Evaluator {
         input: &str,
         outcome: Outcome,
         timed: bool,
-    ) -> Result<Outcome> {
+        initial: ExprPlan,
+    ) -> Result<(Outcome, ExprPlan)> {
         // Re-running the whole session must stay free of consequences.
         if outcome.abnormal.is_some() || session.must_replay(input) {
-            return Ok(outcome);
+            return Ok((outcome, initial));
         }
 
         // An explicit u8 literal is an array regardless of the language mode,
@@ -545,7 +626,7 @@ impl Evaluator {
                 && let Some(rendered) = candidate.value.as_deref().and_then(render_utf8_payload)
             {
                 candidate.value = Some(rendered);
-                return Ok(candidate);
+                return Ok((candidate, ExprPlan::Utf8));
             }
         }
 
@@ -554,10 +635,11 @@ impl Evaluator {
             .as_deref()
             .is_some_and(|v| v.starts_with("0x"));
         if !addressed {
-            return Ok(outcome);
+            return Ok((outcome, initial));
         }
 
         let mut best = outcome;
+        let mut plan = initial;
         for depth in 1..=MAX_ARRAY_DEPTH {
             let prog = if timed {
                 codegen::build_array_expr_timed(session, input, depth)
@@ -574,11 +656,60 @@ impl Evaluator {
             };
             let elements_unprintable = value.contains(UNPRINTABLE);
             best = candidate;
+            plan = ExprPlan::Array(depth);
             if !elements_unprintable {
                 break;
             }
         }
-        Ok(best)
+        Ok((best, plan))
+    }
+
+    fn remember_plan(&self, input: &str, timed: bool, plan: ExprPlan) {
+        let mut plans = self.expr_plans.borrow_mut();
+        if plans.entries.len() >= 256 {
+            plans.entries.clear();
+        }
+        plans.entries.insert((input.to_string(), timed), plan);
+    }
+
+    fn finish_expression(
+        &self,
+        session: &Session,
+        input: &str,
+        outcome: Outcome,
+        timed: bool,
+        initial: ExprPlan,
+        cacheable: bool,
+    ) -> Result<std::result::Result<Outcome, String>> {
+        let (outcome, plan) = self.refine_array(session, input, outcome, timed, initial)?;
+        // UTF-8 rendering depends on the current bytes, not just its type.
+        if cacheable && outcome.abnormal.is_none() && !session.is_explicit_utf8_array_expr(input) {
+            self.remember_plan(input, timed, plan);
+        }
+        Ok(Ok(outcome))
+    }
+
+    fn expression_program(
+        &self,
+        session: &Session,
+        input: &str,
+        timed: bool,
+        plan: ExprPlan,
+    ) -> codegen::Program {
+        match plan {
+            ExprPlan::Normal if timed => codegen::build_timed(session, input, Slot::Expr),
+            ExprPlan::Normal => codegen::build(session, input, Slot::Expr),
+            ExprPlan::Lvalue => codegen::build_lvalue_expr(session, input, timed),
+            ExprPlan::Scalar => codegen::build_scalar_expr(session, input, timed),
+            ExprPlan::Array(depth) if timed => {
+                codegen::build_array_expr_timed(session, input, depth)
+            }
+            ExprPlan::Array(depth) => codegen::build_array_expr(session, input, depth),
+            ExprPlan::Utf8 if timed => codegen::build_utf8_array_expr_timed(session, input),
+            ExprPlan::Utf8 => codegen::build_utf8_array_expr(session, input),
+            ExprPlan::Silent if timed => codegen::build_expr_probe_timed(session, input),
+            ExprPlan::Silent => codegen::build_expr_probe(session, input),
+        }
     }
 
     fn try_program(
@@ -711,7 +842,9 @@ impl Evaluator {
 
         let out = String::from_utf8_lossy(&cap.stdout).into_owned();
         let raw_err = String::from_utf8_lossy(&cap.stderr).into_owned();
-        let (err, stderr_report) = if self.runtime_checks.is_some() {
+        let (err, stderr_report) = if self.runtime_checks.is_some()
+            && cap.status.is_some_and(|status| !status.success())
+        {
             runtime_checks::split_stderr(&raw_err, &self.src_path().display().to_string())
         } else {
             (raw_err.as_str(), None)
@@ -734,17 +867,22 @@ impl Evaluator {
 
         let checked_failure = self.runtime_checks.is_some()
             && (runtime_report.is_some()
-                || runtime_checks::has_report(err)
                 || !cap.status.is_some_and(|status| status.success())
                 || !out_parts.done
                 || !err_parts.done
                 || cap.stdout_truncated
                 || cap.stderr_truncated
                 || cap.stdin_diverged);
-        let abnormal = if checked_failure {
+        let abnormal = if cap.interrupted {
+            Some(if self.runtime_checks.is_some() {
+                "Runtime check interrupted.".to_string()
+            } else {
+                i18n::text("program-interrupted")
+            })
+        } else if checked_failure {
             Some(if cap.status.is_none() {
                 format!("Runtime check timed out after {}s.", self.timeout.as_secs())
-            } else if runtime_report.is_some() || runtime_checks::has_report(err) {
+            } else if runtime_report.is_some() {
                 "Runtime check failed.".to_string()
             } else if cap.stdout_truncated || cap.stderr_truncated {
                 "Runtime check output exceeded the capture limit.".to_string()
@@ -800,6 +938,14 @@ impl Evaluator {
         } else {
             err_parts.output
         };
+
+        if self.stream_output && !checked_failure {
+            // A successful program may print a diagnostic-looking example.
+            // Restore the withheld bytes from the current input, without
+            // replay/protocol bytes or byte offsets into lossy UTF-8 strings.
+            let live = live.as_ref().expect("live output");
+            live.restore_stderr(&live.take_suppressed_stderr());
+        }
 
         let streamed_output_needs_newline = live
             .as_ref()
@@ -1607,6 +1753,27 @@ struct LiveStreams {
 }
 
 impl LiveStreams {
+    fn restore_stderr(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut terminal = self.terminal.lock().expect("terminal visibility");
+        let mut stderr = std::io::stderr().lock();
+        let _ = stderr.write_all(bytes);
+        let _ = stderr.flush();
+        terminal.record(bytes);
+    }
+    fn take_suppressed_stderr(&self) -> Vec<u8> {
+        self.stderr_report_filter
+            .as_ref()
+            .map(|filter| {
+                filter
+                    .lock()
+                    .expect("runtime stderr filter")
+                    .take_suppressed()
+            })
+            .unwrap_or_default()
+    }
     fn new(
         stream_visible: bool,
         stdin_requests: mpsc::Sender<proc::StdinRequest>,
@@ -1654,20 +1821,18 @@ impl LiveStreams {
                 }
             }),
             stderr: Arc::new(move |chunk| {
-                let filtered;
-                let chunk = if let Some(filter) = &stderr_report_filter {
-                    filtered = filter.lock().expect("runtime stderr filter").feed(chunk);
-                    filtered.as_slice()
-                } else {
-                    chunk
-                };
-                let (visible, requests) = {
+                // Always consume the raw protocol first. Diagnostic-looking
+                // user output must not hide stdin requests or completion.
+                let (mut visible, requests) = {
                     let mut filter = stderr.lock().expect("stderr filter");
                     let visible = filter.feed(chunk);
                     (visible, filter.take_stdin_requests())
                 };
                 for request in requests {
                     let _ = stderr_requests.send(request);
+                }
+                if let Some(filter) = &stderr_report_filter {
+                    visible = filter.lock().expect("runtime stderr filter").feed(&visible);
                 }
                 if stream_stderr && !visible.is_empty() {
                     let mut terminal = stderr_terminal.lock().expect("terminal visibility");
@@ -1681,12 +1846,11 @@ impl LiveStreams {
     }
 
     fn finish(&self) {
-        let mut err_tail = Vec::new();
+        let mut err_tail = self.stderr.lock().expect("stderr filter").finish();
         if let Some(filter) = &self.stderr_report_filter {
-            let tail = filter.lock().expect("runtime stderr filter").finish();
-            // The report filter keeps only a possible prefix. If no report
-            // followed it, return those ordinary bytes through the live filter.
-            err_tail.extend(self.stderr.lock().expect("stderr filter").feed(&tail));
+            let mut filter = filter.lock().expect("runtime stderr filter");
+            err_tail = filter.feed(&err_tail);
+            err_tail.extend(filter.finish());
         }
         let out_tail = self.stdout.lock().expect("stdout filter").finish();
         if self.stream_visible && !out_tail.is_empty() {
@@ -1696,7 +1860,6 @@ impl LiveStreams {
             let _ = out.flush();
             terminal.record(&out_tail);
         }
-        err_tail.extend(self.stderr.lock().expect("stderr filter").finish());
         if self.stream_visible && !err_tail.is_empty() {
             let mut terminal = self.terminal.lock().expect("terminal visibility");
             let mut err = std::io::stderr().lock();
@@ -1892,6 +2055,47 @@ fn looks_file_scope(input: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Developer benchmark: identical retained programs before/after changing
+    /// compilation strategies. Session setup is outside the measured query.
+    #[test]
+    #[ignore = "real-compiler performance measurement"]
+    fn benchmark_evaluation_strategies() {
+        let tc = crate::toolchain::Toolchain::detect(None, None).unwrap();
+        println!("compiler: {}", tc.version);
+        println!("history,target,cold_compiles,warm_compiles,median_ms");
+        for history in [0, 10, 100, 1000] {
+            let mut session = Session::default();
+            session.commit(
+                "int value = 42; int matrix[2][2] = {{1,2},{3,4}}; int *pointer = &matrix[0][0];",
+                Slot::Stmt,
+            );
+            for index in 0..history {
+                session.commit(&format!("int item_{index} = {index};"), Slot::Stmt);
+            }
+            for target in ["value", "pointer", "matrix"] {
+                let ev = Evaluator::new(tc.clone(), Duration::from_secs(15)).unwrap();
+                let mut samples = Vec::new();
+                let mut counts = Vec::new();
+                for _ in 0..3 {
+                    ev.compile_count.set(0);
+                    let start = std::time::Instant::now();
+                    let Eval::Done(outcome) = ev.eval(&session, target).unwrap() else {
+                        panic!("benchmark failed");
+                    };
+                    assert!(outcome.abnormal.is_none());
+                    std::hint::black_box(outcome.value);
+                    samples.push(start.elapsed().as_secs_f64() * 1000.0);
+                    counts.push(ev.compile_count.get());
+                }
+                samples.sort_by(f64::total_cmp);
+                println!(
+                    "{history},{target},{},{},{:.2}",
+                    counts[0], counts[2], samples[1]
+                );
+            }
+        }
+    }
 
     #[test]
     fn timeit_calibration_bounds_growth_and_honors_target_and_limit() {
@@ -2157,6 +2361,33 @@ mod tests {
         assert!(!terminal.needs_newline());
         terminal.record(b"partial again");
         assert!(terminal.needs_newline());
+    }
+
+    #[test]
+    fn runtime_report_filter_preserves_replay_and_current_stdin_requests() {
+        let (sender, receiver) = mpsc::channel();
+        let live = LiveStreams::new(false, sender, Some("/tmp/input.c".to_string()));
+        let observers = live.observers();
+        let wire = format!(
+            "{M_STDIN}{M_STDIN_DONE}{M_NEW}prefix\nexample.c:1:2: runtime error: demo\n{M_STDIN}after\n{M_STDIN_DONE}{M_DONE}"
+        );
+        for byte in wire.bytes() {
+            (observers.stderr)(&[byte]);
+        }
+        live.finish();
+        assert_eq!(
+            receiver.try_iter().collect::<Vec<_>>(),
+            [
+                proc::StdinRequest::Replay,
+                proc::StdinRequest::Finished,
+                proc::StdinRequest::Current,
+                proc::StdinRequest::Finished
+            ]
+        );
+        assert_eq!(
+            live.take_suppressed_stderr(),
+            b"example.c:1:2: runtime error: demo\nafter\n"
+        );
     }
 
     #[test]

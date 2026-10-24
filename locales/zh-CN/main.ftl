@@ -27,6 +27,7 @@ cli-more-info = 更多信息请尝试“--help”。
 startup-hint = 输入 C 代码进行求值 · 使用 %help 查看命令 · 按 Ctrl-D 退出
 web-launch-hint = 提示：可使用 `c-shell --web` 启动浏览器界面
 bye = 再见
+program-interrupted = 已中断
 web-listening = 浏览器终端：{$url}
 web-stop-hint = 仅限本机访问 · 按 Ctrl-C 停止
 web-open-failed = 无法自动打开默认浏览器；请手动打开上方网址

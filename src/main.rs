@@ -350,6 +350,7 @@ fn main() -> Result<std::process::ExitCode> {
         .with_ansi_colors(color);
 
     let mut edit_buffer: Option<String> = None;
+    let mut vocabulary_revision = session.revision();
     loop {
         let n = session.counter + 1;
         let prompt = editor::CPrompt { n };
@@ -372,7 +373,10 @@ fn main() -> Result<std::process::ExitCode> {
         // `%edit` itself consumes no input number. Its selected text becomes
         // the editable buffer at the same prompt on the next read_line call.
         edit_buffer = next_edit;
-        *idents.lock().expect("ident vocabulary") = session.identifiers();
+        if vocabulary_revision != session.revision() {
+            *idents.lock().expect("ident vocabulary") = session.identifiers();
+            vocabulary_revision = session.revision();
+        }
         if quit {
             break;
         }
@@ -455,6 +459,7 @@ fn submit(
     style: Style,
     interactive_edit: bool,
 ) -> Result<(bool, bool, Option<String>)> {
+    proc::begin_input();
     let raw = raw.trim();
     // Comment-only input is legal to type but has nothing to evaluate.
     if raw.is_empty() || lex::is_blank(raw) {
@@ -617,7 +622,7 @@ pub(crate) fn warn_external_replay(raw: &str, session: &Session, ui: &Ui, style:
     let bare = style == Style::Bare;
     let external_calls = lex::external_replay_calls(raw)
         .into_iter()
-        .filter(|name| name != "scanf")
+        .filter(|name| name != "scanf" && name != "getchar")
         .collect::<Vec<_>>();
     let external_warning = !external_calls.is_empty() && !session.external_replay_warning_shown();
     if external_warning {

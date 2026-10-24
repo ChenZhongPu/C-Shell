@@ -21,8 +21,11 @@
 //! line or one fresh parent-stdin line, and historical requests can never fall
 //! through to the real terminal.
 
-use std::io::{BufRead, Read, Write};
+#[cfg(unix)]
+use std::io::BufRead;
+use std::io::{Read, Write};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -32,6 +35,48 @@ use wait_timeout::ChildExt;
 /// Per stream. Readers continue draining after this so a noisy child cannot
 /// deadlock, but excess bytes are discarded rather than exhausting our heap.
 pub const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
+
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+pub fn begin_input() {
+    INTERRUPTED.store(false, Ordering::Relaxed);
+}
+pub fn interrupted() -> bool {
+    INTERRUPTED.load(Ordering::Relaxed)
+}
+
+fn install_interrupt_handler() {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        #[cfg(unix)]
+        unsafe {
+            extern "C" fn interrupt(_signal: libc::c_int) {
+                INTERRUPTED.store(true, Ordering::Relaxed);
+            }
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = interrupt as *const () as usize;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+        }
+        #[cfg(windows)]
+        unsafe {
+            unsafe extern "system" fn interrupt(event: u32) -> i32 {
+                if event == 0 || event == 1 {
+                    INTERRUPTED.store(true, Ordering::Relaxed);
+                    1
+                } else {
+                    0
+                }
+            }
+            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(interrupt), 1);
+        }
+    });
+}
 
 pub type ChunkSink = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
@@ -54,6 +99,7 @@ pub enum StdinRequest {
 }
 
 pub struct Captured {
+    pub interrupted: bool,
     /// `None` when the deadline expired and the process tree was killed.
     pub status: Option<ExitStatus>,
     pub stdout: Vec<u8>,
@@ -158,6 +204,7 @@ fn run_inner(
     input: ChildInput,
     observers: Option<Observers>,
 ) -> std::io::Result<Captured> {
+    install_interrupt_handler();
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     match &input {
         ChildInput::Null => cmd.stdin(Stdio::null()),
@@ -236,6 +283,18 @@ fn run_inner(
     let stdout = out_buf.lock().expect("reader buffer");
     let stderr = err_buf.lock().expect("reader buffer");
     Ok(Captured {
+        interrupted: interrupted()
+            || status.is_some_and(|status| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    status.signal() == Some(libc::SIGINT)
+                }
+                #[cfg(windows)]
+                {
+                    status.code().map(|code| code as u32) == Some(0xC000013A)
+                }
+            }),
         status,
         stdout: stdout.bytes.clone(),
         stderr: stderr.bytes.clone(),
@@ -253,14 +312,19 @@ fn wait_or_kill(child: &mut Child, timeout: Duration) -> std::io::Result<Option<
     }
 
     #[cfg(not(unix))]
-    match child.wait_timeout(timeout)? {
-        Some(status) => Ok(Some(status)),
-        None => {
-            // The group leader is still represented by this unreaped Child,
-            // so its pid/group id cannot have been recycled.
-            kill_tree(child);
-            let _ = child.wait();
-            Ok(None)
+    {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.wait_timeout(Duration::from_millis(5))? {
+                return Ok(Some(status));
+            }
+            if interrupted() || Instant::now() >= deadline {
+                // The group leader is still represented by this unreaped Child,
+                // so its pid/group id cannot have been recycled.
+                kill_tree(child);
+                let _ = child.wait();
+                return Ok(None);
+            }
         }
     }
 }
@@ -312,6 +376,81 @@ struct PendingInput {
     request: StdinRequest,
     supplied: bool,
     bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+struct ParentInput {
+    deferred: Vec<u8>,
+    #[cfg(windows)]
+    eof: bool,
+}
+
+// Like Rust's shared stdin buffer, read-ahead belongs to the parent stream,
+// not one generated process. In particular, a Windows pipe read may contain
+// several lines needed by later evaluations (including temporary checks).
+static PARENT_INPUT: std::sync::LazyLock<Mutex<ParentInput>> =
+    std::sync::LazyLock::new(Mutex::default);
+
+impl ParentInput {
+    fn defer(&mut self, mut bytes: Vec<u8>) {
+        bytes.append(&mut self.deferred);
+        self.deferred = bytes;
+    }
+
+    fn poll(&mut self, bytes: &mut Vec<u8>) -> std::io::Result<Option<StdinEvent>> {
+        bytes.append(&mut self.deferred);
+        if bytes.contains(&b'\n') {
+            return Ok(Some(self.line(bytes, false)));
+        }
+        #[cfg(unix)]
+        match std::io::stdin().lock().read_until(b'\n', bytes) {
+            Ok(read) => Ok(Some(
+                self.line(bytes, read == 0 || bytes.last() != Some(&b'\n')),
+            )),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+        #[cfg(windows)]
+        {
+            if self.eof {
+                return Ok(Some(self.line(bytes, true)));
+            }
+            match windows::read_ready_stdin()? {
+                None => Ok(None),
+                Some((incoming, eof)) => {
+                    bytes.extend(incoming);
+                    self.eof = eof;
+                    if eof || bytes.contains(&b'\n') {
+                        Ok(Some(self.line(bytes, eof)))
+                    } else {
+                        Ok(None)
+                    }
+                }
+            }
+        }
+    }
+
+    fn line(&mut self, bytes: &mut Vec<u8>, eof: bool) -> StdinEvent {
+        if let Some(end) = bytes.iter().position(|byte| *byte == b'\n') {
+            self.defer(bytes.split_off(end + 1));
+            StdinEvent {
+                bytes: std::mem::take(bytes),
+                eof: false,
+            }
+        } else {
+            StdinEvent {
+                bytes: std::mem::take(bytes),
+                eof,
+            }
+        }
+    }
 }
 
 struct Tape<'a> {
@@ -384,9 +523,15 @@ fn wait_with_stdin_tape(
         stdin: Some(stdin),
     };
     let mut pending: Option<PendingInput> = None;
+    let mut parent_input = PARENT_INPUT.lock().expect("parent stdin buffer");
     let mut deadline = Instant::now() + timeout;
     let mut exited = None;
     loop {
+        if interrupted() {
+            kill_tree(child);
+            let _ = child.wait();
+            return Ok((None, tape.recorded, tape.diverged));
+        }
         // Snapshot before draining so an exiting child cannot outrun its
         // stderr observer and make the final request disappear from the tape.
         let requests_complete = stderr_reader.is_finished();
@@ -399,10 +544,11 @@ fn wait_with_stdin_tape(
                 {
                     // libc completed using its own buffer. Retain the call
                     // boundary without consuming another parent-input line.
+                    parent_input.defer(input.bytes);
                     tape.supply(
                         input.request,
                         StdinEvent {
-                            bytes: input.bytes,
+                            bytes: Vec::new(),
                             eof: false,
                         },
                         false,
@@ -456,26 +602,15 @@ fn wait_with_stdin_tape(
                     eof: false,
                 })
             } else if allow_current && tape.stdin.is_some() {
-                match std::io::stdin().lock().read_until(b'\n', &mut input.bytes) {
-                    Ok(read) => {
+                match parent_input.poll(&mut input.bytes) {
+                    Ok(Some(event)) => {
                         // Only supplying fresh input restarts the execution
                         // deadline. Buffered calls and replay must not let an
                         // infinite scanf loop renew its timeout forever.
                         deadline = Instant::now() + timeout;
-                        let eof = read == 0 || input.bytes.last() != Some(&b'\n');
-                        Some(StdinEvent {
-                            bytes: std::mem::take(&mut input.bytes),
-                            eof,
-                        })
+                        Some(event)
                     }
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                        ) =>
-                    {
-                        None
-                    }
+                    Ok(None) => None,
                     Err(error) => {
                         kill_tree(child);
                         let _ = child.wait();
@@ -641,13 +776,117 @@ mod windows {
     use std::process::Child;
 
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType, ReadFile};
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetNumberOfConsoleInputEvents, GetStdHandle, INPUT_RECORD, KEY_EVENT,
+        PeekConsoleInputW, ReadConsoleW, STD_INPUT_HANDLE,
+    };
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
         SetInformationJobObject,
     };
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 
     pub struct Job(HANDLE);
+
+    /// Never enter a blocking line read just because a wrapped call emitted
+    /// its begin marker: libc may finish from its own buffer a moment later.
+    /// Console reads start only once Enter is queued; pipes read only bytes
+    /// reported ready by PeekNamedPipe. The caller accumulates partial lines.
+    pub fn read_ready_stdin() -> io::Result<Option<(Vec<u8>, bool)>> {
+        unsafe {
+            let handle = GetStdHandle(STD_INPUT_HANDLE);
+            let mut mode = 0;
+            if GetConsoleMode(handle, &mut mode) != 0 {
+                let mut count = 0;
+                if GetNumberOfConsoleInputEvents(handle, &mut count) == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if count == 0 {
+                    return Ok(None);
+                }
+                let mut records: Vec<INPUT_RECORD> = vec![std::mem::zeroed(); count as usize];
+                let mut read = 0;
+                if PeekConsoleInputW(handle, records.as_mut_ptr(), count, &mut read) == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let complete = records[..read as usize].iter().any(|record| {
+                    record.EventType == KEY_EVENT as u16
+                        && record.Event.KeyEvent.bKeyDown != 0
+                        && record.Event.KeyEvent.uChar.UnicodeChar == 13
+                });
+                if !complete {
+                    return Ok(None);
+                }
+                let mut line = Vec::new();
+                loop {
+                    let mut buffer = [0u16; 2048];
+                    let mut read = 0;
+                    if ReadConsoleW(
+                        handle,
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len() as u32,
+                        &mut read,
+                        std::ptr::null_mut(),
+                    ) == 0
+                    {
+                        if super::interrupted() {
+                            return Ok(None);
+                        }
+                        return Err(io::Error::last_os_error());
+                    }
+                    line.extend_from_slice(&buffer[..read as usize]);
+                    if read == 0 || line.last().is_some_and(|ch| *ch == 10 || *ch == 13) {
+                        break;
+                    }
+                }
+                if line.last() == Some(&13) {
+                    line.push(10);
+                }
+                let eof = line.is_empty();
+                return Ok(Some((String::from_utf16_lossy(&line).into_bytes(), eof)));
+            }
+            let mut available = 8192;
+            if GetFileType(handle) == FILE_TYPE_PIPE {
+                if PeekNamedPipe(
+                    handle,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                ) == 0
+                {
+                    let error = io::Error::last_os_error();
+                    if matches!(error.raw_os_error(), Some(109 | 233)) {
+                        return Ok(Some((Vec::new(), true)));
+                    }
+                    return Err(error);
+                }
+                if available == 0 {
+                    return Ok(None);
+                }
+            }
+            let mut buffer = vec![0u8; available.min(8192) as usize];
+            let mut read = 0;
+            if ReadFile(
+                handle,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+                &mut read,
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(109) {
+                    return Err(error);
+                }
+            }
+            buffer.truncate(read as usize);
+            Ok(Some((buffer, read == 0)))
+        }
+    }
 
     impl Job {
         pub fn attach(child: &Child) -> io::Result<Self> {
@@ -699,6 +938,11 @@ mod unix {
     pub fn wait_or_kill(child: &mut Child, timeout: Duration) -> io::Result<Option<ExitStatus>> {
         let deadline = Instant::now() + timeout;
         loop {
+            if super::interrupted() {
+                kill_group(child.id());
+                let _ = child.wait();
+                return Ok(None);
+            }
             if exited_unreaped(child.id())? {
                 kill_group(child.id());
                 return child.wait().map(Some);

@@ -3,15 +3,23 @@
 use crate::codegen::Slot;
 use crate::lex;
 use crate::proc::StdinEvent;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Default, Clone)]
 pub struct Session {
     /// `#include`s, `#define`s, function definitions, type definitions.
-    pub file_items: Vec<String>,
+    file_items: Vec<String>,
     /// Statements and block-scope declarations, in order, inside `main`.
     /// A literal `{` entry begins each compiler-approved shadowing epoch;
     /// codegen closes all such scopes after the newest input.
-    pub stmts: Vec<String>,
+    stmts: Vec<String>,
+    revision: u64,
+    names: BTreeMap<String, usize>,
+    macros: BTreeMap<String, usize>,
+    pure_functions: std::cell::OnceCell<BTreeSet<String>>,
     /// Number of captured stdin events associated with each `stmts` entry.
     /// The generated replay uses the flattened tape; `%src` uses these counts
     /// only to add redacted annotations at the right input boundary.
@@ -34,6 +42,40 @@ pub struct Session {
 }
 
 impl Session {
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub fn file_items(&self) -> &[String] {
+        &self.file_items
+    }
+    pub fn stmts(&self) -> &[String] {
+        &self.stmts
+    }
+
+    pub fn uses_stdin_tape(&self) -> bool {
+        lex::STDIN_APIS
+            .iter()
+            .any(|name| self.names.contains_key(*name))
+    }
+
+    fn changed(&mut self) {
+        self.revision = NEXT_REVISION.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn index(&mut self, text: &str, file: bool, insert: bool) {
+        for name in lex::identifiers(text)
+            .into_iter()
+            .filter(|name| name.len() >= 2)
+        {
+            update_count(&mut self.names, name, insert);
+        }
+        if file {
+            for name in lex::defined_macros(text) {
+                update_count(&mut self.macros, name, insert);
+            }
+            self.pure_functions.take();
+        }
+    }
     /// Record an input that compiled and ran.
     ///
     /// A pure expression is evaluated and forgotten: it asked a question
@@ -42,7 +84,9 @@ impl Session {
     pub fn commit(&mut self, text: &str, slot: Slot) {
         let stored = match slot {
             Slot::FileScope => {
+                self.index(text, true, true);
                 self.file_items.push(text.to_string());
+                self.changed();
                 return;
             }
             Slot::Stmt => text.to_string(),
@@ -53,21 +97,18 @@ impl Session {
             }
             Slot::Expr => return,
         };
+        self.index(&stored, false, true);
         self.stmts.push(indent(&stored));
         self.stmt_stdin_events.push(0);
+        self.changed();
     }
 
     /// Macro expansion can hide both calls and mutations from the lexical
     /// heuristic. Treat any retained macro reference conservatively.
     pub fn references_macro(&self, text: &str) -> bool {
-        let names = self
-            .file_items
-            .iter()
-            .flat_map(|item| lex::defined_macros(item))
-            .collect::<std::collections::BTreeSet<_>>();
         lex::identifiers(text)
             .iter()
-            .any(|name| names.contains(name))
+            .any(|name| self.macros.contains_key(name))
     }
 
     pub fn must_replay(&self, text: &str) -> bool {
@@ -89,17 +130,22 @@ impl Session {
     /// Every later statement remains in that block until codegen closes it at
     /// the end of `main`, giving C shadowing the shape of REPL rebinding.
     pub fn commit_scoped(&mut self, text: &str) {
+        self.index(text, false, true);
         self.stmts.push(indent("{"));
         self.stmt_stdin_events.push(0);
         self.stmts.push(indent(text));
         self.stmt_stdin_events.push(0);
         self.scope_depth += 1;
+        self.changed();
     }
 
     /// Replace a compiler-selected file-scope item in place. Keeping its index
     /// preserves declaration order for older functions/types that refer to it.
     pub fn replace_file(&mut self, index: usize, text: &str) {
-        self.file_items[index] = text.to_string();
+        let old = std::mem::replace(&mut self.file_items[index], text.to_string());
+        self.index(&old, true, false);
+        self.index(text, true, true);
+        self.changed();
     }
 
     /// Attach fresh program-input lines to the state-changing input that was
@@ -115,6 +161,7 @@ impl Session {
             .last_mut()
             .expect("stdin input must change state") += count;
         self.stdin_tape.extend(events);
+        self.changed();
     }
 
     pub fn stdin_tape(&self) -> &[StdinEvent] {
@@ -150,34 +197,37 @@ impl Session {
         if self.references_macro(source) {
             return true;
         }
-        let functions = self
-            .file_items
-            .iter()
-            .filter_map(|item| lex::function_definition(item))
-            .collect::<Vec<_>>();
-        let mut pure = functions
-            .iter()
-            .map(|(name, _)| *name)
-            .collect::<std::collections::BTreeSet<_>>();
-
-        loop {
-            let impure = functions
+        let pure = self.pure_functions.get_or_init(|| {
+            let functions = self
+                .file_items
                 .iter()
-                .filter_map(|(name, body)| {
-                    (self.references_macro(body)
-                        || lex::may_have_side_effects_with_pure_calls(body, |called| {
-                            pure.contains(called)
-                        }))
-                    .then_some(*name)
-                })
+                .filter_map(|item| lex::function_definition(item))
                 .collect::<Vec<_>>();
-            let old_len = pure.len();
-            pure.retain(|name| !impure.contains(name));
-            if pure.len() == old_len {
-                break;
-            }
-        }
+            let mut pure = functions
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<std::collections::BTreeSet<_>>();
 
+            loop {
+                let impure = functions
+                    .iter()
+                    .filter_map(|(name, body)| {
+                        (self.references_macro(body)
+                            || lex::may_have_side_effects_with_pure_calls(body, |called| {
+                                pure.contains(called)
+                            }))
+                        .then_some(*name)
+                    })
+                    .collect::<Vec<_>>();
+                let old_len = pure.len();
+                pure.retain(|name| !impure.contains(name));
+                if pure.len() == old_len {
+                    break;
+                }
+            }
+
+            pure.into_iter().map(str::to_string).collect()
+        });
         lex::may_have_side_effects_with_pure_calls(source, |called| pure.contains(called))
     }
 
@@ -211,15 +261,7 @@ impl Session {
     /// the completion vocabulary. Single letters are omitted: offering `x`
     /// as a completion of `x` helps nobody.
     pub fn identifiers(&self) -> Vec<String> {
-        let mut seen = std::collections::BTreeSet::new();
-        for text in self.file_items.iter().chain(self.stmts.iter()) {
-            for w in lex::identifiers(text) {
-                if w.len() >= 2 {
-                    seen.insert(w);
-                }
-            }
-        }
-        seen.into_iter().collect()
+        self.names.keys().cloned().collect()
     }
 
     pub fn reset(&mut self) {
@@ -231,6 +273,21 @@ impl Session {
         self.counter = 0;
         self.inputs.clear();
         self.external_replay_warning_shown = false;
+        self.names.clear();
+        self.macros.clear();
+        self.pure_functions.take();
+        self.changed();
+    }
+}
+
+fn update_count(index: &mut BTreeMap<String, usize>, name: String, insert: bool) {
+    if insert {
+        *index.entry(name).or_default() += 1;
+    } else if let Some(count) = index.get_mut(&name) {
+        *count -= 1;
+        if *count == 0 {
+            index.remove(&name);
+        }
     }
 }
 
@@ -244,6 +301,42 @@ fn indent(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incremental_indexes_follow_replacement_shadowing_and_reset() {
+        let mut session = Session::default();
+        session.commit("#define OLD_MACRO shared_name", Slot::FileScope);
+        session.commit("int shared_name = 1;", Slot::Stmt);
+        let before = session.revision();
+        session.replace_file(0, "#define NEW_MACRO other_name");
+        assert_ne!(before, session.revision());
+        assert!(!session.references_macro("OLD_MACRO"));
+        assert!(session.references_macro("NEW_MACRO"));
+        assert!(session.identifiers().contains(&"shared_name".to_string()));
+        assert!(!session.identifiers().contains(&"OLD_MACRO".to_string()));
+        session.commit_scoped("int inner_name = 2;");
+        let expected = session
+            .file_items
+            .iter()
+            .chain(session.stmts.iter())
+            .flat_map(|source| lex::identifiers(source))
+            .filter(|name| name.len() >= 2)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(session.identifiers(), expected);
+        let mut branch = session.clone();
+        session.commit("int left = 1;", Slot::Stmt);
+        branch.commit("int right = 1;", Slot::Stmt);
+        assert_ne!(
+            session.revision(),
+            branch.revision(),
+            "divergent cloned sessions shared a cache revision"
+        );
+        session.reset();
+        assert!(session.identifiers().is_empty());
+        assert!(!session.references_macro("NEW_MACRO"));
+    }
 
     #[test]
     fn numbered_inputs_are_available_until_reset() {
