@@ -87,12 +87,12 @@ impl WebTerminal {
         {
             assert!(
                 std::time::Instant::now() < deadline,
-                "missing {needle}: {}",
+                "missing {needle:?}: {}",
                 String::from_utf8_lossy(&self.transcript)
             );
             match self.socket.read().unwrap_or_else(|error| {
                 panic!(
-                    "{error}; missing {needle}: {}",
+                    "{error}; missing {needle:?}: {}",
                     String::from_utf8_lossy(&self.transcript)
                 )
             }) {
@@ -102,7 +102,7 @@ impl WebTerminal {
                     self.socket.send(WebSocketMessage::Pong(bytes)).unwrap()
                 }
                 WebSocketMessage::Close(_) => panic!(
-                    "terminal closed before {needle}: {}",
+                    "terminal closed before {needle:?}: {}",
                     String::from_utf8_lossy(&self.transcript)
                 ),
                 _ => {}
@@ -119,10 +119,40 @@ impl WebTerminal {
         }
     }
 
-    fn evaluate(&mut self, code: &str, expected: &str) {
+    fn after(&self, from: usize, text: &str) -> usize {
+        let crlf = text.replace('\n', "\r\n");
+        [text.as_bytes(), crlf.as_bytes()]
+            .into_iter()
+            .filter_map(|needle| {
+                self.transcript[from..]
+                    .windows(needle.len())
+                    .rposition(|bytes| bytes == needle)
+                    .map(|index| from + index + needle.len())
+            })
+            .max()
+            .expect("observed terminal text")
+    }
+
+    fn until_painted(&mut self, from: usize, text: &str) {
+        self.until(from, text);
+        let text_end = self.after(from, text);
+        // Reedline finishes a repaint by restoring cursor visibility. Wait
+        // for the complete paint before typing; merely seeing the prompt can
+        // leave input queued while the previous read_line is still exiting.
+        // Cursor-position queries (ESC[6n) are Unix-only and are not a barrier
+        // on Windows, where crossterm queries the console API directly.
+        self.until(text_end, "\x1b[?25h");
+    }
+
+    fn prompt(&mut self, from: usize, number: usize) {
+        self.until_painted(from, &format!("In [{number}]:"));
+    }
+
+    fn evaluate(&mut self, code: &str, expected: &str) -> usize {
         let start = self.transcript.len();
         self.send(format!("{code}\r").as_bytes());
         self.until(start, expected);
+        self.after(start, expected)
     }
 }
 
@@ -189,18 +219,15 @@ fn interactive_terminal_recovers_from_interrupts_in_edit_compile_run_and_input()
     );
     assert_eq!(String::from_utf8_lossy(&preflight.stdout), "2\n");
     let mut terminal = WebTerminal::start(&mut make_command());
-    terminal.until(0, "In [1]:");
+    terminal.prompt(0, 1);
     let editing = terminal.transcript.len();
-    terminal.send(b"int discarded = 1\x03");
-    terminal.until(editing, "\x1b[6n");
-    let query = editing
-        + terminal.transcript[editing..]
-            .windows(4)
-            .rposition(|bytes| bytes == b"\x1b[6n")
-            .unwrap();
-    terminal.until(query + 4, "In [1]:");
-    terminal.evaluate("1 + 1", "Out[1]: 2");
-    terminal.until(0, "In [2]:");
+    terminal.send(b"int discarded = 1");
+    terminal.until_painted(editing, "int discarded = 1");
+    let cancelled = terminal.transcript.len();
+    terminal.send(b"\x03");
+    terminal.prompt(cancelled, 1);
+    let start = terminal.evaluate("1 + 1", "Out[1]: 2");
+    terminal.prompt(start, 2);
 
     std::fs::write(&trigger, "slow").unwrap();
     terminal.send(b"2 + 2\r");
@@ -216,9 +243,9 @@ fn interactive_terminal_recovers_from_interrupts_in_edit_compile_run_and_input()
     let start = terminal.transcript.len();
     terminal.send(b"\x03");
     terminal.until(start, "interrupted");
-    terminal.until(start, "In [3]:");
-    terminal.evaluate("3 + 3", "Out[3]: 6");
-    terminal.until(0, "In [4]:");
+    terminal.prompt(start, 3);
+    let start = terminal.evaluate("3 + 3", "Out[3]: 6");
+    terminal.prompt(start, 4);
 
     terminal.evaluate(
         "{ puts(\"loop-ready\"); fflush(stdout); for (;;) {} }",
@@ -226,9 +253,9 @@ fn interactive_terminal_recovers_from_interrupts_in_edit_compile_run_and_input()
     );
     let start = terminal.transcript.len();
     terminal.send(b"\x03");
-    terminal.until(start, "In [5]:");
-    terminal.evaluate("40 + 2", "Out[5]: 42");
-    terminal.until(0, "In [6]:");
+    terminal.prompt(start, 5);
+    let start = terminal.evaluate("40 + 2", "Out[5]: 42");
+    terminal.prompt(start, 6);
 
     terminal.evaluate(
         "{ int value; fputs(\"input-ready\\n\", stderr); fflush(stderr); scanf(\"%d\", &value); }",
@@ -236,29 +263,32 @@ fn interactive_terminal_recovers_from_interrupts_in_edit_compile_run_and_input()
     );
     let start = terminal.transcript.len();
     terminal.send(b"\x03");
-    terminal.until(start, "In [7]:");
-    terminal.evaluate("6 * 7", "Out[7]: 42");
-    terminal.until(0, "In [8]:");
-    terminal.evaluate("char text[16];", "In [9]:");
-    terminal.evaluate(
+    terminal.prompt(start, 7);
+    let start = terminal.evaluate("6 * 7", "Out[7]: 42");
+    terminal.prompt(start, 8);
+    let start = terminal.transcript.len();
+    terminal.send(b"char text[16];\r");
+    terminal.prompt(start, 9);
+    let start = terminal.evaluate(
         "fputs(\"line-ready\\n\", stderr); fflush(stderr); fgets(text, sizeof text, stdin);",
         "line-ready\n",
     );
     terminal.send(b"hello\r");
-    terminal.until(0, "In [10]:");
-    terminal.evaluate("text", "Out[10]: \"hello\\n\"");
-    terminal.until(0, "In [11]:");
-    terminal.evaluate(
+    terminal.prompt(start, 10);
+    let start = terminal.evaluate("text", "Out[10]: \"hello\\n\"");
+    terminal.prompt(start, 11);
+    let start = terminal.evaluate(
         "%check fprintf(stderr, \"runtime error: demo\\n\");",
         "runtime error: demo\n",
     );
+    terminal.prompt(start, 11);
     let start = terminal.transcript.len();
-    terminal.evaluate(
+    let output_end = terminal.evaluate(
         "%check fprintf(stderr, \"example.c:1:2: runtime error: demo\\n\");",
         "example.c:1:2: runtime error: demo\n",
     );
     assert!(!String::from_utf8_lossy(&terminal.transcript[start..]).contains("Runtime check:"));
-    terminal.until(start, "In [11]:");
+    terminal.prompt(output_end, 11);
     let start = terminal.transcript.len();
     terminal.evaluate(
         "%check { int n = 0; fprintf(stderr, \"example.c:1:2: runtime error: demo\\n\"); puts(\"checked-input-ready\"); fflush(stdout); scanf(\"%d\", &n); printf(\"read=%d\\n\", n); }",
@@ -267,7 +297,8 @@ fn interactive_terminal_recovers_from_interrupts_in_edit_compile_run_and_input()
     terminal.send(b"42\r");
     terminal.until(start, "read=42\n");
     terminal.until(start, "example.c:1:2: runtime error: demo\n");
-    terminal.until(start, "In [11]:");
+    let output_end = terminal.after(start, "example.c:1:2: runtime error: demo\n");
+    terminal.prompt(output_end, 11);
     let current = String::from_utf8_lossy(&terminal.transcript[start..]).replace("\r\n", "\n");
     assert_eq!(
         current
