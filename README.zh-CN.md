@@ -98,7 +98,9 @@ c-shell 会把当前输入与会话状态重新组装成完整 C 程序，然后
 
 构建需要 Rust 工具链；运行时需要 GNU GCC、LLVM Clang 或 Apple Clang。
 Windows 上请使用 WinLibs GCC（或其他 MinGW-w64 GCC），并将其 `bin` 目录
-加入 `PATH`；不支持 MSVC。其他编译器不在当前支持和测试范围内。
+加入 `PATH`；不支持 MSVC。WinLibs 随附的 `clang` 同样以 MinGW-w64 为目标，
+可通过同一套 GNU 风格命令行使用，但 Windows CI 目前只覆盖 GCC；不支持
+`clang-cl`。其他编译器不在当前支持和测试范围内。
 
 从 crates.io 安装：
 
