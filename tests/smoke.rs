@@ -1,9 +1,9 @@
 //! End-to-end smoke tests: drive the real binary against the real C compiler.
 //!
 //! The unit tests are all pure functions, so this file is the only place the
-//! toolchain detection, MSVC flag dialect, crash isolation and value printing
-//! actually get exercised. In CI it runs on Linux (gcc/clang), macOS (clang) and
-//! Windows (CL), which is precisely the coverage a dev machine
+//! toolchain detection, GNU flag dialect, crash isolation and value printing
+//! actually get exercised. In CI it runs on Linux (gcc/clang), macOS (clang)
+//! and Windows (WinLibs GCC), which is precisely the coverage a dev machine
 //! cannot provide.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -168,7 +168,7 @@ impl Drop for WebTerminal {
 fn interactive_terminal_recovers_from_interrupts_in_edit_compile_run_and_input() {
     let dir = tempfile::tempdir().unwrap();
     let wrapper = dir.path().join(if cfg!(windows) {
-        "cl.cmd"
+        "cc.cmd"
     } else {
         "cc-interrupt"
     });
@@ -187,7 +187,7 @@ fn interactive_terminal_recovers_from_interrupts_in_edit_compile_run_and_input()
     }
     let compiler_name = std::env::var_os("CC").unwrap_or_else(|| {
         if cfg!(windows) {
-            "cl".into()
+            "gcc".into()
         } else {
             "cc".into()
         }
@@ -277,37 +277,43 @@ fn interactive_terminal_recovers_from_interrupts_in_edit_compile_run_and_input()
     terminal.prompt(start, 10);
     let start = terminal.evaluate("text", "Out[10]: \"hello\\n\"");
     terminal.prompt(start, 11);
-    let start = terminal.evaluate(
-        "%check fprintf(stderr, \"runtime error: demo\\n\");",
-        "runtime error: demo\n",
-    );
-    terminal.prompt(start, 11);
-    let start = terminal.transcript.len();
-    let output_end = terminal.evaluate(
-        "%check fprintf(stderr, \"example.c:1:2: runtime error: demo\\n\");",
-        "example.c:1:2: runtime error: demo\n",
-    );
-    assert!(!String::from_utf8_lossy(&terminal.transcript[start..]).contains("Runtime check:"));
-    terminal.prompt(output_end, 11);
-    let start = terminal.transcript.len();
-    terminal.evaluate(
-        "%check { int n = 0; fprintf(stderr, \"example.c:1:2: runtime error: demo\\n\"); puts(\"checked-input-ready\"); fflush(stdout); scanf(\"%d\", &n); printf(\"read=%d\\n\", n); }",
-        "checked-input-ready\n",
-    );
-    terminal.send(b"42\r");
-    terminal.until(start, "read=42\n");
-    terminal.until(start, "example.c:1:2: runtime error: demo\n");
-    let output_end = terminal.after(start, "example.c:1:2: runtime error: demo\n");
-    terminal.prompt(output_end, 11);
-    let current = String::from_utf8_lossy(&terminal.transcript[start..]).replace("\r\n", "\n");
-    assert_eq!(
-        current
-            .matches("example.c:1:2: runtime error: demo\n")
-            .count(),
-        1,
-        "{current}"
-    );
-    assert!(!current.contains("Runtime check:"), "{current}");
+    // WinLibs GCC ships no ASan/UBSan runtime, so the checked-input portion
+    // only runs where %check can actually select a backend.
+    let checks_available =
+        !runtime_check_unavailable(&runtime_check_output("en", &["%check 1 + 1"]));
+    if checks_available {
+        let start = terminal.evaluate(
+            "%check fprintf(stderr, \"runtime error: demo\\n\");",
+            "runtime error: demo\n",
+        );
+        terminal.prompt(start, 11);
+        let start = terminal.transcript.len();
+        let output_end = terminal.evaluate(
+            "%check fprintf(stderr, \"example.c:1:2: runtime error: demo\\n\");",
+            "example.c:1:2: runtime error: demo\n",
+        );
+        assert!(!String::from_utf8_lossy(&terminal.transcript[start..]).contains("Runtime check:"));
+        terminal.prompt(output_end, 11);
+        let start = terminal.transcript.len();
+        terminal.evaluate(
+            "%check { int n = 0; fprintf(stderr, \"example.c:1:2: runtime error: demo\\n\"); puts(\"checked-input-ready\"); fflush(stdout); scanf(\"%d\", &n); printf(\"read=%d\\n\", n); }",
+            "checked-input-ready\n",
+        );
+        terminal.send(b"42\r");
+        terminal.until(start, "read=42\n");
+        terminal.until(start, "example.c:1:2: runtime error: demo\n");
+        let output_end = terminal.after(start, "example.c:1:2: runtime error: demo\n");
+        terminal.prompt(output_end, 11);
+        let current = String::from_utf8_lossy(&terminal.transcript[start..]).replace("\r\n", "\n");
+        assert_eq!(
+            current
+                .matches("example.c:1:2: runtime error: demo\n")
+                .count(),
+            1,
+            "{current}"
+        );
+        assert!(!current.contains("Runtime check:"), "{current}");
+    }
     std::thread::sleep(Duration::from_millis(2100));
     assert!(
         !survived.exists(),
@@ -669,7 +675,7 @@ fn explicit_u8_literals_get_a_safe_utf8_preview_only() {
     // ordinary string printer. The explicit-source probe must still refine it
     // into validated UTF-8 rather than depending on an address-shaped result.
     // Invalid UTF-8 payload fallback is tested below the C compiler boundary:
-    // Clang/MSVC may reject deliberately malformed u8 literals as source.
+    // Clang may reject deliberately malformed u8 literals as source.
     // A universal character name asks every compiler to encode the character;
     // spelling its UTF-8 bytes as \xF0... is not portable before C23.
     let out = run(&[
@@ -994,10 +1000,10 @@ fn real_warnings_still_show() {
     // The comparison must go through *variables*: on a constant expression
     // like `-1 > 0u` clang folds and deliberately stays silent, and this
     // test's job is to pass on every compiler family. gcc and clang warn
-    // via -Wsign-compare, MSVC via C4018 — all within default levels.
+    // via -Wsign-compare, all within default levels.
     let out = run(&["int neg = -1;", "unsigned pos = 0;", "neg > pos"]);
     assert!(
-        out.contains("warning") || out.contains("C4018"),
+        out.contains("warning"),
         "sign-compare warning disappeared:\n{out}"
     );
 }
@@ -1875,7 +1881,7 @@ fn c23_digit_separators_do_not_join_independent_batch_inputs() {
         .args(["--std", "c23", "-e", "1'000"])
         .output()
         .unwrap();
-    // The host must implement this C23 feature (MSVC may not do so yet).
+    // The host must implement this C23 feature.
     if !probe.status.success() {
         return;
     }

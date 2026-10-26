@@ -60,9 +60,9 @@ fn pty_command(executable: &std::path::Path, config: &Config) -> CommandBuilder 
     #[cfg(windows)]
     {
         // portable-pty 0.9 overlays the process environment with registry
-        // values on Windows, replacing the Developer Command Prompt PATH.
-        // Preserve the caller's complete environment, including CL's SDK,
-        // include/library settings and dynamically configured tool paths.
+        // values on Windows, replacing the PATH that points at the configured
+        // MinGW-w64 toolchain. Preserve the caller's complete environment,
+        // including compiler paths and dynamically configured tools.
         command.env_clear();
         for (key, value) in std::env::vars_os() {
             command.env(key, value);

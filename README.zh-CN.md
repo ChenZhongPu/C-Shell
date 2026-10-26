@@ -67,8 +67,8 @@ Out[5]: 1
 
 ## 主要特点
 
-- **由你的编译器给出答案。** GNU GCC、LLVM Clang、Apple Clang 和 MSVC
-  决定语言规则、ABI 行为、警告与错误。
+- **由你的编译器给出答案。** GNU GCC（Windows 上为 WinLibs）、LLVM Clang
+  和 Apple Clang 决定语言规则、ABI 行为、警告与错误。
 - **有状态的 C 会话。** 声明、语句、函数和类型可供后续输入使用，同时保留
   C 本身的作用域规则。
 - **适合交互输入。** 提供语法高亮、补全、会话内历史、智能续行缩进、右花括号
@@ -82,7 +82,7 @@ Out[5]: 1
   标准版本信息。
 - **终端、浏览器与批处理输入。** 可直接使用 REPL，也可在本机浏览器中获得相同的
   PTY 交互体验，或使用 `-e`、文件重定向和管道输入，并获得确定的退出状态。
-- **跨平台编译器驱动。** 通过能力探测识别 GNU 风格与 MSVC 风格的命令行，
+- **跨平台编译器驱动。** 通过能力探测识别 GNU 风格的命令行，
   不依赖可执行文件名称猜测。
 
 ## 为什么使用真实编译器？
@@ -96,8 +96,9 @@ c-shell 会把当前输入与会话状态重新组装成完整 C 程序，然后
 
 ## 安装
 
-构建需要 Rust 工具链；运行时需要 GNU GCC、LLVM Clang、Apple Clang 或
-MSVC。其他编译器不在当前支持和测试范围内。
+构建需要 Rust 工具链；运行时需要 GNU GCC、LLVM Clang 或 Apple Clang。
+Windows 上请使用 WinLibs GCC（或其他 MinGW-w64 GCC），并将其 `bin` 目录
+加入 `PATH`；不支持 MSVC。其他编译器不在当前支持和测试范围内。
 
 从 crates.io 安装：
 
@@ -113,7 +114,7 @@ cargo install --path .
 
 使用 `--cc` 时只尝试指定的编译器。否则，c-shell 会先检查 `$CC`，再检查
 PATH：Unix 上依次尝试 `cc`、`gcc`、`clang`；Windows 上尝试 `gcc`、
-`clang`、`cc`、`clang-cl`、`cl`。
+`clang`、`cc`。
 
 `--cc` 和 `$CC` 必须是单个可执行文件名称或路径，不能是包含参数的 Shell
 命令。c-shell 会通过实际编译探测能力，而不是从版本字符串推断。例如 macOS
@@ -196,8 +197,7 @@ c-shell 会生成自己的 `main`，用于承载会话局部变量和值输出�
 include 块。
 
 Unix 构建会链接 `-lm`；Windows 数学函数来自 C 运行库。GNU 风格的
-GCC/Clang 驱动使用 `-Wall -Wextra`，MSVC 风格的 `cl`/`clang-cl`
-使用 `/W3`。
+GCC/Clang 驱动使用 `-Wall -Wextra`。
 
 ### 重复声明与重新定义
 
@@ -232,7 +232,7 @@ Out[4]: 9
 ```
 
 旧定义会在原位置被替换，以保持声明顺序。形似函数的输入绝不会被降级到
-`main` 内部，这可以避免 GCC 嵌套函数扩展产生 Clang 或 MSVC 无法解释的会话。
+`main` 内部，这可以避免 GCC 嵌套函数扩展产生 Clang 无法解释的会话。
 `%reset` 会清除整个会话。
 
 ### Magic 命令
@@ -472,7 +472,7 @@ Tab 会补全 Magic 命令、C 关键字、常用标准库名称，以及长度�
 ## 工作原理
 
 c-shell 会重新组装会话，并把完整 C 文件交给真实宿主编译器
-（GNU GCC、LLVM/Apple Clang 或 MSVC）。
+（GNU GCC，Windows 上为 WinLibs；或 LLVM/Apple Clang）。
 
 直接调用的 `scanf`、`getchar`、`getc(stdin)`、`fgetc(stdin)` 和
 `fgets(..., stdin)` 会在重放时复用输入记录。字符串与字符的值预览会转义

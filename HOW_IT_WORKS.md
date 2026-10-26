@@ -16,7 +16,7 @@ single Windows pipe read available to subsequent inputs. Reset still discards
 the session's replay tape; it does not discard unread bytes from the stream.
 
 ### 3. Trial Compilation & Classification
-A lexical heuristic routes function definitions, preprocessor directives, typedefs and tag definitions to file scope; these inputs are never demoted into `main`, which prevents GCC from silently accepting a nested function that Clang/MSVC reject. The compiler arbitrates expression-versus-statement cases, but an input whose final code token is `;` goes directly to the statement slot rather than launching an expression compile that cannot succeed. Clearly braced statements ending in `}` do the same; possible compound literals such as `(int){7}` retain expression classification. After a redeclaration diagnostic, alternate nested-scope or in-place replacement assemblies must compile as complete programs before c-shell accepts them. File scope remains unavailable as a general fallback.
+A lexical heuristic routes function definitions, preprocessor directives, typedefs and tag definitions to file scope; these inputs are never demoted into `main`, which prevents GCC from silently accepting a nested function that Clang rejects. The compiler arbitrates expression-versus-statement cases, but an input whose final code token is `;` goes directly to the statement slot rather than launching an expression compile that cannot succeed. Clearly braced statements ending in `}` do the same; possible compound literals such as `(int){7}` retain expression classification. After a redeclaration diagnostic, alternate nested-scope or in-place replacement assemblies must compile as complete programs before c-shell accepts them. File scope remains unavailable as a general fallback.
 
 ### 4. Value Printing Mechanics
 `_Generic` selects a print *function*, which is then called — selecting a call expression instead would type-check every unselected branch against the wrong argument type and fail to compile. Session-visible named structs and simple anonymous struct typedefs get recursive printers whose output uses designated-initializer form:
@@ -44,7 +44,7 @@ In [6]: ptr
 Out[6]: 0x7ffd2f8c4a10
 ```
 
-Element counts come from `sizeof`, so no declarator is parsed and a genuine pointer keeps printing as an address. `char text[] = "hi"` still prints `"hi"`, but character-array previews stop at the array's `sizeof` bound even when no NUL terminator is present. GNU/Clang obtain that bound through unevaluated type inspection; MSVC uses a compiler-validated addressable-expression wrapper with a complete, sized character-array pointer association; an unspecified-size array association does not reliably match fixed arrays there. Actual `char *` values retain the ordinary NUL-terminated string behavior. Beyond 100 elements the rest are summarized as `... (n more)`. Nesting is the one static property this cannot recover at run time, so arrays deeper than two dimensions, and arrays whose elements have no printer of their own (an array of pointers, for instance), show `<unprintable>` elements rather than a guess.
+Element counts come from `sizeof`, so no declarator is parsed and a genuine pointer keeps printing as an address. `char text[] = "hi"` still prints `"hi"`, but character-array previews stop at the array's `sizeof` bound even when no NUL terminator is present. GNU/Clang obtain that bound through unevaluated type inspection. Actual `char *` values retain the ordinary NUL-terminated string behavior. Beyond 100 elements the rest are summarized as `... (n more)`. Nesting is the one static property this cannot recover at run time, so arrays deeper than two dimensions, and arrays whose elements have no printer of their own (an array of pointers, for instance), show `<unprintable>` elements rather than a guess.
 
 Struct-member formatting never treats `char *` as a string: every pointer member is `NULL` or an address, fixed arrays are traversed structurally with the same 100-element bound, and a known nested struct calls its own printer. A top-level `struct P *` likewise prints only its address; explicit `*ptr` requests expansion. This differs intentionally from a top-level `char *` expression, where the user explicitly asked for the existing string dereference. Small flat structs stay on one line; larger, nested or array-bearing structs use indented multiline output. Multi-declarator fields, function-pointer declarators, bit-fields, flexible arrays, C11 anonymous members and unions conservatively produce a labelled raw byte dump instead of guessed member names.
 
@@ -77,8 +77,8 @@ Each candidate must compile and link, execute a valid program, and terminate
 with the expected report for deliberately faulty memory/arithmetic operations.
 This rejects ignored flags and missing runtime libraries. Results are cached
 only in the evaluator and cleared when `%cc` or `%std` changes the toolchain.
-MSVC flags precede `/link`; `/Z7` keeps compiler debug information in the
-temporary object and linker PDBs remain beside the temporary executable.
+Instrumentation flags precede the source path so the compiler cannot treat
+them as input files.
 
 Checks stop at the first detected error, and leak detection is disabled for
 session allocations. Sanitizer reports use a private log directory per run,
@@ -134,9 +134,10 @@ pending program-input read. Child process groups (Unix) or Job Objects
 The next input clears the interrupt flag and uses the same session.
 
 CI runs real compilers on Linux (GCC and Clang), macOS (Clang) and Windows
-(CL). Linux/macOS jobs require working ASan and UBSan; the Windows job
-requires the installed MSVC ASan component and working ASan. A required
-backend cannot silently skip tests. The Web PTY regression exercises edit,
-compile, run and input interruptions, recovery, descendant cleanup and
-terminal CRLF input on each native runner. Windows validation belongs to
-the native CL CI job; no local Windows cross-build is required.
+(WinLibs GCC). Linux/macOS jobs require working ASan and UBSan. MinGW-w64 GCC
+ships no sanitizer runtime, so the Windows job does not require one and its
+`%check` tests skip. A required backend cannot silently skip tests. The Web
+PTY regression exercises edit, compile, run and input interruptions,
+recovery, descendant cleanup and terminal CRLF input on each native runner.
+Windows validation belongs to the native WinLibs CI job; no local Windows
+cross-build is required.

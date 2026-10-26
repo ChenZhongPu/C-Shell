@@ -242,7 +242,7 @@ compiler-not-found =
     c-shell requires a mode capable of its C11-style value printer.
     Install gcc or clang, or point c-shell at one with --cc <path>.{$windows-note}
 compiler-windows-note =
-    On Windows, MSVC (cl.exe) only works from a Developer Command Prompt.
+    On Windows, install WinLibs GCC (or another MinGW-w64 GCC) and put its bin directory on PATH.
 compiler-default-std = default std
 compiler-default-std-value = default std {$standard}
 compiler-auto-std = -std={$selected}, auto-raised: default {$default} lacks _Generic

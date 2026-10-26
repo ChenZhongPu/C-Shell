@@ -220,8 +220,8 @@ impl Evaluator {
             ));
         }
         let args = match self.runtime_checks {
-            Some(checks) => checks.compile_args(&self.tc, &src, &exe, self.dir.path()),
-            None => self.tc.compile_args(&src, &exe, self.dir.path()),
+            Some(checks) => checks.compile_args(&self.tc, &src, &exe),
+            None => self.tc.compile_args(&src, &exe),
         };
         let mut cmd = Command::new(&self.tc.path);
         cmd.args(&args);
@@ -398,7 +398,7 @@ impl Evaluator {
 
     /// Try compiler-validated assembly strategies. File-scope-shaped input is
     /// never demoted into `main`: GCC nested functions would make identical
-    /// sessions diverge from Clang/MSVC. On a normal failure, candidate
+    /// sessions diverge from Clang. On a normal failure, candidate
     /// rebinding strategies are accepted only when the whole program compiles.
     fn attempt(
         &self,
@@ -485,10 +485,7 @@ impl Evaluator {
             &[Slot::Stmt]
         };
         for &slot in slots {
-            if slot == Slot::Expr
-                && (self.tc.family == crate::toolchain::Family::Msvc || session.must_replay(input))
-                && lex::may_be_array_lvalue(input)
-            {
+            if slot == Slot::Expr && session.must_replay(input) && lex::may_be_array_lvalue(input) {
                 let bounded = codegen::build_lvalue_expr(session, input, timed);
                 if let Ok(o) = self.try_program(bounded, slot, session.stdin_tape())? {
                     return self.finish_expression(
@@ -1906,9 +1903,8 @@ fn describe_abnormal(st: &std::process::ExitStatus) -> Option<String> {
 }
 
 /// Diagnostics that mean "this name already denotes something here".
-/// GNU/Clang spellings are textual; MSVC diagnostic codes remain stable even
-/// when its prose is localized. A positive match only enables a retry — the
-/// alternate assembly still has to compile and run before it can be committed.
+/// A positive match only enables a retry — the alternate assembly still has
+/// to compile and run before it can be committed.
 fn is_rebinding_diagnostic(diag: &str) -> bool {
     let lower = diag.to_ascii_lowercase();
     [
@@ -1917,15 +1913,6 @@ fn is_rebinding_diagnostic(diag: &str) -> bool {
         "redeclared",
         "conflicting types for",
         "already has a body",
-        "c2011",
-        "c2084",
-        "c2086",
-        "c2365",
-        "c2371",
-        "c2373",
-        "c2374",
-        "c2375",
-        "c2556",
     ]
     .iter()
     .any(|needle| lower.contains(needle))

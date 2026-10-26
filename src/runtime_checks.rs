@@ -1,8 +1,8 @@
 //! Optional runtime instrumentation, probed only when `%check` is requested.
 //!
-//! These messages deliberately remain English in every UI language. Compiler
-//! families select argument syntax; actual compile/link/run probes select the
-//! checks, including for clang-cl and installations missing sanitizer runtimes.
+//! These messages deliberately remain English in every UI language. Actual
+//! compile/link/run probes select the checks, including for installations
+//! missing sanitizer runtimes.
 
 use std::io::Read as _;
 use std::process::Command;
@@ -85,41 +85,21 @@ impl Checks {
         tc: &Toolchain,
         src: &std::path::Path,
         exe: &std::path::Path,
-        dir: &std::path::Path,
     ) -> Vec<String> {
-        let mut args = tc.compile_args(src, exe, dir);
-        let mut flags = Vec::new();
-        if tc.is_msvc() {
-            if self.address {
-                flags.push("/fsanitize=address");
-            }
-            if self.undefined {
-                flags.push("/fsanitize=undefined");
-            }
-            // /Z7 embeds debug information in the temporary object, avoiding
-            // a compiler PDB in the user's current working directory.
-            flags.extend(["/Z7", "/Od"]);
-            args.extend([
-                "/DEBUG".to_string(),
-                "/INCREMENTAL:NO".to_string(),
-                format!("/PDB:{}", exe.with_extension("pdb").display()),
-            ]);
-        } else {
-            let sanitizer = match (self.address, self.undefined) {
-                (true, true) => "-fsanitize=address,undefined",
-                (true, false) => "-fsanitize=address",
-                (false, true) => "-fsanitize=undefined",
-                (false, false) => unreachable!("at least one check is required"),
-            };
-            flags.extend([
-                sanitizer,
-                "-g",
-                "-O0",
-                "-fno-omit-frame-pointer",
-                "-fno-sanitize-recover=all",
-            ]);
-        }
-        // Compiler switches must precede the MSVC /link delimiter.
+        let mut args = tc.compile_args(src, exe);
+        let sanitizer = match (self.address, self.undefined) {
+            (true, true) => "-fsanitize=address,undefined",
+            (true, false) => "-fsanitize=address",
+            (false, true) => "-fsanitize=undefined",
+            (false, false) => unreachable!("at least one check is required"),
+        };
+        let flags = [
+            sanitizer,
+            "-g",
+            "-O0",
+            "-fno-omit-frame-pointer",
+            "-fno-sanitize-recover=all",
+        ];
         args.splice(0..0, flags.into_iter().map(str::to_string));
         args
     }
@@ -171,7 +151,7 @@ impl Checks {
         }
         let timeout = timeout.min(Duration::from_secs(10));
         let mut command = Command::new(&tc.path);
-        command.args(self.compile_args(tc, &src, &exe, dir.path()));
+        command.args(self.compile_args(tc, &src, &exe));
         let Ok(compiled) = proc::run_captured(&mut command, timeout, false) else {
             return false;
         };
@@ -182,7 +162,6 @@ impl Checks {
         )
         .to_ascii_lowercase();
         if !compiled.status.is_some_and(|s| s.success())
-            || diagnostics.contains("d9002")
             || diagnostics.contains("ignoring unknown option")
             || diagnostics.contains("argument unused during compilation")
         {
@@ -678,10 +657,10 @@ mod tests {
     }
 
     #[test]
-    fn msvc_instrumentation_stays_before_the_linker_delimiter() {
+    fn instrumentation_flags_precede_the_source() {
         let tc = Toolchain {
-            path: "cl.exe".into(),
-            family: crate::toolchain::Family::Msvc,
+            path: "gcc".into(),
+            family: crate::toolchain::Family::Gnu,
             version: String::new(),
             std: "c17".into(),
             default_std: None,
@@ -691,22 +670,13 @@ mod tests {
             &tc,
             std::path::Path::new("temp/input.c"),
             std::path::Path::new("temp/input.exe"),
-            std::path::Path::new("temp"),
         );
-        let linker = args.iter().position(|arg| arg == "/link").unwrap();
-        for option in ["/fsanitize=address", "/Z7", "/Od"] {
-            assert!(args[..linker].iter().any(|arg| arg == option));
+        let source = args
+            .iter()
+            .position(|arg| arg == "temp/input.c")
+            .expect("source argument");
+        for option in ["-fsanitize=address", "-g", "-O0", "-fno-omit-frame-pointer"] {
+            assert!(args[..source].iter().any(|arg| arg == option), "{option}");
         }
-        assert!(
-            args[linker + 1..]
-                .iter()
-                .any(|arg| arg == "/INCREMENTAL:NO")
-        );
-        assert!(!args.iter().any(|arg| arg == "/Zi"));
-        assert!(
-            args[linker + 1..]
-                .iter()
-                .any(|arg| arg == "/PDB:temp/input.pdb")
-        );
     }
 }

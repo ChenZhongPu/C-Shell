@@ -389,12 +389,8 @@ static inline void cs_m_unknown(const volatile void *v)          { (void)v; fput
     else printf("(void *)0x%" PRIxPTR, (uintptr_t)(x));                 \
 } while (0)
 
-#if defined(__GNUC__) || defined(__clang__)
 #define CS_STRING_BOUND(x) _Generic((__typeof__(x) *)0,                  \
     char (*)[]: sizeof(x), const char (*)[]: sizeof(x), default: SIZE_MAX)
-#else
-#define CS_STRING_BOUND(x) SIZE_MAX
-#endif
 
 #define CS_PRINT_WITH_BOUND(x, n) _Generic((x),                          \
     _Bool: cs_p_b,              char: cs_p_c,                            \
@@ -420,23 +416,12 @@ static inline void cs_m_unknown(const volatile void *v)          { (void)v; fput
 /* Capture addressable expressions before inspecting a variably modified
    type: sizeof/typeof may evaluate a VLA operand. Pointer capture preserves
    single evaluation even for rows[index++] where each row is a VLA. */
-#if defined(__GNUC__) || defined(__clang__)
 #define CS_PRINT_LVALUE(x) do {                                          \
     __auto_type _cs_print_address = &(x);                               \
     if (_Generic(_cs_print_address, char (*)[]: 1, const char (*)[]: 1, default: 0)) \
         cs_p_s_bounded((const void *)_cs_print_address, sizeof(*_cs_print_address)); \
     else CS_PRINT(*_cs_print_address);                                  \
 } while (0)
-#else
-/* MSVC's generic selection does not reliably match a fixed-size array
-   pointer against a pointer to an unspecified-size array. Use the complete
-   character-array type of exactly this object's byte size instead. */
-#define CS_PRINT_LVALUE(x) do {                                          \
-    if (_Generic(&(x), char (*)[sizeof(x)]: 1, const char (*)[sizeof(x)]: 1, default: 0)) \
-        cs_p_s_bounded((const void *)&(x), sizeof(x));                   \
-    else CS_PRINT(x);                                                   \
-} while (0)
-#endif
 
 /* An array decays to a pointer before _Generic can see it, so array-ness is
    settled at run time instead: an array object begins at its first element,
@@ -770,10 +755,10 @@ pub struct Program {
     /// therefore needs the request-driven stdin tape transport.
     pub uses_stdin_tape: bool,
     /// True when the input sits inside a generated expression macro wrapper.
-    /// MSVC's traditional preprocessor attributes diagnostics from a
-    /// multi-line macro invocation to the invocation's *first* line — the
-    /// wrapper line just above the input — so the remapper must know it may
-    /// pull those anchors back into the input.
+    /// Preprocessors may attribute diagnostics from a multi-line macro
+    /// invocation to the invocation's *first* line — the wrapper line just
+    /// above the input — so the remapper must know it may pull those anchors
+    /// back into the input.
     pub wrapped: bool,
 }
 

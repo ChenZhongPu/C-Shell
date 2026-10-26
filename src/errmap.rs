@@ -35,11 +35,7 @@ pub fn remap_runtime(raw: &str, src: &str, program: &crate::codegen::Program) ->
         while let Some(index) = remaining.find(&path) {
             mapped.push_str(&remaining[..index]);
             remaining = &remaining[index + path.len()..];
-            let (location, parenthesized) = if let Some(tail) = remaining.strip_prefix(':') {
-                (tail, false)
-            } else if let Some(tail) = remaining.strip_prefix('(') {
-                (tail, true)
-            } else {
+            let Some(location) = remaining.strip_prefix(':') else {
                 mapped.push_str(&path);
                 continue;
             };
@@ -49,12 +45,6 @@ pub fn remap_runtime(raw: &str, src: &str, program: &crate::codegen::Program) ->
             if let Ok(line) = location[..end].parse::<usize>() {
                 mapped.push_str(&map(line));
                 remaining = &location[end..];
-                if parenthesized {
-                    // MSVC stack locations commonly use file(line).
-                    if let Some(tail) = remaining.strip_prefix(')') {
-                        remaining = tail;
-                    }
-                }
             } else {
                 mapped.push_str(&path);
             }
@@ -83,9 +73,9 @@ pub fn remap(
 ) -> String {
     // Map a generated-file line to an input-relative one. With `wrapped`,
     // the wrapper lines directly above and below the input hold nothing but
-    // `CS_PRINT((` and `));`, so a diagnostic anchored there — MSVC's
-    // traditional preprocessor does exactly that for macro arguments — can
-    // only be about the expression itself and is clamped to it.
+    // `CS_PRINT((` and `));`, so a diagnostic anchored there can only be
+    // about the expression itself and is clamped to it. Preprocessors may
+    // attribute macro-argument diagnostics to the invocation's first line.
     let map_line = |n: usize| -> Option<usize> {
         if n >= start && n < start + count {
             Some(n - start + 1)
@@ -97,20 +87,9 @@ pub fn remap(
             None
         }
     };
-    // cl.exe prints the bare source filename to stdout on every compile; it
-    // carries no information and would leak through every later filter.
-    // Only compiler diagnostics pass through here, so a line that is
-    // exactly the filename can never be a real message.
-    let basename = std::path::Path::new(src)
-        .file_name()
-        .and_then(|s| s.to_str());
     let mut out = String::with_capacity(raw.len());
     let mut dropping_generated_gutter = false;
     for line in raw.lines() {
-        if basename.is_some_and(|b| line.trim() == b) {
-            continue;
-        }
-
         if let Some(gutter) = remap_gutter(line, start, count, session_ranges) {
             match gutter {
                 Gutter::Keep(line) => {
@@ -334,8 +313,7 @@ pub fn only_new(text: &str) -> String {
 /// to do with the error being reported and only buries it.
 pub fn drop_stale_warnings(text: &str) -> String {
     let filtered = filter_blocks(text, |header| {
-        // Both spellings: GNU/Clang `warning:` and MSVC `warning C4552:`.
-        let is_warning = header.contains("warning:") || header.contains("warning C");
+        let is_warning = header.contains("warning:");
         header.starts_with("<input>:") || !is_warning
     });
     if !filtered.trim().is_empty() {
@@ -412,32 +390,13 @@ fn is_group_banner(line: &str) -> bool {
     false
 }
 
-/// Recognise a leading `path:LINE` (GNU, Clang) or `path(LINE)` (MSVC)
-/// location, returning the line number and everything after it.
+/// Recognise a leading `path:LINE` (GNU, Clang) location, returning the line
+/// number and everything after it.
 fn split_location<'a>(line: &'a str, src: &str) -> Option<(usize, &'a str)> {
-    let rest = line.strip_prefix(src)?;
-
-    if let Some(after) = rest.strip_prefix(':') {
-        let end = after.find(|c: char| !c.is_ascii_digit())?;
-        let n: usize = after[..end].parse().ok()?;
-        return Some((n, &after[end..]));
-    }
-    // MSVC writes `path(LINE)` or `path(LINE,COL)`; the closing paren belongs
-    // to the location and must not survive into the rewritten message.
-    if let Some(after) = rest.strip_prefix('(') {
-        let end = after.find(|c: char| !c.is_ascii_digit())?;
-        let n: usize = after[..end].parse().ok()?;
-        let tail = &after[end..];
-        let tail = match tail.strip_prefix(',') {
-            Some(col) => {
-                let e = col.find(|c: char| !c.is_ascii_digit())?;
-                &col[e..]
-            }
-            None => tail,
-        };
-        return Some((n, tail.strip_prefix(')')?));
-    }
-    None
+    let rest = line.strip_prefix(src)?.strip_prefix(':')?;
+    let end = rest.find(|c: char| !c.is_ascii_digit())?;
+    let n: usize = rest[..end].parse().ok()?;
+    Some((n, &rest[end..]))
 }
 
 #[cfg(test)]
@@ -459,11 +418,6 @@ mod tests {
         assert!(mapped.contains("#0 in main <input>:1:5"));
         assert!(mapped.contains("#1 in setup <session>:1:2"));
         assert!(mapped.contains("SUMMARY: error <input>:1:5 in main"));
-        let windows = format!("    #0 main C:/tmp/input.c({start})\n");
-        assert_eq!(
-            remap_runtime(&windows, "C:\\tmp\\input.c", &program),
-            "    #0 main <input>:1\n"
-        );
     }
 
     #[test]
@@ -472,15 +426,6 @@ mod tests {
         assert_eq!(
             remap(raw, "/tmp/x/in.c", "", 40, 5, &[], false).trim_end(),
             "<input>:3:5: error: 'y' undeclared"
-        );
-    }
-
-    #[test]
-    fn maps_msvc_location() {
-        let raw = "C:\\t\\in.c(42): error C2065: 'y': undeclared identifier";
-        assert_eq!(
-            remap(raw, "C:\\t\\in.c", "", 42, 1, &[], false).trim_end(),
-            "<input>:1: error C2065: 'y': undeclared identifier"
         );
     }
 
@@ -506,23 +451,23 @@ mod tests {
 
     #[test]
     fn wrapper_line_anchors_are_pulled_into_a_wrapped_input() {
-        // MSVC's traditional preprocessor pins diagnostics from a macro
-        // argument to the invocation's first line: `CS_PRINT((`, one line
-        // above the input. Nothing but the wrapper lives there, so the
-        // anchor is clamped to the expression.
-        let raw = "C:\\t\\in.c(41): warning C4018: '>': signed/unsigned mismatch";
+        // A preprocessor may pin a macro-argument diagnostic to the
+        // invocation's first line: `CS_PRINT((`, one line above the input.
+        // Nothing but the wrapper lives there, so the anchor is clamped to
+        // the expression.
+        let raw = "/tmp/x/in.c:41: warning: comparison of integers of different signs";
         assert_eq!(
-            remap(raw, "C:\\t\\in.c", "", 42, 1, &[], true).trim_end(),
-            "<input>:1: warning C4018: '>': signed/unsigned mismatch"
+            remap(raw, "/tmp/x/in.c", "", 42, 1, &[], true).trim_end(),
+            "<input>:1: warning: comparison of integers of different signs"
         );
         // The closing `));` line clamps to the input's last line.
-        let raw2 = "C:\\t\\in.c(43): error C2143: syntax error";
+        let raw2 = "/tmp/x/in.c:43: error: syntax error";
         assert_eq!(
-            remap(raw2, "C:\\t\\in.c", "", 42, 1, &[], true).trim_end(),
-            "<input>:1: error C2143: syntax error"
+            remap(raw2, "/tmp/x/in.c", "", 42, 1, &[], true).trim_end(),
+            "<input>:1: error: syntax error"
         );
         // Unwrapped slots keep strict attribution.
-        assert!(remap(raw, "C:\\t\\in.c", "", 42, 1, &[], false).starts_with("<generated>"));
+        assert!(remap(raw, "/tmp/x/in.c", "", 42, 1, &[], false).starts_with("<generated>"));
     }
 
     #[test]
@@ -549,13 +494,6 @@ mod tests {
         let got = drop_stale_warnings(&mapped);
         assert_eq!(
             got.trim_end(),
-            "<input>:1: error: expected expression at end of input"
-        );
-
-        let msvc = "C:\\t\\in.c(1): error C2059: syntax error: ')'";
-        let mapped = remap(msvc, "C:\\t\\in.c", generated, 2, 1, &[], true);
-        assert_eq!(
-            drop_stale_warnings(&mapped).trim_end(),
             "<input>:1: error: expected expression at end of input"
         );
     }
@@ -588,15 +526,6 @@ mod tests {
             "error: c-shell's generated C runtime failed to compile: fatal error: 'uchar.h' file not found\n\
              run %src --raw to inspect the generated program\n"
         );
-    }
-
-    #[test]
-    fn drops_msvc_bare_filename_lines() {
-        // cl.exe echoes the source filename to stdout on every compile.
-        let raw = "input.c\n/tmp/x/input.c:42:1: warning: something";
-        let got = remap(raw, "/tmp/x/input.c", "", 42, 1, &[], false);
-        assert!(!got.contains("input.c"), "{got}");
-        assert!(got.contains("<input>:1:1: warning"), "{got}");
     }
 
     #[test]

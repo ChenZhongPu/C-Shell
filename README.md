@@ -64,8 +64,9 @@ Out[5]: 1
 
 ## Highlights
 
-- **Your compiler, your answers.** GNU GCC, LLVM Clang, Apple Clang, and MSVC
-  determine the language rules, ABI behavior, warnings, and errors.
+- **Your compiler, your answers.** GNU GCC (WinLibs on Windows), LLVM Clang,
+  and Apple Clang determine the language rules, ABI behavior, warnings, and
+  errors.
 - **A stateful C session.** Declarations, statements, functions, and types
   remain available to later inputs without replacing C's normal scope rules.
 - **Interactive editing.** Syntax highlighting, completion, history, smart
@@ -80,8 +81,8 @@ Out[5]: 1
 - **Terminal, browser, or batch input.** Use the REPL directly, open the same PTY
   experience in a local browser, or run `-e` and redirected or piped input
   with deterministic exit status and diagnostics.
-- **Cross-platform compiler drivers.** GNU-style and MSVC-style command lines
-  are detected by capability probes rather than executable names.
+- **Cross-platform compiler drivers.** GNU-style command lines are detected
+  by capability probes rather than executable names.
 
 ## Why a real compiler?
 
@@ -97,9 +98,10 @@ change with compiler version, flags, surrounding code or another execution.
 
 ## Installation
 
-Requires a Rust toolchain to build and, at runtime, GNU GCC, LLVM Clang,
-Apple Clang, or MSVC. Other compilers are not part of the supported or tested
-compatibility surface.
+Requires a Rust toolchain to build and, at runtime, GNU GCC, LLVM Clang, or
+Apple Clang. On Windows, use WinLibs GCC (or another MinGW-w64 GCC) and put
+its `bin` directory on `PATH`; MSVC is not supported. Other compilers are not
+part of the supported or tested compatibility surface.
 
 Install the published crate from crates.io:
 
@@ -114,8 +116,8 @@ cargo install --path .
 ```
 
 With `--cc`, only that compiler is tried. Otherwise startup checks `$CC`, then
-PATH (`cc`, `gcc`, `clang`; on Windows `gcc`, `clang`, `cc`, `clang-cl`,
-`cl`). `--cc` and `$CC` must name one executable or path, not a
+PATH (`cc`, `gcc`, `clang`; on Windows `gcc`, `clang`, `cc`). `--cc` and `$CC`
+must name one executable or path, not a
 shell command containing flags. The first candidate that passes every check
 wins. Capabilities are probed by trial compilation, never derived from version
 strings — executable names can be aliases, and distros backport features. For
@@ -176,8 +178,8 @@ c-shell also adds diagnostics, output and platform link flags plus generated
 REPL scaffolding.
 Select a supported mode with `--std c17`, or switch mid-session with `%std
 c17` / `%std default`. One exception: when the compiler's default mode cannot
-compile `_Generic` (MSVC without `/std:` is the common case), c-shell tries
-c17 and then c11, and the banner reports an automatic raise. `_Generic`
+compile `_Generic`, c-shell tries c17 and then c11, and the banner reports an
+automatic raise. `_Generic`
 support is the actual capability floor: a candidate that cannot compile a
 representative value-printer probe in the selected mode is skipped. An
 unsupported explicit `--std` is an error both at startup and in `%std`.
@@ -215,9 +217,8 @@ pre-included, so no `#include` is needed for the everyday library. `uchar` is
 also pre-included when the compiler can confirm that the host C library
 provides it; some macOS SDKs omit that header. `%header` shows the exact
 guarded include block. Unix builds link `-lm`; Windows math functions come
-from the C runtime. GNU-style GCC/Clang drivers use `-Wall -Wextra`;
-MSVC-style `cl`/`clang-cl` drivers use `/W3`. The warning is often exactly the
-thing you came to check.
+from the C runtime. GNU-style GCC/Clang drivers use `-Wall -Wextra`. The
+warning is often exactly the thing you came to check.
 
 ### Rebinding declarations and definitions
 
@@ -257,8 +258,8 @@ Out[4]: 9
 
 The old item is replaced at its original position to preserve declaration
 order. A function-shaped input is never retried inside `main`; this prevents
-GCC nested-function extensions from creating a session that Clang or MSVC
-interprets differently. `%reset` clears the complete session.
+GCC nested-function extensions from creating a session that Clang interprets
+differently. `%reset` clears the complete session.
 
 ### Commands
 
@@ -529,7 +530,8 @@ file. The separate current-session input archive exists only for direct
 ## How it works
 
 c-shell works by reassembling your session and passing complete C files to your
-real host compiler (GNU GCC, LLVM/Apple Clang, or MSVC).
+real host compiler (GNU GCC, including WinLibs on Windows, or LLVM/Apple
+Clang).
 
 Direct `scanf`, `getchar`, `getc(stdin)`, `fgetc(stdin)` and
 `fgets(..., stdin)` reuse recorded input during replay. Value previews escape

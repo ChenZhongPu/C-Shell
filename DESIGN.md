@@ -4,12 +4,13 @@ Settled architecture decisions, the one big open problem, and the traps buried
 in the code that you must know about before changing it. README is for users;
 this file is for whoever develops the tool next.
 
-Status: v0.4.0 working, English/Chinese UI. The default test run has 118 unit
+Status: v0.4.0 working, English/Chinese UI. The default test run has 114 unit
 tests and 79 end-to-end smoke tests; a real-compiler performance benchmark is
 ignored by default. Verified locally on Linux with GCC 16.2.1 and Clang
-22.1.8. Native CI covers Linux GCC/Clang, macOS Clang and Windows CL; see
-`.github/workflows/ci.yml` for the exact matrix and required sanitizer backends.
-Windows is validated in its native CL CI job, without local cross-builds.
+22.1.8. Native CI covers Linux GCC/Clang, macOS Clang and Windows WinLibs GCC;
+see `.github/workflows/ci.yml` for the exact matrix and required sanitizer
+backends. Windows is validated in its native WinLibs CI job, without local
+cross-builds.
 
 ---
 
@@ -17,7 +18,7 @@ Windows is validated in its native CL CI job, without local cross-builds.
 
 | Module | Responsibility |
 |---|---|
-| `toolchain.rs` | compiler detection, cached capability probing, GNU/Clang/MSVC flag dialects, default-std detection, `_Generic` floor |
+| `toolchain.rs` | compiler detection, cached capability probing, GNU-style flags, default-std detection, `_Generic` floor |
 | `eval.rs` | trial-compile classification/rebinding, compile, run with timeout, crash diagnosis |
 | `editor.rs` | reedline integration: syntect highlighting, completion menu, multi-line validation, prompt |
 | `main.rs` | CLI, REPL, `-e`, redirected and piped-input modes |
@@ -78,7 +79,7 @@ toolchain.
 `eval::looks_file_scope` sends preprocessor directives, typedefs, tag
 definitions and function-shaped inputs exclusively to file scope. They are
 never demoted into `main`, because GCC nested functions would make an
-identical session diverge from Clang/MSVC. Other inputs never receive file
+identical session diverge from Clang. Other inputs never receive file
 scope as a fallback, because moving a declaration out of `main` can silently
 change shadowing semantics. The compiler arbitrates expression versus
 statement; classics like `foo * bar;` follow its current typedef context.
@@ -208,9 +209,9 @@ it bought no purity (GCC accepts many GNU extensions without `-pedantic`) and
 contradicted the tool's thesis of matching a plain compiler invocation. The
 default mode is detected by compiling and running a probe that reports
 `__STDC_VERSION__` and `__STRICT_ANSI__`; that run doubles as the
-works-at-all self-test. When the default mode cannot compile `_Generic`
-(MSVC without `/std:` is the common case), detection tries c17 and then c11
-and marks the selected mode as automatic. The final gate compiles a
+works-at-all self-test. When the default mode cannot compile `_Generic`,
+detection tries c17 and then c11 and marks the selected mode as automatic.
+The final gate compiles a
 representative subset of the value-printer runtime (`inline`, `_Bool` and
 `_Generic`) under the selected mode rather than inferring support from a
 version string. An unsupported explicit standard is rejected.
@@ -412,15 +413,15 @@ c-shell (Rust) ──pipe──> runner child (slot table + the user's heap/file
 ```
 
 - Each step library exports exactly one c-shell entry symbol (`cs_step` —
-  trivial even on MSVC) and imports no symbols from the Rust runner. Normal C
+  trivial in C) and imports no symbols from the Rust runner. Normal C
   runtime/system-library imports still exist. Avoiding runner imports removes
   the Windows import-library problem that once made this option expensive.
 - `&x` is stable across inputs; heap allocations and `FILE*` can survive in
   the runner process, and `scanf` runs once on the normal hot path. Per-input
   compilation no longer includes the accumulated statement journal. On
-  Windows, every step DLL must use the same dynamic CRT (`/MD`); separate
-  static CRT instances would make allocation and `FILE*` ownership unsafe
-  across DLL boundaries. Compilation is still not strictly constant while
+  Windows, every step DLL must share one C runtime; separate runtime
+  instances would make allocation and `FILE*` ownership unsafe across DLL
+  boundaries. Compilation is still not strictly constant while
   shared declarations and recompiled session function definitions continue
   to grow.
 - **Replay is demoted, not deleted: it becomes a best-effort recovery layer.**
@@ -473,13 +474,6 @@ References: [crepl](https://l-m.dev/cs/crepl/)
   unspecified behavior, undefined behavior, differing extensions/ABIs, or a
   compiler bug; the comparison should report the environment rather than
   claim a single cause.
-- **MSVC status (first CI contact 2026-07):** detection, the legacy default →
-  `/std:c17` auto-raise, and `_Generic` value printing all worked on the
-  real cl 19.51. Two papercuts found and fixed: cl echoes the bare source
-  filename to stdout (now dropped in `errmap::remap`), and C4552/C4553
-  joined the suppressed unused-family list. Still anticipated but not yet
-  seen: antivirus briefly locking freshly-exited executables (unique exe
-  names per step would be the fix); ANSI colors on legacy conhost.
 - No session save/load. `Session` is not serializable yet; adding serde is
   straightforward.
 - **No way to remove a retained input short of `%reset`.** Compiler-validated
@@ -553,15 +547,8 @@ the classic `_Generic` default-function type error. Keep aggregate association
 macros late-bound: type definitions precede generated printer prototypes and
 all exact visible aggregate types must be in the member table.
 
-**An MSVC probe cannot trust exit status alone.** `cl.exe` reports an unknown
-option such as `/std:bogus` as warning D9002 and exits successfully; clang-cl
-can similarly report an unused argument. Capability probes treat these
-specific diagnostics as failure, or an invalid explicit `--std` can be
-silently accepted. Changing this rule also requires a cache-schema bump so a
-previous false-positive result cannot survive on disk.
-
 **Function-shaped input must never fall back into `main`.** gcc accepts nested
-functions as an extension even under `-std=c17`; Clang and MSVC reject them.
+functions as an extension even under `-std=c17`; Clang rejects them.
 A failed file-scope function that is retried as a statement therefore creates
 a tool-induced compiler disagreement. `eval::attempt` now keeps all
 file-scope-shaped input exclusively at file scope: a redeclaration may replace
@@ -652,15 +639,14 @@ under every later input. gcc's `file: In function 'f':` group banner carries
 no line number: hold it back until something under it survives, or it is
 left stranded above nothing.
 
-**MSVC pins macro-argument diagnostics to the invocation's first line**
-(`errmap::remap`, the `wrapped` flag). The traditional cl preprocessor
-attributes a diagnostic arising inside a multi-line macro invocation to the
-line of the macro *name* — for the Expr slot that is the `CS_PRINT((`
-wrapper line just above the input, which strict attribution labels
-`<generated>` and the warning filter then silently drops. Symptom: values
-print but warnings vanish, only on MSVC, only for expressions. Wrapper-line
-anchors are clamped into the input; nothing but the wrapper lives on those
-lines, so the clamp cannot mislabel foreign diagnostics.
+**Macro-argument diagnostics may anchor to the invocation's first line**
+(`errmap::remap`, the `wrapped` flag). A preprocessor can attribute a
+diagnostic arising inside a multi-line macro invocation to the line of the
+macro *name* — for the Expr slot that is the `CS_PRINT((` wrapper line just
+above the input, which strict attribution would label `<generated>` and the
+warning filter would then silently drop. Wrapper-line anchors are clamped
+into the input; nothing but the wrapper lives on those lines, so the clamp
+cannot mislabel foreign diagnostics.
 
 **Every compiler, capability probe, generated user program and optional
 `clang-format` process goes through the deadline-aware helpers in `proc`.**

@@ -125,8 +125,8 @@ fn render_probe(result: Eval, ui: &Ui, missing: &str, style: Style) -> bool {
 }
 
 /// Compilers anchor an unsupported `_Generic` selection differently. Clang
-/// keeps the primary error on the user expression, while GCC/MSVC may leave
-/// only a macro-expansion note after generated diagnostics are removed.
+/// keeps the primary error on the user expression, while GCC may leave only
+/// a macro-expansion note after generated diagnostics are removed.
 fn unsupported_bits_type(diag: &str) -> bool {
     if diag.trim().is_empty() {
         return true;

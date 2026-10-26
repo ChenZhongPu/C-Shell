@@ -16,7 +16,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Successful capability probes remain valid until the compiler, relevant
 /// environment, requested standard, c-shell version, or this TTL changes.
 const CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-const CACHE_SCHEMA: &str = "toolchain-v3";
+const CACHE_SCHEMA: &str = "toolchain-v4";
 
 /// `.output()` with a deadline; `None` covers spawn failure and timeout
 /// alike — for a probe those are the same answer.
@@ -25,34 +25,15 @@ fn probe_output(cmd: &mut Command) -> Option<proc::Captured> {
     cap.status.is_some().then_some(cap)
 }
 
-/// cl.exe reports an unknown command-line option as warning D9002 and still
-/// exits successfully. clang-cl can likewise warn that an option was unused.
-/// A capability probe must treat both as rejection; exit status alone would
-/// silently accept an unsupported `/std:` value.
-fn msvc_ignored_option(cap: &proc::Captured) -> bool {
-    ignored_msvc_option_text(&format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&cap.stdout),
-        String::from_utf8_lossy(&cap.stderr)
-    ))
-}
-
-fn ignored_msvc_option_text(text: &str) -> bool {
-    let text = text.to_ascii_lowercase();
-    text.contains("d9002")
-        || text.contains("ignoring unknown option")
-        || text.contains("argument unused during compilation")
-}
-
-/// Which flag dialect a compiler speaks. Version numbers are deliberately
-/// not part of this: capabilities are probed by trial compile, never derived
-/// from a version string.
+/// Which driver lineage a compiler belongs to. Both currently share the GNU
+/// flag dialect; the distinction is recorded in the capability cache rather
+/// than used to choose flags. Version numbers are deliberately not part of
+/// this: capabilities are probed by trial compile, never derived from a
+/// version string.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Family {
     Gnu,
     Clang,
-    /// `cl.exe`, and `clang-cl` which mimics its command line.
-    Msvc,
 }
 
 #[derive(Clone, Debug)]
@@ -69,8 +50,7 @@ pub struct Toolchain {
     /// compiler itself via `__STDC_VERSION__` / `__STRICT_ANSI__`.
     pub default_std: Option<String>,
     /// Set when `std` was forced by us rather than the user, because the
-    /// compiler's default mode cannot host the `_Generic` value printer
-    /// (MSVC without `/std:` is C89).
+    /// compiler's default mode cannot host the `_Generic` value printer.
     pub auto_std: bool,
 }
 
@@ -104,7 +84,7 @@ int main(void) {
 "#;
 
 /// Turn the VERSION_PROBE's output into a human label like "gnu23".
-fn parse_std_probe(out: &str, family: Family) -> Option<String> {
+fn parse_std_probe(out: &str) -> Option<String> {
     let mut it = out.split_whitespace();
     let v: i64 = it.next()?.parse().ok()?;
     let gnu: i32 = it.next()?.parse().ok()?;
@@ -115,33 +95,20 @@ fn parse_std_probe(out: &str, family: Family) -> Option<String> {
         199901.. => "99",
         _ => "89",
     };
-    // __STRICT_ANSI__ is a GNU-family signal; MSVC has no gnu dialect.
-    let prefix = if gnu == 1 && family != Family::Msvc {
-        "gnu"
-    } else {
-        "c"
-    };
+    // __STRICT_ANSI__ separates `-std=c17` from `-std=gnu17`.
+    let prefix = if gnu == 1 { "gnu" } else { "c" };
     Some(format!("{prefix}{n}"))
 }
 
-/// Candidate compiler names, most preferred first. On Windows `cc` is rarely
-/// present but costs nothing to try; `cl` comes last because it only works
-/// from a Developer Command Prompt.
+/// Candidate compiler names, most preferred first. On Windows, WinLibs GCC
+/// (or another MinGW-w64 GCC) is the supported toolchain; `cc` is rarely
+/// present but costs nothing to try.
 #[cfg(windows)]
-const CANDIDATES: &[&str] = &["gcc", "clang", "cc", "clang-cl", "cl"];
+const CANDIDATES: &[&str] = &["gcc", "clang", "cc"];
 #[cfg(not(windows))]
 const CANDIDATES: &[&str] = &["cc", "gcc", "clang"];
 
-fn family_of(path: &Path, banner: &str) -> Family {
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    // clang-cl must be checked before clang: it is clang, but takes MSVC flags.
-    if stem == "cl" || stem.ends_with("clang-cl") {
-        return Family::Msvc;
-    }
+fn family_of(banner: &str) -> Family {
     // Never trust the executable's name for gcc-vs-clang. Apple's Command
     // Line Tools may expose /usr/bin/gcc as an Apple Clang driver, while a
     // separately installed GNU GCC is genuine GCC; the banner distinguishes
@@ -236,7 +203,6 @@ fn load_cached(path: &Path, requested_std: Option<&str>) -> Option<Toolchain> {
     let family = match lines.next()? {
         "gnu" => Family::Gnu,
         "clang" => Family::Clang,
-        "msvc" => Family::Msvc,
         _ => return None,
     };
     let version = hex_decode(lines.next()?)?;
@@ -271,7 +237,6 @@ fn store_cached(tc: &Toolchain, requested_std: Option<&str>) {
     let family = match tc.family {
         Family::Gnu => "gnu",
         Family::Clang => "clang",
-        Family::Msvc => "msvc",
     };
     let default_std = tc
         .default_std
@@ -290,8 +255,6 @@ fn store_cached(tc: &Toolchain, requested_std: Option<&str>) {
 }
 
 fn banner_of(path: &Path) -> Result<String> {
-    // MSVC has no --version; invoked bare it prints its banner to stderr and
-    // exits nonzero, so accept output from either stream and ignore status.
     let out = probe_output(Command::new(path).arg("--version"))
         .with_context(|| format!("failed to run {}", path.display()))?;
     let pick = |b: &[u8]| {
@@ -305,12 +268,6 @@ fn banner_of(path: &Path) -> Result<String> {
     let s = pick(&out.stdout);
     if !s.is_empty() && out.status.is_some_and(|st| st.success()) {
         return Ok(s);
-    }
-    if let Some(bare) = probe_output(&mut Command::new(path)) {
-        let e = pick(&bare.stderr);
-        if !e.is_empty() {
-            return Ok(e);
-        }
     }
     let e = pick(&out.stderr);
     if e.is_empty() {
@@ -351,7 +308,7 @@ impl Toolchain {
                     continue;
                 }
             };
-            let family = family_of(&path, &banner);
+            let family = family_of(&banner);
             let mut tc = Toolchain {
                 path,
                 family,
@@ -361,10 +318,10 @@ impl Toolchain {
                 auto_std: false,
             };
             // One compile + run answers two questions at once: does this
-            // toolchain produce working executables (MSVC outside a Developer
-            // Command Prompt fails here), and what its default mode is.
+            // toolchain produce working executables, and what its default
+            // mode is.
             match tc.probe_run(&[], VERSION_PROBE) {
-                Some(out) => tc.default_std = parse_std_probe(&out, family),
+                Some(out) => tc.default_std = parse_std_probe(&out),
                 None => {
                     tried.push(i18n::text_with(
                         "compiler-cannot-build",
@@ -424,67 +381,33 @@ impl Toolchain {
         ))
     }
 
-    pub fn is_msvc(&self) -> bool {
-        self.family == Family::Msvc
-    }
-
     /// Render the argv for compiling `src` to `exe`.
-    pub fn compile_args(&self, src: &Path, exe: &Path, obj_dir: &Path) -> Vec<String> {
+    pub fn compile_args(&self, src: &Path, exe: &Path) -> Vec<String> {
         let mut a: Vec<String> = Vec::new();
-        if self.is_msvc() {
-            a.push("/nologo".into());
-            if !self.std.is_empty() {
-                a.push(format!("/std:{}", self.std));
-            }
-            a.push("/W3".into());
-            // The MSVC spellings of "defined but not used yet", normal at a
-            // REPL: C4101 unreferenced local, C4102 unreferenced label,
-            // C4552/C4553 expression result not used (a deliberate `expr;`).
-            a.push("/wd4101".into());
-            a.push("/wd4102".into());
-            a.push("/wd4552".into());
-            a.push("/wd4553".into());
-            // /TC forces C even when the temp file has an odd extension.
-            a.push("/TC".into());
-            a.push(src.display().to_string());
-            a.push(format!("/Fe:{}", exe.display()));
-            // Keep the intermediate .obj out of the working directory. The
-            // trailing separator is what tells cl this is a directory.
-            a.push(format!(
-                "/Fo:{}{}",
-                obj_dir.display(),
-                std::path::MAIN_SEPARATOR
-            ));
-            a.push("/link".into());
-        } else {
-            if !self.std.is_empty() {
-                a.push(format!("-std={}", self.std));
-            }
-            // Beginners benefit far more from seeing warnings than from a
-            // quiet prompt, so these are on by default.
-            a.push("-Wall".into());
-            a.push("-Wextra".into());
-            // ...except the -Wunused umbrella. At a REPL everything is
-            // unused the moment it is defined: a new function has no caller
-            // yet, and a deliberate `expr;` is an unused value by design.
-            a.push("-Wno-unused".into());
-            // Enabled by -Wextra and not part of the umbrella.
-            a.push("-Wno-unused-parameter".into());
-            a.push("-fno-diagnostics-color".into());
-            a.push("-x".into());
-            a.push("c".into());
-            a.push(src.display().to_string());
-            a.push("-o".into());
-            a.push(exe.display().to_string());
-            // Math lives in libm only on Unix. On Windows it is part of
-            // every C runtime, and worse: clang.exe defaults to the MSVC
-            // target there, where `-lm` becomes a link against a
-            // nonexistent m.lib. The probes never pass -lm, so that
-            // failure would surface not at detection but at the user's
-            // first evaluation.
-            if !cfg!(windows) {
-                a.push("-lm".into());
-            }
+        if !self.std.is_empty() {
+            a.push(format!("-std={}", self.std));
+        }
+        // Beginners benefit far more from seeing warnings than from a quiet
+        // prompt, so these are on by default.
+        a.push("-Wall".into());
+        a.push("-Wextra".into());
+        // ...except the -Wunused umbrella. At a REPL everything is unused
+        // the moment it is defined: a new function has no caller yet, and a
+        // deliberate `expr;` is an unused value by design.
+        a.push("-Wno-unused".into());
+        // Enabled by -Wextra and not part of the umbrella.
+        a.push("-Wno-unused-parameter".into());
+        a.push("-fno-diagnostics-color".into());
+        a.push("-x".into());
+        a.push("c".into());
+        a.push(src.display().to_string());
+        a.push("-o".into());
+        a.push(exe.display().to_string());
+        // Math lives in libm only on Unix. MinGW keeps it in the C runtime,
+        // and the probes never pass -lm, so a link failure would otherwise
+        // surface not at detection but at the user's first evaluation.
+        if !cfg!(windows) {
+            a.push("-lm".into());
         }
         a
     }
@@ -502,22 +425,9 @@ impl Toolchain {
             .path()
             .join(format!("probe{}", std::env::consts::EXE_SUFFIX));
         let mut cmd = Command::new(&self.path);
-        if self.is_msvc() {
-            cmd.arg("/nologo").arg("/TC");
-            cmd.args(args);
-            cmd.arg(&src).arg(format!("/Fe:{}", exe.display()));
-            cmd.arg(format!(
-                "/Fo:{}{}",
-                dir.path().display(),
-                std::path::MAIN_SEPARATOR
-            ));
-        } else {
-            cmd.args(args);
-            cmd.arg("-x").arg("c").arg(&src).arg("-o").arg(&exe);
-        }
-        probe_output(&mut cmd).is_some_and(|c| {
-            c.status.is_some_and(|st| st.success()) && !(self.is_msvc() && msvc_ignored_option(&c))
-        })
+        cmd.args(args);
+        cmd.arg("-x").arg("c").arg(&src).arg("-o").arg(&exe);
+        probe_output(&mut cmd).is_some_and(|c| c.status.is_some_and(|st| st.success()))
     }
 
     /// Like `probe`, but also runs the produced executable and returns its
@@ -530,19 +440,8 @@ impl Toolchain {
             .path()
             .join(format!("probe{}", std::env::consts::EXE_SUFFIX));
         let mut cmd = Command::new(&self.path);
-        if self.is_msvc() {
-            cmd.arg("/nologo").arg("/TC");
-            cmd.args(args);
-            cmd.arg(&src).arg(format!("/Fe:{}", exe.display()));
-            cmd.arg(format!(
-                "/Fo:{}{}",
-                dir.path().display(),
-                std::path::MAIN_SEPARATOR
-            ));
-        } else {
-            cmd.args(args);
-            cmd.arg("-x").arg("c").arg(&src).arg("-o").arg(&exe);
-        }
+        cmd.args(args);
+        cmd.arg("-x").arg("c").arg(&src).arg("-o").arg(&exe);
         let ok = probe_output(&mut cmd).is_some_and(|c| c.status.is_some_and(|st| st.success()));
         if !ok {
             return None;
@@ -555,11 +454,7 @@ impl Toolchain {
     }
 
     fn supports_std(&self, std: &str) -> bool {
-        let flag = if self.is_msvc() {
-            format!("/std:{std}")
-        } else {
-            format!("-std={std}")
-        };
+        let flag = format!("-std={std}");
         self.probe(&[&flag], "int main(void){return 0;}")
     }
 
@@ -569,8 +464,6 @@ impl Toolchain {
     fn value_printer_ok(&self) -> bool {
         let flag = if self.std.is_empty() {
             None
-        } else if self.is_msvc() {
-            Some(format!("/std:{}", self.std))
         } else {
             Some(format!("-std={}", self.std))
         };
@@ -612,19 +505,6 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_msvc_ignored_option_diagnostics() {
-        assert!(ignored_msvc_option_text(
-            "cl : Command line warning D9002 : ignoring unknown option '/std:bogus'"
-        ));
-        assert!(ignored_msvc_option_text(
-            "warning: argument unused during compilation: '/std:bogus'"
-        ));
-        assert!(!ignored_msvc_option_text(
-            "warning C4101: unreferenced local variable"
-        ));
-    }
-
-    #[test]
     fn requested_standard_is_part_of_cache_identity() {
         let exe = std::env::current_exe().expect("current test executable");
         assert_ne!(cache_key(&exe, None), cache_key(&exe, Some("c17")));
@@ -633,78 +513,34 @@ mod tests {
 
     #[test]
     fn parses_modern_gcc_default() {
-        assert_eq!(
-            parse_std_probe("202311 1\n", Family::Gnu).as_deref(),
-            Some("gnu23")
-        );
+        assert_eq!(parse_std_probe("202311 1\n").as_deref(), Some("gnu23"));
         // gcc's pre-release C2x value maps to the same label.
-        assert_eq!(
-            parse_std_probe("202000 1\n", Family::Gnu).as_deref(),
-            Some("gnu23")
-        );
+        assert_eq!(parse_std_probe("202000 1\n").as_deref(), Some("gnu23"));
     }
 
     #[test]
     fn distinguishes_strict_from_gnu_dialect() {
-        assert_eq!(
-            parse_std_probe("201710 0\n", Family::Clang).as_deref(),
-            Some("c17")
-        );
-        assert_eq!(
-            parse_std_probe("201710 1\n", Family::Clang).as_deref(),
-            Some("gnu17")
-        );
-    }
-
-    #[test]
-    fn msvc_legacy_mode_has_no_gnu_dialect() {
-        // MSVC never defines __STRICT_ANSI__; the gnu bit is meaningless there.
-        assert_eq!(
-            parse_std_probe("0 1\n", Family::Msvc).as_deref(),
-            Some("c89")
-        );
+        assert_eq!(parse_std_probe("201710 0\n").as_deref(), Some("c17"));
+        assert_eq!(parse_std_probe("201710 1\n").as_deref(), Some("gnu17"));
     }
 
     #[test]
     fn rejects_garbage() {
-        assert_eq!(parse_std_probe("", Family::Gnu), None);
-        assert_eq!(parse_std_probe("not numbers\n", Family::Gnu), None);
+        assert_eq!(parse_std_probe(""), None);
+        assert_eq!(parse_std_probe("not numbers\n"), None);
     }
 
     #[test]
-    fn family_detection_covers_windows_compilers() {
-        // clang-cl IS clang, but speaks the MSVC dialect: the name must win
-        // over the banner.
-        assert_eq!(
-            family_of(
-                Path::new("C:/LLVM/bin/clang-cl.exe"),
-                "clang version 22.1.6"
-            ),
-            Family::Msvc
-        );
-        assert_eq!(
-            family_of(Path::new("cl.exe"), "Microsoft (R) C/C++"),
-            Family::Msvc
-        );
-        assert_eq!(
-            family_of(Path::new("/usr/bin/clang"), "clang version 22.1.6"),
-            Family::Clang
-        );
-        assert_eq!(
-            family_of(Path::new("/mingw64/bin/gcc.exe"), "gcc (GCC) 14.2"),
-            Family::Gnu
-        );
+    fn family_detection_distinguishes_gcc_from_clang() {
+        assert_eq!(family_of("clang version 22.1.6"), Family::Clang);
+        assert_eq!(family_of("gcc (GCC) 14.2"), Family::Gnu);
         // Apple Command Line Tools may expose a gcc-named Clang driver.
-        assert_eq!(
-            family_of(Path::new("/usr/bin/gcc"), "Apple clang version 21.0.0"),
-            Family::Clang
-        );
+        assert_eq!(family_of("Apple clang version 21.0.0"), Family::Clang);
     }
 
     #[test]
     fn libm_is_linked_only_on_unix() {
-        // On Windows, clang defaults to the MSVC target where `-lm` becomes
-        // a link against a nonexistent m.lib; MinGW keeps math in the CRT.
+        // MinGW keeps math in the C runtime.
         let tc = Toolchain {
             path: "gcc".into(),
             family: Family::Gnu,
@@ -713,7 +549,7 @@ mod tests {
             default_std: None,
             auto_std: false,
         };
-        let args = tc.compile_args(Path::new("in.c"), Path::new("out"), Path::new("."));
+        let args = tc.compile_args(Path::new("in.c"), Path::new("out"));
         assert_eq!(args.contains(&"-lm".to_string()), cfg!(unix));
     }
 }

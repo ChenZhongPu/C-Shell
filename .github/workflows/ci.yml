@@ -39,13 +39,15 @@ jobs:
             name: macos-clang
             cc: clang
             sanitizers: all
-          # cl.exe via a Developer Command Prompt environment — the only
-          # place the MSVC flag dialect gets exercised at all.
+          # WinLibs GCC is the supported Windows toolchain. The Rust binary
+          # is built for windows-gnu so the compiler it drives at run time
+          # and the linker that produced it belong to the same environment.
           - os: windows-latest
-            name: windows-msvc
-            msvc: true
-            cc: cl
-            sanitizers: address
+            name: windows-gnu
+            cc: gcc
+            target: x86_64-pc-windows-gnu
+            # MinGW-w64 GCC ships no ASan/UBSan runtime, so %check tests skip.
+            sanitizers: none
     runs-on: ${{ matrix.os }}
     env:
       CC: ${{ matrix.cc }}
@@ -54,37 +56,53 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
 
-      - uses: ilammy/msvc-dev-cmd@v1
-        if: matrix.msvc
+      - name: Install WinLibs GCC
+        if: runner.os == 'Windows'
+        uses: bwoodsend/setup-winlibs-action@v1
 
       - name: Install Linux compilers and sanitizer runtimes
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y gcc clang libclang-rt-dev
 
-      - name: Require the MSVC AddressSanitizer component
-        if: matrix.msvc
-        shell: pwsh
-        run: |
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.ASAN -property installationPath
-          if (-not $installation) { throw 'The CI image must provide the MSVC AddressSanitizer component.' }
+      - name: Add the GNU Windows Rust target
+        if: runner.os == 'Windows'
+        run: rustup target add ${{ matrix.target }}
 
       - name: Show detected C compilers
         shell: bash
         run: |
-          for c in cc gcc clang cl; do
+          for c in cc gcc clang; do
             command -v "$c" >/dev/null 2>&1 && echo "$c -> $(command -v "$c")" || true
           done
 
-      - run: cargo test --all-targets
+      - name: Test
+        shell: bash
+        run: |
+          if [[ -n "${{ matrix.target }}" ]]; then
+            cargo test --all-targets --target "${{ matrix.target }}"
+          else
+            cargo test --all-targets
+          fi
 
-      - run: cargo build --release
+      - name: Build release binary
+        shell: bash
+        run: |
+          if [[ -n "${{ matrix.target }}" ]]; then
+            cargo build --release --target "${{ matrix.target }}"
+          else
+            cargo build --release
+          fi
 
       - name: Stage binary
         shell: bash
         run: |
           mkdir stage
-          cp "target/release/c-shell${{ runner.os == 'Windows' && '.exe' || '' }}" stage/
+          bin="target/release/c-shell"
+          if [[ -n "${{ matrix.target }}" ]]; then
+            bin="target/${{ matrix.target }}/release/c-shell"
+          fi
+          [[ -f "$bin.exe" ]] && bin="$bin.exe"
+          cp "$bin" stage/
 
       - uses: actions/upload-artifact@v4
         with:

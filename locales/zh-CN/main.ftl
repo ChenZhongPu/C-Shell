@@ -232,7 +232,7 @@ compiler-not-found =
     c-shell 需要能够编译其 C11 风格值打印器的语言模式。
     请安装 gcc 或 clang，或使用 --cc <路径> 指定编译器。{$windows-note}
 compiler-windows-note =
-    在 Windows 上，MSVC（cl.exe）只能从 Developer Command Prompt 中使用。
+    在 Windows 上，请安装 WinLibs GCC（或其他 MinGW-w64 GCC），并将其 bin 目录加入 PATH。
 compiler-default-std = 默认标准
 compiler-default-std-value = 默认标准 {$standard}
 compiler-auto-std = -std={$selected}，已自动提升：默认模式 {$default} 不支持 _Generic
