@@ -75,15 +75,6 @@ jobs:
             command -v "$c" >/dev/null 2>&1 && echo "$c -> $(command -v "$c")" || true
           done
 
-      - name: Test
-        shell: bash
-        run: |
-          if [[ -n "${{ matrix.target }}" ]]; then
-            cargo test --all-targets --target "${{ matrix.target }}"
-          else
-            cargo test --all-targets
-          fi
-
       - name: Build release binary
         shell: bash
         run: |
@@ -108,3 +99,12 @@ jobs:
         with:
           name: c-shell-dev-${{ matrix.name }}
           path: stage/
+
+      - name: Test
+        shell: bash
+        run: |
+          if [[ -n "${{ matrix.target }}" ]]; then
+            cargo test --all-targets --target "${{ matrix.target }}"
+          else
+            cargo test --all-targets
+          fi

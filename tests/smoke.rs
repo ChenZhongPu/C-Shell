@@ -23,6 +23,7 @@ impl Drop for ChildGuard {
     }
 }
 
+#[cfg(unix)]
 struct WebTerminal {
     _server: ChildGuard,
     _stdout: BufReader<std::process::ChildStdout>,
@@ -31,6 +32,7 @@ struct WebTerminal {
     cursor_reports: usize,
 }
 
+#[cfg(unix)]
 impl WebTerminal {
     fn start(command: &mut Command) -> Self {
         let mut child = command
@@ -156,6 +158,7 @@ impl WebTerminal {
     }
 }
 
+#[cfg(unix)]
 impl Drop for WebTerminal {
     fn drop(&mut self) {
         let _ = self.socket.send(WebSocketMessage::Binary(vec![3].into()));
@@ -164,6 +167,7 @@ impl Drop for WebTerminal {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn interactive_terminal_recovers_from_interrupts_in_edit_compile_run_and_input() {
     let dir = tempfile::tempdir().unwrap();
