@@ -21,6 +21,9 @@ use crate::proc;
 use crate::runtime_checks::{self, Checks, Request};
 use crate::session::Session;
 
+#[cfg(unix)]
+pub(crate) mod resident;
+
 pub struct Outcome {
     pub slot: Slot,
     /// What the new input printed itself.
@@ -130,6 +133,9 @@ pub struct Evaluator {
     runtime_checks: Option<Checks>,
     check_cache: std::collections::HashMap<Request, std::result::Result<Checks, String>>,
     expr_plans: std::cell::RefCell<ExprPlans>,
+    /// Step-DLL backend, when `--resident` is active (Unix only).
+    #[cfg(unix)]
+    resident: Option<std::cell::RefCell<resident::Resident>>,
 }
 
 impl Evaluator {
@@ -146,7 +152,40 @@ impl Evaluator {
             runtime_checks: None,
             check_cache: std::collections::HashMap::new(),
             expr_plans: std::cell::RefCell::new(ExprPlans::default()),
+            #[cfg(unix)]
+            resident: None,
         })
+    }
+
+    /// Keep session state in a long-lived runner instead of replaying it.
+    #[cfg(unix)]
+    pub fn enable_resident(&mut self) -> Result<()> {
+        self.resident = Some(std::cell::RefCell::new(resident::Resident::new()?));
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub fn enable_resident(&mut self) -> Result<()> {
+        anyhow::bail!(i18n::text("resident-platform"))
+    }
+
+    pub fn is_resident(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.resident.is_some()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    /// Forget resident state (the runner is restarted lazily).
+    pub fn reset_resident(&mut self) {
+        #[cfg(unix)]
+        if let Some(resident) = &mut self.resident {
+            resident.get_mut().reset();
+        }
     }
 
     fn src_path(&self) -> PathBuf {
@@ -351,6 +390,10 @@ impl Evaluator {
     }
 
     pub fn eval(&self, session: &Session, input: &str) -> Result<Eval> {
+        #[cfg(unix)]
+        if let Some(resident) = &self.resident {
+            return resident.borrow_mut().eval(self, session, input);
+        }
         self.eval_inner(session, input, false)
     }
 

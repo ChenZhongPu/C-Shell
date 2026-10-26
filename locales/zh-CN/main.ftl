@@ -236,3 +236,9 @@ compiler-windows-note =
 compiler-default-std = 默认标准
 compiler-default-std-value = 默认标准 {$standard}
 compiler-auto-std = -std={$selected}，已自动提升：默认模式 {$default} 不支持 _Generic
+arg-resident = 将会话状态保存在常驻进程中，而不是反复重放
+resident-unsupported = 常驻模式无法处理此输入：{$reason}
+resident-platform = 此平台暂不支持 --resident
+resident-type-in-use = `{$name}` 仍被先前的定义使用；请先执行 %reset，再在常驻模式下重新定义
+resident-runner-error = 常驻进程出错：{$error}
+resident-slots-exhausted = 常驻模式的变量槽位已用尽；请执行 %reset

@@ -5,6 +5,8 @@
 //! is to find out what *your* compiler does, not what an interpreter would.
 
 mod codegen;
+#[cfg(unix)]
+mod decl;
 mod editor;
 mod errmap;
 mod eval;
@@ -74,6 +76,10 @@ struct Args {
     #[arg(long, value_enum, value_name = "LANG")]
     lang: Option<Language>,
 
+    /// Keep session state in a resident runner instead of replaying it
+    #[arg(long)]
+    resident: bool,
+
     /// Start a browser terminal available only on this machine
     #[arg(long, conflicts_with = "eval")]
     web: bool,
@@ -131,6 +137,7 @@ fn command_for(language: Language) -> clap::Command {
         .mut_arg("lang", |arg| {
             arg.help(tr("arg-lang")).hide_possible_values(true)
         })
+        .mut_arg("resident", |arg| arg.help(tr("arg-resident")))
         .mut_arg("web", |arg| arg.help(tr("arg-web")))
         .mut_arg("no_open", |arg| arg.help(tr("arg-no-open")));
     if language.is_chinese() {
@@ -213,6 +220,10 @@ fn parse_args(language: Language) -> Args {
 }
 
 fn main() -> Result<std::process::ExitCode> {
+    #[cfg(unix)]
+    if std::env::var_os("C_SHELL_RUNNER").is_some() {
+        return Ok(eval::resident::runner_main());
+    }
     let detected_language = i18n::detect();
     let language = i18n::requested_from_args(std::env::args_os()).unwrap_or(detected_language);
     i18n::set(language);
@@ -232,6 +243,9 @@ fn main() -> Result<std::process::ExitCode> {
         child_args.extend(["--lang".into(), language.code().into()]);
         if args.no_color {
             child_args.push("--no-color".into());
+        }
+        if args.resident {
+            child_args.push("--resident".into());
         }
         web::serve(web::Config {
             child_args,
@@ -260,6 +274,9 @@ fn main() -> Result<std::process::ExitCode> {
 
     let tc = toolchain::Toolchain::detect(args.cc.as_deref(), args.std.as_deref())?;
     let mut ev = Evaluator::new(tc, Duration::from_secs(args.timeout))?;
+    if args.resident {
+        ev.enable_resident()?;
+    }
     // At a real terminal, forward only the newest input's output as it arrives
     // so prompts before scanf are visible. Batch transcripts remain buffered.
     let stdin_is_terminal = std::io::stdin().is_terminal();
@@ -487,7 +504,8 @@ fn submit(
     session.counter = n;
     session.remember_input(n, raw);
 
-    let external_warning = warn_external_replay(raw, session, ui, style);
+    // Nothing is replayed in resident mode, so the replay warning is moot.
+    let external_warning = !ev.is_resident() && warn_external_replay(raw, session, ui, style);
 
     match ev.eval(session, raw)? {
         Eval::CompileError(diag) => {

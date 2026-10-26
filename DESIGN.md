@@ -4,8 +4,8 @@ Settled architecture decisions, the one big open problem, and the traps buried
 in the code that you must know about before changing it. README is for users;
 this file is for whoever develops the tool next.
 
-Status: v0.4.0 working, English/Chinese UI. The default test run has 114 unit
-tests and 79 end-to-end smoke tests; a real-compiler performance benchmark is
+Status: v0.4.0 working, English/Chinese UI. The default test run has 123 unit
+tests and 85 end-to-end smoke tests; a real-compiler performance benchmark is
 ignored by default. Verified locally on Linux with GCC 16.2.1 and Clang
 22.1.8. Native CI covers Linux GCC/Clang, macOS Clang and Windows WinLibs GCC;
 see `.github/workflows/ci.yml` for the exact matrix and required sanitizer
@@ -396,6 +396,26 @@ user-selected compiler, so its long-term performance plan cannot require
 replacing that compiler.
 
 ### Chosen architecture: journaled resident runner
+
+**Status: implemented as the opt-in `--resident` backend (Unix).** See
+`src/eval/resident.rs` (runner, step assembly, recovery) and `src/decl.rs`
+(tree-sitter-c declaration analysis). Deviations from the sketch below:
+
+- tree-sitter is used only to find declarators and classify inputs. A variable's
+  type is never rebuilt: the declarator's identifier is replaced by `(*cs_pN)`,
+  which declares a pointer to exactly that type (`int a[5]` becomes
+  `int (*cs_pN)[5]`, `int (*fp)(double)` becomes `int (*(*cs_pN))(double)`).
+  `int a[] = {…}` reports its element count back through `M_DIM`.
+- Functions are not called through function pointers: each definition gets a
+  unique symbol (`cs_fn_f_7`) and a macro maps `f` to it, with every step loaded
+  `RTLD_GLOBAL`. Redefinition is therefore just a new binding.
+- The runner is `c-shell` itself (`C_SHELL_RUNNER=1`), commands on fd 3 and
+  replies on fd 4; program output keeps the existing marker protocol.
+- Replay survives only as recovery: after a crash, timeout or interrupt the
+  runner restarts and the journal of successful steps is loaded again.
+- Variable-length arrays are disabled (`-Werror=vla`); a type used by live
+  variables or functions cannot be redefined until `%reset`.
+- Not done: Windows (`LoadLibrary` plus a shared CRT), stdin, `%check`.
 
 The key import is evcxr's move: share state by *parameter passing*, not
 through the linker. In C it is stronger than in Rust, because slots can be

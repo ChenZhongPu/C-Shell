@@ -470,6 +470,7 @@ pub fn handle(
 
         "reset" => {
             session.reset();
+            ev.reset_resident();
             println!("{}", ui.dim(&ui.text("session-cleared")));
         }
 

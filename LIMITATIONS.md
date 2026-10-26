@@ -30,6 +30,15 @@
 
 - **Not every C value is printable.** The `_Generic` runtime covers the standard boolean/integer/real-floating types, top-level `char` strings, common object pointers and session-visible structs as described in [HOW_IT_WORKS.md](HOW_IT_WORKS.md). Header-only/anonymous aggregate types that have no reusable C spelling, complex and `void` values are evaluated without `Out[n]` and receive an explanatory note. A member whose type is not in the scalar or generated aggregate table is shown as `<unprintable>` rather than being coerced.
 
+## Resident mode (`--resident`)
+
+- **Experimental and Unix-only.** It needs `dlopen`, so Windows still uses replay.
+- **No variable-length arrays.** Their size cannot be recovered from a declaration, so steps compile with `-Werror=vla`.
+- **A type that earlier definitions still use cannot be redefined** until `%reset`; functions and macros can.
+- **Declarations are one construct per input.** Mixing declarations and statements in one input is rejected, and variables of an anonymous struct/union/enum type are not supported.
+- **A crash, timeout or interrupt restarts the runner** and silently replays the journal of successful steps, so side effects of those steps can repeat in that case.
+- **Not yet covered:** stdin reads, `%check`, live output streaming; `%type`, `%bits`, `%time`, `%timeit` and `%src` still work by replaying the journal.
+
 ## Platform & Process Management
 
 - **Process cleanup follows the launched process tree.** On Unix, the process group is killed when each run ends; a child that explicitly creates a new session with `setsid` can still escape. On Windows, each run is contained in a Job Object that is closed when the run ends.

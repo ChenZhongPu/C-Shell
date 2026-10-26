@@ -133,6 +133,7 @@ c-shell                              # auto-detect a compiler
 c-shell --cc clang --std c23         # request compiler and mode; verify the banner
 c-shell --timeout 30                 # deadline for each compilation and program run
 c-shell --lang zh                    # force the Chinese UI (use en for English)
+c-shell --resident                   # keep state in a resident runner (Linux/macOS)
 c-shell --web                        # open a browser terminal on this machine
 c-shell --web --no-open              # print its local URL without opening it
 c-shell -e 'sizeof(long)'            # evaluate and exit: bare value on stdout,
@@ -545,6 +546,17 @@ For full technical details on accumulation and replay, the stdin tape,
 **[HOW_IT_WORKS.md](HOW_IT_WORKS.md)**.
 Repeated-query compilation measurements and cache rules are in
 [PERFORMANCE.md](PERFORMANCE.md).
+
+### Resident mode (experimental, Linux/macOS)
+
+By default every input rebuilds and reruns the whole session. With
+`--resident` a long-lived runner process keeps your variables instead: each
+input is compiled into one small shared library and `dlopen`ed, so earlier
+code is never executed again and per-input work stays constant as a session
+grows. Variables, arrays, structs, function pointers, functions (including
+redefinition), types and macros work; variable-length arrays are rejected, and
+`%check`, stdin reads and Windows are not supported yet. See
+[DESIGN.md](DESIGN.md) for the design and its limits.
 
 ## Known limitations
 

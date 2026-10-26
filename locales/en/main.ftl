@@ -246,3 +246,9 @@ compiler-windows-note =
 compiler-default-std = default std
 compiler-default-std-value = default std {$standard}
 compiler-auto-std = -std={$selected}, auto-raised: default {$default} lacks _Generic
+arg-resident = Keep session state in a resident runner instead of replaying it
+resident-unsupported = Resident mode cannot handle this input: {$reason}
+resident-platform = --resident is not supported on this platform yet
+resident-type-in-use = `{$name}` is still used by earlier definitions; run %reset before redefining it in resident mode
+resident-runner-error = Resident runner failed: {$error}
+resident-slots-exhausted = Resident mode has no free variable slots left; run %reset

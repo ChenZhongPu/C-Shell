@@ -31,6 +31,9 @@ pub const M_STDIN_DONE: &str = "\x01\x02c-shell/stdin-end\x02\x01";
 pub const M_UTF8: &str = "\x01\x02c-shell/utf8\x02\x01";
 /// Prefix for `%utf8`/`%utf16`/`%utf32` code-unit probe payloads.
 pub const M_UNICODE: &str = "\x01\x02c-shell/unicode\x02\x01";
+/// Prefix for `slot:count` lines a resident step prints for variables whose
+/// outermost array dimension was inferred from an initializer (`int a[] = …`).
+pub const M_DIM: &str = "\x01\x02c-shell/dim\x02\x01";
 
 /// Headers every generated program includes before any user code, so beginners
 /// need no `#include` for the common library. `%header` shows this list.
@@ -986,6 +989,33 @@ impl Source {
     }
 }
 
+/// Headers, protocol marker definitions and the value-printing runtime that
+/// every generated translation unit starts with.
+pub(crate) fn prelude(bits: bool, timed: bool) -> String {
+    let mut src = String::from(HEADERS);
+    // Ahead of the runtime, which expands them.
+    src.push_str(&format!("#define CS_M_NEW \"{}\"\n", escape(M_NEW)));
+    src.push_str(&format!("#define CS_M_VAL \"{}\"\n", escape(M_VAL)));
+    src.push_str(&format!("#define CS_M_TIME \"{}\"\n", escape(M_TIME)));
+    src.push_str(&format!("#define CS_M_DONE \"{}\"\n", escape(M_DONE)));
+    src.push_str(&format!("#define CS_M_STDIN \"{}\"\n", escape(M_STDIN)));
+    src.push_str(&format!(
+        "#define CS_M_STDIN_DONE \"{}\"\n",
+        escape(M_STDIN_DONE)
+    ));
+    src.push_str(&format!("#define CS_M_UTF8 \"{}\"\n", escape(M_UTF8)));
+    src.push_str(&format!("#define CS_M_UNICODE \"{}\"\n", escape(M_UNICODE)));
+    src.push_str(&format!("#define CS_M_DIM \"{}\"\n", escape(M_DIM)));
+    if bits {
+        src.push_str("#define CS_ENABLE_BITS 1\n");
+    }
+    if timed {
+        src.push_str("#define CS_ENABLE_TIME_ONCE 1\n");
+    }
+    src.push_str(RUNTIME);
+    src
+}
+
 fn build_inner(session: &Session, input: &str, flavor: BuildFlavor, timed: bool) -> Program {
     let slot = flavor.slot();
     let silent_expr = matches!(flavor, BuildFlavor::SilentExpr);
@@ -1018,26 +1048,7 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor, timed: bool)
     let mut new_start_line = 1usize;
     let mut session_line_ranges = Vec::new();
 
-    src.push_str(HEADERS);
-    // Ahead of the runtime, which expands them.
-    src.push_str(&format!("#define CS_M_NEW \"{}\"\n", escape(M_NEW)));
-    src.push_str(&format!("#define CS_M_VAL \"{}\"\n", escape(M_VAL)));
-    src.push_str(&format!("#define CS_M_TIME \"{}\"\n", escape(M_TIME)));
-    src.push_str(&format!("#define CS_M_DONE \"{}\"\n", escape(M_DONE)));
-    src.push_str(&format!("#define CS_M_STDIN \"{}\"\n", escape(M_STDIN)));
-    src.push_str(&format!(
-        "#define CS_M_STDIN_DONE \"{}\"\n",
-        escape(M_STDIN_DONE)
-    ));
-    src.push_str(&format!("#define CS_M_UTF8 \"{}\"\n", escape(M_UTF8)));
-    src.push_str(&format!("#define CS_M_UNICODE \"{}\"\n", escape(M_UNICODE)));
-    if bits_uppercase.is_some() {
-        src.push_str("#define CS_ENABLE_BITS 1\n");
-    }
-    if timed {
-        src.push_str("#define CS_ENABLE_TIME_ONCE 1\n");
-    }
-    src.push_str(RUNTIME);
+    src.push_str(&prelude(bits_uppercase.is_some(), timed));
 
     for (index, item) in session.file_items().iter().enumerate() {
         if file_replacement == Some(index) {
@@ -1215,7 +1226,7 @@ struct AggregatePrinter {
 /// definitions are visible. Pointers are never dereferenced. Declarators that
 /// are easy to misidentify (multi-declarators, function pointers, bit-fields
 /// and anonymous members) select an explicit raw-byte fallback instead.
-fn build_aggregate_printers(source: &str) -> String {
+pub(crate) fn build_aggregate_printers(source: &str) -> String {
     let printers = collect_aggregate_printers(source);
     if printers.is_empty() {
         return String::new();
@@ -1839,7 +1850,7 @@ fn type_tokens(src: &str) -> Vec<TypeToken> {
     out
 }
 
-fn escape(s: &str) -> String {
+pub(crate) fn escape(s: &str) -> String {
     s.bytes().map(|b| format!("\\x{b:02x}")).collect()
 }
 

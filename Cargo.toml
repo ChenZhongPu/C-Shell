@@ -39,6 +39,9 @@ tungstenite = "0.29"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# Declaration analysis for the resident (Step-DLL) backend.
+tree-sitter = "0.27.1"
+tree-sitter-c = "0.24.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

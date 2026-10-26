@@ -45,7 +45,7 @@ pub fn interrupted() -> bool {
     INTERRUPTED.load(Ordering::Relaxed)
 }
 
-fn install_interrupt_handler() {
+pub(crate) fn install_interrupt_handler() {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
         return;

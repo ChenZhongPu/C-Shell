@@ -2676,3 +2676,136 @@ fn buffered_character_reads_do_not_wait_for_another_input_line() {
         format!("97 98 10{newline}42\n")
     );
 }
+
+/// Evaluate `codes` with `-e` in resident (Step-DLL) mode.
+#[cfg(unix)]
+fn resident_evals(timeout: u32, codes: &[&str]) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_c-shell"));
+    command.args(["--no-color", "--lang", "en", "--resident"]);
+    command.args(["--timeout", &timeout.to_string()]);
+    for code in codes {
+        command.args(["-e", code]);
+    }
+    command.output().expect("run c-shell --resident")
+}
+
+#[cfg(unix)]
+fn resident_stdout(codes: &[&str]) -> String {
+    let output = resident_evals(15, codes);
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[cfg(unix)]
+#[test]
+fn resident_state_lives_in_one_process_instead_of_being_replayed() {
+    let out = resident_stdout(&[
+        "#include <unistd.h>",
+        "long first = getpid();",
+        "int unrelated = 1;",
+        "first == getpid()",
+    ]);
+    assert_eq!(out, "1\n", "later inputs ran in a different process");
+}
+
+#[cfg(unix)]
+#[test]
+fn resident_variables_arrays_and_structs_survive_between_inputs() {
+    let out = resident_stdout(&[
+        "int x = 42;",
+        "x = x + 1;",
+        "x",
+        "int a[] = {1, 2, 3};",
+        "sizeof a",
+        "a[1] = 9;",
+        "a",
+        "struct P { int x; int y; } p = {1, 2};",
+        "p.y = 7;",
+        "p",
+        "char *s = \"hi\";",
+        "s",
+        "int add(int a, int b) { return a + b; }",
+        "int (*fp)(int, int) = add;",
+        "fp(2, 3)",
+    ]);
+    assert_eq!(out, "43\n12\n{1, 9, 3}\n{ .x = 1, .y = 7 }\n\"hi\"\n5\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn resident_function_redefinition_rebinds_the_name() {
+    let out = resident_stdout(&[
+        "int f(int n) { return n + 1; }",
+        "int g(int n) { return f(n) * 10; }",
+        "int f(int n) { return n + 100; }",
+        "f(1)",
+        "g(1)",
+    ]);
+    // The new `f` is used by later inputs; `g` still calls the `f` it saw.
+    assert_eq!(out, "101\n20\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn resident_rejects_variable_length_arrays_and_busy_type_redefinition() {
+    let output = resident_evals(15, &["int n = 3;", "int v[n];"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("variable length array"), "{stderr}");
+    assert!(
+        !stderr.contains("cs_p"),
+        "generated names leaked into diagnostics: {stderr}"
+    );
+
+    let output = resident_evals(
+        15,
+        &[
+            "struct Q { int a; };",
+            "struct Q q = {7};",
+            "struct Q { int a; int b; };",
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("`Q` is still used"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn resident_restores_state_after_a_crash_or_timeout() {
+    let output = resident_evals(
+        2,
+        &[
+            "int keep = 11;",
+            "int *p = 0;",
+            "*p = 1;",
+            "keep",
+            "for (;;) {}",
+            "keep + 1",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("segmentation fault"), "{stderr}");
+    assert!(stderr.contains("killed after 2s"), "{stderr}");
+    assert_eq!(stdout, "11\n12\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn resident_reports_compile_errors_in_input_coordinates() {
+    let output = resident_evals(15, &["int ok = 1;", "ok + missing"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("<input>:1:"), "{stderr}");
+    assert!(stderr.contains("missing"), "{stderr}");
+    assert!(!stderr.contains("cs_step"), "{stderr}");
+}
