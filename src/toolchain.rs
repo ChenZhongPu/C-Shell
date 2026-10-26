@@ -293,8 +293,12 @@ impl Toolchain {
         for name in names {
             let path = match which::which(&name) {
                 Ok(p) => p,
-                Err(_) => {
-                    tried.push(name);
+                Err(e) => {
+                    if explicit.is_some() {
+                        tried.push(format!("{name} ({e})"));
+                    } else {
+                        tried.push(name);
+                    }
                     continue;
                 }
             };
@@ -303,8 +307,8 @@ impl Toolchain {
             }
             let banner = match banner_of(&path) {
                 Ok(b) => b,
-                Err(_) => {
-                    tried.push(name);
+                Err(e) => {
+                    tried.push(format!("{} ({e:#})", path.display()));
                     continue;
                 }
             };

@@ -216,14 +216,7 @@ fn run_inner(
     let hand_over_tty = unix::prepare(cmd, matches!(&input, ChildInput::Inherit));
     let mut child = cmd.spawn()?;
     #[cfg(windows)]
-    let job = match windows::Job::attach(&child) {
-        Ok(job) => job,
-        Err(error) => {
-            kill_tree(&child);
-            let _ = child.wait();
-            return Err(error);
-        }
-    };
+    let _job = windows::Job::attach(&child).ok();
     #[cfg(unix)]
     if hand_over_tty {
         unix::give_terminal_to(child.id());
@@ -265,9 +258,6 @@ fn run_inner(
     if hand_over_tty {
         unix::take_terminal_back();
     }
-
-    #[cfg(windows)]
-    drop(job);
 
     // Readers normally end the instant the last write end closes. If a
     // descendant escaped containment (for example with setsid on Unix), the
