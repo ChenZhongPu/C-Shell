@@ -104,7 +104,7 @@ fn parse_std_probe(out: &str) -> Option<String> {
 /// (or another MinGW-w64 GCC) is the supported toolchain; `cc` is rarely
 /// present but costs nothing to try.
 #[cfg(windows)]
-const CANDIDATES: &[&str] = &["gcc", "clang", "cc"];
+const CANDIDATES: &[&str] = &["gcc.exe", "gcc", "clang.exe", "clang", "cc.exe", "cc"];
 #[cfg(not(windows))]
 const CANDIDATES: &[&str] = &["cc", "gcc", "clang"];
 
