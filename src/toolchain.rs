@@ -288,9 +288,17 @@ impl Toolchain {
         let mut names: Vec<String> = Vec::new();
         if let Some(e) = explicit {
             names.push(e.to_string());
+            #[cfg(windows)]
+            if !e.to_ascii_lowercase().ends_with(".exe") {
+                names.push(format!("{e}.exe"));
+            }
         } else {
             if let Some(cc) = std::env::var("CC").ok().filter(|c| !c.trim().is_empty()) {
-                names.push(cc);
+                names.push(cc.clone());
+                #[cfg(windows)]
+                if !cc.to_ascii_lowercase().ends_with(".exe") {
+                    names.push(format!("{cc}.exe"));
+                }
             }
             names.extend(CANDIDATES.iter().map(|s| s.to_string()));
         }
@@ -407,6 +415,7 @@ impl Toolchain {
         // Enabled by -Wextra and not part of the umbrella.
         a.push("-Wno-unused-parameter".into());
         a.push("-fno-diagnostics-color".into());
+        a.push("-pipe".into());
         a.push("-x".into());
         a.push("c".into());
         a.push(src.display().to_string());
