@@ -255,8 +255,13 @@ fn store_cached(tc: &Toolchain, requested_std: Option<&str>) {
 }
 
 fn banner_of(path: &Path) -> Result<String> {
-    let out = probe_output(Command::new(path).arg("--version"))
-        .with_context(|| format!("failed to run {}", path.display()))?;
+    let mut cmd = Command::new(path);
+    cmd.arg("--version");
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        cmd.current_dir(parent);
+    }
+    let out =
+        probe_output(&mut cmd).with_context(|| format!("failed to run {}", path.display()))?;
     let pick = |b: &[u8]| {
         String::from_utf8_lossy(b)
             .lines()
@@ -429,6 +434,7 @@ impl Toolchain {
             .path()
             .join(format!("probe{}", std::env::consts::EXE_SUFFIX));
         let mut cmd = Command::new(&self.path);
+        cmd.current_dir(dir.path());
         cmd.args(args);
         cmd.arg("-x").arg("c").arg(&src).arg("-o").arg(&exe);
         probe_output(&mut cmd).is_some_and(|c| c.status.is_some_and(|st| st.success()))
@@ -444,17 +450,20 @@ impl Toolchain {
             .path()
             .join(format!("probe{}", std::env::consts::EXE_SUFFIX));
         let mut cmd = Command::new(&self.path);
+        cmd.current_dir(dir.path());
         cmd.args(args);
         cmd.arg("-x").arg("c").arg(&src).arg("-o").arg(&exe);
         let ok = probe_output(&mut cmd).is_some_and(|c| c.status.is_some_and(|st| st.success()));
         if !ok {
             return None;
         }
-        let run = probe_output(&mut Command::new(&exe))?;
-        if !run.status.is_some_and(|st| st.success()) {
+        let mut run = Command::new(&exe);
+        run.current_dir(dir.path());
+        let run_cap = probe_output(&mut run)?;
+        if !run_cap.status.is_some_and(|st| st.success()) {
             return None;
         }
-        Some(String::from_utf8_lossy(&run.stdout).into_owned())
+        Some(String::from_utf8_lossy(&run_cap.stdout).into_owned())
     }
 
     fn supports_std(&self, std: &str) -> bool {

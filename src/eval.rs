@@ -224,6 +224,7 @@ impl Evaluator {
             None => self.tc.compile_args(&src, &exe),
         };
         let mut cmd = Command::new(&self.tc.path);
+        cmd.current_dir(self.dir.path());
         cmd.args(&args);
         let cap = match proc::run_captured(&mut cmd, self.timeout, false) {
             Ok(c) => c,
