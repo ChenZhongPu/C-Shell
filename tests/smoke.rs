@@ -2876,3 +2876,71 @@ fn resident_probes_report_errors_and_survive_crashes() {
         "{stderr}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn resident_declarations_without_initializers_are_zeroed_and_quiet() {
+    let output = resident_evals(
+        15,
+        &[
+            "int i;",
+            "int arr[3];",
+            "struct S { int a; int b; } s;",
+            "i",
+            "arr",
+            "s",
+        ],
+    );
+    assert!(output.status.success());
+    // No stray notes from generated copying code (`'i' declared here`).
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "0\n{0, 0, 0}\n{ .a = 0, .b = 0 }\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn resident_programs_read_piped_stdin_across_inputs() {
+    let output = run_evals_with_stdin_resident(
+        &[
+            "int v = -1, w = -1;",
+            "int r = scanf(\"%d\", &v);",
+            "scanf(\"%d\", &w);",
+            "v",
+            "w",
+            "r",
+        ],
+        "42 7\n",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The second scanf is served from the buffer the first one filled.
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n7\n1\n");
+}
+
+#[cfg(unix)]
+fn run_evals_with_stdin_resident(codes: &[&str], input: &str) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_c-shell"));
+    command.args(["--no-color", "--lang", "en", "--resident"]);
+    for code in codes {
+        command.args(["-e", code]);
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start c-shell --resident with program stdin");
+    child
+        .stdin
+        .take()
+        .expect("program stdin")
+        .write_all(input.as_bytes())
+        .expect("write program stdin");
+    child.wait_with_output().expect("wait for c-shell")
+}

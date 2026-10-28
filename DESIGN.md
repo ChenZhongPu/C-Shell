@@ -5,7 +5,7 @@ in the code that you must know about before changing it. README is for users;
 this file is for whoever develops the tool next.
 
 Status: v0.4.0 working, English/Chinese UI. The default test run has 123 unit
-tests and 88 end-to-end smoke tests; a real-compiler performance benchmark is
+tests and 90 end-to-end smoke tests; a real-compiler performance benchmark is
 ignored by default. Verified locally on Linux with GCC 16.2.1 and Clang
 22.1.8. Native CI covers Linux GCC/Clang, macOS Clang and Windows WinLibs GCC;
 see `.github/workflows/ci.yml` for the exact matrix and required sanitizer

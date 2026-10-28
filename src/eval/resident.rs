@@ -22,7 +22,7 @@ use crate::codegen::{self, M_DIM, M_DONE, M_NEW, Slot};
 use crate::decl::{self, Analysis, FileItem, FuncDef, Plan, VarDecl};
 use crate::session::Session;
 use crate::{errmap, i18n, lex, proc};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use std::ffi::{CStr, CString, c_void};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -232,14 +232,18 @@ fn absorb(buffer: &mut Vec<u8>, chunk: &[u8], seen: &mut bool, truncated: &mut b
 }
 
 impl Runner {
-    fn spawn() -> Result<Self> {
+    fn spawn(inherit_stdin: bool) -> Result<Self> {
         let exe = std::env::current_exe().context("cannot locate the c-shell executable")?;
         let (commands_read, commands_write) = pipe()?;
         let (reply_read, reply_write) = pipe()?;
         let mut command = Command::new(exe);
         command
             .env("C_SHELL_RUNNER", "1")
-            .stdin(Stdio::null())
+            .stdin(if inherit_stdin {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
@@ -419,6 +423,7 @@ pub struct Resident {
     journal: Vec<Library>,
     /// `%time` is running: wrap the input in the single-input timer.
     timed: bool,
+    inherit_stdin: bool,
 }
 
 fn line_of(src: &str) -> usize {
@@ -617,6 +622,14 @@ impl Resident {
                 for (offset, var) in vars.iter().enumerate() {
                     let slot = delta.first_slot + offset;
                     let name = &var.name;
+                    // Without an initializer the compiler would warn about
+                    // copying an uninitialized object, and the session would
+                    // hold stack garbage. Zero it, like static storage.
+                    if var.init == var.declarator {
+                        src.push_str(&format!(
+                            "    memset((void *)&{name}, 0, sizeof({name}));\n"
+                        ));
+                    }
                     src.push_str(&format!(
                         "    cs_slot[{slot}] = malloc(sizeof({name}));\n    if (!cs_slot[{slot}]) abort();\n    memcpy(cs_slot[{slot}], &{name}, sizeof({name}));\n"
                     ));
@@ -698,7 +711,7 @@ impl Resident {
 
     fn ensure_runner(&mut self) -> Result<&mut Runner> {
         if self.runner.is_none() {
-            self.runner = Some(Runner::spawn()?);
+            self.runner = Some(Runner::spawn(self.inherit_stdin)?);
         }
         Ok(self.runner.as_mut().expect("runner was just created"))
     }
@@ -707,7 +720,7 @@ impl Resident {
     /// effects of those steps repeat; this is recovery, not the normal path.
     fn recover(&mut self, timeout: Duration) {
         self.runner = None;
-        let Ok(mut runner) = Runner::spawn() else {
+        let Ok(mut runner) = Runner::spawn(self.inherit_stdin) else {
             self.reset();
             return;
         };
@@ -941,6 +954,7 @@ impl Resident {
     }
 
     pub fn eval(&mut self, ev: &Evaluator, session: &Session, input: &str) -> Result<Eval> {
+        self.inherit_stdin = ev.allow_program_stdin;
         let trimmed = input.trim();
         let mut plan_error = None;
         match decl::analyze(trimmed) {
@@ -1207,15 +1221,8 @@ fn take_dims(output: &str) -> (String, Vec<(usize, usize)>) {
 
 impl Resident {
     pub fn new() -> Result<Self> {
-        let mut resident = Self::default();
-        // Fail early, with a useful message, if the runner cannot start.
-        resident.ensure_runner().map(|_| ()).map_err(|error| {
-            anyhow!(i18n::text_with(
-                "resident-runner-error",
-                &[("error", format!("{error:#}"))]
-            ))
-        })?;
-        Ok(resident)
+        // The runner starts lazily: its stdin depends on how c-shell is used.
+        Ok(Self::default())
     }
 }
 
