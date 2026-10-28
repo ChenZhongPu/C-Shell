@@ -30,15 +30,12 @@ jobs:
           - os: ubuntu-latest
             name: linux-gcc
             cc: gcc
-            sanitizers: all
           - os: ubuntu-latest
             name: linux-clang
             cc: clang
-            sanitizers: all
           - os: macos-latest
             name: macos-clang
             cc: clang
-            sanitizers: all
           # WinLibs GCC is the supported Windows toolchain. The Rust binary
           # is built for windows-gnu so the compiler it drives at run time
           # and the linker that produced it belong to the same environment.
@@ -46,12 +43,9 @@ jobs:
             name: windows-gnu
             cc: gcc
             target: x86_64-pc-windows-gnu
-            # MinGW-w64 GCC ships no ASan/UBSan runtime, so %check tests skip.
-            sanitizers: none
     runs-on: ${{ matrix.os }}
     env:
       CC: ${{ matrix.cc }}
-      C_SHELL_TEST_REQUIRE_SANITIZERS: ${{ matrix.sanitizers }}
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -60,9 +54,9 @@ jobs:
         if: runner.os == 'Windows'
         uses: bwoodsend/setup-winlibs-action@v1
 
-      - name: Install Linux compilers and sanitizer runtimes
+      - name: Install Linux compilers
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y gcc clang libclang-rt-dev
+        run: sudo apt-get update && sudo apt-get install -y gcc clang
 
       - name: Add the GNU Windows Rust target
         if: runner.os == 'Windows'

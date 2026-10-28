@@ -4,14 +4,14 @@ Settled architecture decisions, the one big open problem, and the traps buried
 in the code that you must know about before changing it. README is for users;
 this file is for whoever develops the tool next.
 
-Status: v0.4.0 working, English/Chinese UI. The default test run has 124 unit
-tests and 90 end-to-end smoke tests; a real-compiler performance benchmark is
-ignored by default. Verified locally on Linux with GCC 16.2.1 and Clang
+Status: v0.4.0 working, English/Chinese UI. The default test run includes unit
+and end-to-end smoke tests; a real-compiler performance benchmark is ignored
+by default. Verified locally on Linux with GCC 16.2.1 and Clang
 22.1.8. Native CI covers Linux GCC/Clang, macOS Clang and Windows WinLibs GCC;
-see `.github/workflows/ci.yml` for the exact matrix and required sanitizer
-backends. WinLibs' MinGW-targeting `clang` uses the same GNU-style driver
-interface and is supported but not part of the Windows CI matrix. Windows is
-validated in its native WinLibs CI job, without local cross-builds.
+see `.github/workflows/ci.yml` for the exact matrix. WinLibs' MinGW-targeting
+`clang` uses the same GNU-style driver interface and is supported but not part
+of the Windows CI matrix. Windows is validated in its native WinLibs CI job,
+without local cross-builds.
 
 ---
 
@@ -28,7 +28,6 @@ validated in its native WinLibs CI job, without local cross-builds.
 | `errmap.rs` | diagnostic provenance/remapping, scaffolding removal, stale-warning filtering |
 | `tests/smoke.rs` | end-to-end tests driving the real binary and compiler |
 | `proc.rs` | child deadlines, output capture, request-driven stdin tape transport and timeout-path process-tree cleanup |
-| `runtime_checks.rs` | on-demand sanitizer probing, compiler flags and temporary checked execution configuration |
 | `magic.rs` | `%` commands, numbered-input lookup and optional `clang-format` presentation |
 | `std_index.rs` | curated ISO C89–C23 identifier-to-header and availability metadata for `%where` |
 | `codegen.rs` | program assembly, shadowing/replacement variants, `_Generic` runtimes |
@@ -51,7 +50,7 @@ control/do-while/preprocessor continuation, tab completion (magics, C keywords,
 retained session names), process-local Up/Down recall and numbered-input
 `%edit [n]`, `-e`/redirected/piped-input batch modes,
 `%help [--verbose] %quit %clear %reset %src %header %edit %type %bits %Bits
-%utf8 %utf16 %utf32 %where %check %time %timeit %cc %std`, deadlines and
+%utf8 %utf16 %utf32 %where %time %timeit %cc %std`, deadlines and
 timeout-path tree cleanup for compiler/probe/user-program children, cached
 compiler capability probes, CI for 4 platform configs, and a tag-triggered release
 workflow.
@@ -421,8 +420,7 @@ replacing that compiler.
 - Only output is allowed (`lex::blocked_resident_calls`): input reads and
   calls that change files, processes or the environment are refused before
   compiling. That is what makes journal recovery safe without a stdin tape.
-- Not done: Windows (`LoadLibrary` plus a shared CRT) and `%check`,
-  which still replays the committed session text in a fresh instrumented program.
+- Not done: Windows (`LoadLibrary` plus a shared CRT).
 
 The key import is evcxr's move: share state by *parameter passing*, not
 through the linker. In C it is stronger than in Rust, because slots can be

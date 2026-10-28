@@ -18,7 +18,6 @@ use crate::errmap;
 use crate::i18n;
 use crate::lex;
 use crate::proc;
-use crate::runtime_checks::{self, Checks, Request};
 use crate::session::Session;
 
 #[cfg(unix)]
@@ -32,9 +31,6 @@ pub struct Outcome {
     pub value: Option<String>,
     /// Anything the new input wrote to stderr.
     pub errors: String,
-    /// Sanitizer diagnostics are captured separately so live program prompts
-    /// remain visible and native stack traces never bypass the check renderer.
-    pub runtime_report: Option<String>,
     /// Live program output already reached the terminal but did not end in
     /// `\n`; the renderer must separate subsequent diagnostics/value/prompt.
     pub streamed_output_needs_newline: bool,
@@ -130,8 +126,6 @@ pub struct Evaluator {
     pub timeout: Duration,
     stream_output: bool,
     allow_program_stdin: bool,
-    runtime_checks: Option<Checks>,
-    check_cache: std::collections::HashMap<Request, std::result::Result<Checks, String>>,
     expr_plans: std::cell::RefCell<ExprPlans>,
     /// Step-DLL backend, when `--resident` is active (Unix only).
     #[cfg(unix)]
@@ -149,8 +143,6 @@ impl Evaluator {
             timeout,
             stream_output: false,
             allow_program_stdin: false,
-            runtime_checks: None,
-            check_cache: std::collections::HashMap::new(),
             expr_plans: std::cell::RefCell::new(ExprPlans::default()),
             #[cfg(unix)]
             resident: None,
@@ -213,29 +205,7 @@ impl Evaluator {
     /// Swap in a different compiler, re-probing what it supports.
     pub fn set_toolchain(&mut self, tc: crate::toolchain::Toolchain) {
         self.tc = tc;
-        self.check_cache.clear();
         self.expr_plans.get_mut().entries.clear();
-    }
-
-    /// Check one input in a temporary instrumented evaluator. Neither valid
-    /// nor invalid checked inputs are committed; ordinary evaluation remains
-    /// unchanged. Only the requested backend is probed, with session-local
-    /// results invalidated by `%cc` and `%std`.
-    pub fn check(&mut self, session: &Session, input: &str, request: Request) -> Result<Eval> {
-        let checks = self
-            .check_cache
-            .entry(request)
-            .or_insert_with(|| Checks::detect(&self.tc, request, self.timeout))
-            .clone();
-        let checks = match checks {
-            Ok(checks) => checks,
-            Err(message) => return Ok(Eval::CompileError(message)),
-        };
-        let mut checked = Self::new(self.tc.clone(), self.timeout)?;
-        checked.runtime_checks = Some(checks);
-        checked.stream_output = self.stream_output;
-        checked.allow_program_stdin = self.allow_program_stdin;
-        checked.eval(session, input)
     }
 
     /// Compile `text`. Either way the compiler's raw diagnostics come back —
@@ -258,10 +228,7 @@ impl Evaluator {
                 &[("error", e.to_string())],
             ));
         }
-        let args = match self.runtime_checks {
-            Some(checks) => checks.compile_args(&self.tc, &src, &exe),
-            None => self.tc.compile_args(&src, &exe),
-        };
+        let args = self.tc.compile_args(&src, &exe);
         let mut cmd = Command::new(&self.tc.path);
         cmd.current_dir(self.dir.path());
         cmd.args(&args);
@@ -782,15 +749,7 @@ impl Evaluator {
     ) -> Result<std::result::Result<Outcome, String>> {
         match self.compile_program(&prog) {
             Ok((exe, warnings)) => {
-                let mut outcome =
-                    self.run(&exe, slot, warnings, prog.uses_stdin_tape, stdin_tape)?;
-                if let Some(report) = &mut outcome.runtime_report {
-                    *report = errmap::remap_runtime(
-                        report,
-                        &self.src_path().display().to_string(),
-                        &prog,
-                    );
-                }
+                let outcome = self.run(&exe, slot, warnings, prog.uses_stdin_tape, stdin_tape)?;
                 Ok(Ok(outcome))
             }
             Err(diag) => Ok(Err(diag)),
@@ -855,22 +814,11 @@ impl Evaluator {
         uses_stdin_tape: bool,
         stdin_tape: &[proc::StdinEvent],
     ) -> Result<Outcome> {
-        let runtime_capture = self
-            .runtime_checks
-            .map(|checks| checks.capture(&mut cmd))
-            .transpose()
-            .context("Unable to capture runtime check diagnostics")?;
         let executable = cmd.get_program().to_os_string();
         let taped = uses_stdin_tape || !stdin_tape.is_empty();
         let (request_tx, request_rx) = mpsc::channel();
-        let live = (self.stream_output || taped).then(|| {
-            LiveStreams::new(
-                self.stream_output,
-                request_tx,
-                self.runtime_checks
-                    .map(|_| self.src_path().display().to_string()),
-            )
-        });
+        let live =
+            (self.stream_output || taped).then(|| LiveStreams::new(self.stream_output, request_tx));
         let start_time = std::time::Instant::now();
         let cap = if taped {
             proc::run_observed_with_stdin_tape(
@@ -903,56 +851,14 @@ impl Evaluator {
         }
 
         let out = String::from_utf8_lossy(&cap.stdout).into_owned();
-        let raw_err = String::from_utf8_lossy(&cap.stderr).into_owned();
-        let (err, stderr_report) = if self.runtime_checks.is_some()
-            && cap.status.is_some_and(|status| !status.success())
-        {
-            runtime_checks::split_stderr(&raw_err, &self.src_path().display().to_string())
-        } else {
-            (raw_err.as_str(), None)
-        };
-        let mut runtime_report = runtime_capture
-            .as_ref()
-            .map(|capture| capture.read())
-            .transpose()
-            .context("Unable to read runtime check diagnostics")?
-            .filter(|report| !report.is_empty());
-        if let Some(report) = stderr_report {
-            runtime_report
-                .get_or_insert_with(String::new)
-                .push_str(report);
-        }
+        let err = String::from_utf8_lossy(&cap.stderr).into_owned();
         let out_parts = split_new(&out, true);
-        let err_parts = split_new(err, false);
+        let err_parts = split_new(&err, false);
         let timed_duration = out_parts.time_ns.map(Duration::from_nanos);
         let duration = timed_duration.unwrap_or(process_duration);
 
-        let checked_failure = self.runtime_checks.is_some()
-            && (runtime_report.is_some()
-                || !cap.status.is_some_and(|status| status.success())
-                || !out_parts.done
-                || !err_parts.done
-                || cap.stdout_truncated
-                || cap.stderr_truncated
-                || cap.stdin_diverged);
         let abnormal = if cap.interrupted {
-            Some(if self.runtime_checks.is_some() {
-                "Runtime check interrupted.".to_string()
-            } else {
-                i18n::text("program-interrupted")
-            })
-        } else if checked_failure {
-            Some(if cap.status.is_none() {
-                format!("Runtime check timed out after {}s.", self.timeout.as_secs())
-            } else if runtime_report.is_some() {
-                "Runtime check failed.".to_string()
-            } else if cap.stdout_truncated || cap.stderr_truncated {
-                "Runtime check output exceeded the capture limit.".to_string()
-            } else if cap.stdin_diverged {
-                "Runtime check failed: recorded stdin diverged during replay.".to_string()
-            } else {
-                "Runtime check did not complete successfully.".to_string()
-            })
+            Some(i18n::text("program-interrupted"))
         } else {
             match cap.status {
                 None => Some(i18n::text_with(
@@ -978,36 +884,11 @@ impl Evaluator {
             })
         };
 
-        // Keep ordinary stderr from a failed checked run, including replay or
-        // exit handlers. Current-input live stderr is already visible. Native
-        // sanitizer diagnostics are captured separately in runtime_report.
-        let errors = if checked_failure {
-            let diagnostic = if self.stream_output {
-                match err.find(M_NEW) {
-                    None => err,
-                    Some(_) => err.rsplit_once(M_DONE).map_or("", |(_, tail)| tail),
-                }
-            } else {
-                err
-            };
-            diagnostic
-                .replace(M_NEW, "")
-                .replace(M_DONE, "")
-                .replace(M_STDIN, "")
-                .replace(M_STDIN_DONE, "")
-        } else if self.stream_output {
+        let errors = if self.stream_output {
             String::new()
         } else {
             err_parts.output
         };
-
-        if self.stream_output && !checked_failure {
-            // A successful program may print a diagnostic-looking example.
-            // Restore the withheld bytes from the current input, without
-            // replay/protocol bytes or byte offsets into lossy UTF-8 strings.
-            let live = live.as_ref().expect("live output");
-            live.restore_stderr(&live.take_suppressed_stderr());
-        }
 
         let streamed_output_needs_newline = live
             .as_ref()
@@ -1022,14 +903,12 @@ impl Evaluator {
             },
             value: out_parts.value.filter(|_| {
                 slot == Slot::Expr
-                    && !checked_failure
                     && out_parts.done
                     && err_parts.done
                     && !cap.stdout_truncated
                     && !cap.stderr_truncated
             }),
             errors,
-            runtime_report,
             streamed_output_needs_newline,
             stdin_events: cap.stdin_recorded,
             warnings,
@@ -1171,7 +1050,6 @@ impl Evaluator {
             output: last_outcome.output,
             value: Some(report),
             errors: last_outcome.errors,
-            runtime_report: last_outcome.runtime_report,
             streamed_output_needs_newline: last_outcome.streamed_output_needs_newline,
             stdin_events: Vec::new(),
             warnings: last_outcome.warnings,
@@ -1823,44 +1701,16 @@ struct LiveStreams {
     terminal: Arc<Mutex<TerminalVisibility>>,
     stream_visible: bool,
     stdin_requests: mpsc::Sender<proc::StdinRequest>,
-    stderr_report_filter: Option<Arc<Mutex<runtime_checks::StderrFilter>>>,
 }
 
 impl LiveStreams {
-    fn restore_stderr(&self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        let mut terminal = self.terminal.lock().expect("terminal visibility");
-        let mut stderr = std::io::stderr().lock();
-        let _ = stderr.write_all(bytes);
-        let _ = stderr.flush();
-        terminal.record(bytes);
-    }
-    fn take_suppressed_stderr(&self) -> Vec<u8> {
-        self.stderr_report_filter
-            .as_ref()
-            .map(|filter| {
-                filter
-                    .lock()
-                    .expect("runtime stderr filter")
-                    .take_suppressed()
-            })
-            .unwrap_or_default()
-    }
-    fn new(
-        stream_visible: bool,
-        stdin_requests: mpsc::Sender<proc::StdinRequest>,
-        runtime_source: Option<String>,
-    ) -> Self {
+    fn new(stream_visible: bool, stdin_requests: mpsc::Sender<proc::StdinRequest>) -> Self {
         Self {
             stdout: Arc::new(Mutex::new(LiveFilter::new(true))),
             stderr: Arc::new(Mutex::new(LiveFilter::new(false))),
             terminal: Arc::new(Mutex::new(TerminalVisibility::default())),
             stream_visible,
             stdin_requests,
-            stderr_report_filter: runtime_source
-                .map(|source| Arc::new(Mutex::new(runtime_checks::StderrFilter::new(&source)))),
         }
     }
 
@@ -1873,7 +1723,6 @@ impl LiveStreams {
         let stderr_requests = self.stdin_requests.clone();
         let stream_stdout = self.stream_visible;
         let stream_stderr = self.stream_visible;
-        let stderr_report_filter = self.stderr_report_filter.clone();
         proc::Observers {
             stdout: Arc::new(move |chunk| {
                 let (visible, requests) = {
@@ -1895,18 +1744,13 @@ impl LiveStreams {
                 }
             }),
             stderr: Arc::new(move |chunk| {
-                // Always consume the raw protocol first. Diagnostic-looking
-                // user output must not hide stdin requests or completion.
-                let (mut visible, requests) = {
+                let (visible, requests) = {
                     let mut filter = stderr.lock().expect("stderr filter");
                     let visible = filter.feed(chunk);
                     (visible, filter.take_stdin_requests())
                 };
                 for request in requests {
                     let _ = stderr_requests.send(request);
-                }
-                if let Some(filter) = &stderr_report_filter {
-                    visible = filter.lock().expect("runtime stderr filter").feed(&visible);
                 }
                 if stream_stderr && !visible.is_empty() {
                     let mut terminal = stderr_terminal.lock().expect("terminal visibility");
@@ -1920,12 +1764,7 @@ impl LiveStreams {
     }
 
     fn finish(&self) {
-        let mut err_tail = self.stderr.lock().expect("stderr filter").finish();
-        if let Some(filter) = &self.stderr_report_filter {
-            let mut filter = filter.lock().expect("runtime stderr filter");
-            err_tail = filter.feed(&err_tail);
-            err_tail.extend(filter.finish());
-        }
+        let err_tail = self.stderr.lock().expect("stderr filter").finish();
         let out_tail = self.stdout.lock().expect("stdout filter").finish();
         if self.stream_visible && !out_tail.is_empty() {
             let mut terminal = self.terminal.lock().expect("terminal visibility");
@@ -2428,9 +2267,9 @@ mod tests {
     }
 
     #[test]
-    fn runtime_report_filter_preserves_replay_and_current_stdin_requests() {
+    fn stderr_observer_preserves_replay_and_current_stdin_requests() {
         let (sender, receiver) = mpsc::channel();
-        let live = LiveStreams::new(false, sender, Some("/tmp/input.c".to_string()));
+        let live = LiveStreams::new(false, sender);
         let observers = live.observers();
         let wire = format!(
             "{M_STDIN}{M_STDIN_DONE}{M_NEW}prefix\nexample.c:1:2: runtime error: demo\n{M_STDIN}after\n{M_STDIN_DONE}{M_DONE}"
@@ -2447,10 +2286,6 @@ mod tests {
                 proc::StdinRequest::Current,
                 proc::StdinRequest::Finished
             ]
-        );
-        assert_eq!(
-            live.take_suppressed_stderr(),
-            b"example.c:1:2: runtime error: demo\nafter\n"
         );
     }
 

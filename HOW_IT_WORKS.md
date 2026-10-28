@@ -11,9 +11,9 @@ Every evaluation reassembles and reruns the whole session. Block-scope declarati
 Direct `scanf`, `getchar`, `getc(stdin)`, `fgetc(stdin)` and `fgets(..., stdin)` calls are wrapped while libc retains responsibility for conversions, buffering, pushback and EOF. Non-stdin file streams go directly to libc. Call-start and call-completion markers distinguish an active read from a call already satisfied by libc's buffer. A completed buffered call retains an empty call boundary without consuming another parent-input line; an active call can receive one fresh line, retained only in memory. Historical calls replay those boundaries and lines without reconnecting to the terminal. Parent-input reads are polled on Unix and Windows so a completion marker or Ctrl-C can release a pending read even when stdin stays open. Calls inside functions, recursion and loops therefore replay in their original order. `%src` annotates the associated statement with only a request count—the bytes remain hidden. `%reset` discards the tape, and no tape is written to a history file. If function replacement or changed control flow consumes a different number of requests, evaluation stops with an explicit stdin-tape divergence instead of silently prompting or waiting for the normal timeout.
 
 Parent read-ahead belongs to the process stdin stream and survives individual
-evaluations, temporary checks and `%reset`. This keeps later lines from a
-single Windows pipe read available to subsequent inputs. Reset still discards
-the session's replay tape; it does not discard unread bytes from the stream.
+evaluations and `%reset`. This keeps later lines from a single Windows pipe
+read available to subsequent inputs. Reset still discards the session's replay
+tape; it does not discard unread bytes from the stream.
 
 ### 3. Trial Compilation & Classification
 A lexical heuristic routes function definitions, preprocessor directives, typedefs and tag definitions to file scope; these inputs are never demoted into `main`, which prevents GCC from silently accepting a nested function that Clang rejects. The compiler arbitrates expression-versus-statement cases, but an input whose final code token is `;` goes directly to the statement slot rather than launching an expression compile that cannot succeed. Clearly braced statements ending in `}` do the same; possible compound literals such as `(int){7}` retain expression classification. After a redeclaration diagnostic, alternate nested-scope or in-place replacement assemblies must compile as complete programs before c-shell accepts them. File scope remains unavailable as a general fallback.
@@ -64,47 +64,7 @@ Ordinary inputs and `%time` share output rendering and session commits. In `-e` 
 
 `%timeit` compiles once and passes the loop count as a runtime argument for both calibration and measured samples. Calibration grows in bounded steps of 2x to 10x until a batch reaches roughly 100 ms (less for short execution deadlines), so a single iteration below the host clock resolution cannot trigger an immediate jump to 100 million iterations. Each sample still starts a fresh process and replays the same retained session. Source generation maintains a running line count so recording diagnostic spans does not repeatedly scan the accumulated program.
 
-### 9. On-demand Runtime Checks
-
-`%check [--address | --undefined] <code>` creates a temporary evaluator with
-sanitizer compiler/linker flags, preserving the current compiler, standard,
-timeout, terminal streaming and stdin replay. It never commits checked input
-or consumes an input number. Automatic selection tries ASan+UBSan, then ASan,
-then UBSan; an explicit backend request never falls back to unchecked code.
-No sanitizer probes run during startup or ordinary evaluation.
-
-Each candidate must compile and link, execute a valid program, and terminate
-with the expected report for deliberately faulty memory/arithmetic operations.
-This rejects ignored flags and missing runtime libraries. Results are cached
-only in the evaluator and cleared when `%cc` or `%std` changes the toolchain.
-Instrumentation flags precede the source path so the compiler cannot treat
-them as input files.
-
-Checks stop at the first detected error, and leak detection is disabled for
-session allocations. Sanitizer reports use a private log directory per run,
-separate from program stderr, so live prompts remain immediate and native
-stack traces cannot bypass formatting in the terminal. Some combined GCC
-runtimes still write UBSan reports to stderr: a streaming prefix filter
-withholds those reports across pipe chunks while preserving program prompts,
-and the captured report follows the same formatting path. Probes accept both
-reporting paths. Report reads obey the capture limit.
-Runtime failures are recognized even during retained replay or exit handlers
-after the completion marker. Source locations remain internal; summaries omit
-line numbers and paths in both terminal and batch modes.
-Output explains common findings in two lines. Unknown findings get a brief
-generic message. Messages remain English in every UI language.
-The stderr fallback requires a native source-location header and a failed
-execution; ordinary program messages such as `runtime error: demo` are kept.
-If a successful program prints a native-looking example, any withheld live
-stderr is restored. The protocol parser consumes raw stderr before diagnostic
-filtering, so a diagnostic-looking example cannot hide stdin requests or
-completion markers. The filter retains bounded file-location prefixes across
-chunks, including locations in other headers, and saves withheld bytes within
-the output capture limit for restoration after successful execution.
-Stack symbolization is disabled because the concise
-summary does not use stack traces or an external symbolizer.
-
-### 10. Reusing Analysis Without Reusing Execution
+### 9. Reusing Analysis Without Reusing Execution
 
 An evaluator remembers up to 256 compiler-confirmed expression printing
 strategies for one session revision. Repeated pointer and array queries can
@@ -126,7 +86,7 @@ The editor keeps syntect state after each physical line. Multiline block
 comments therefore retain their context. Repainting or moving the cursor
 reuses unchanged lines; editing reparses from the first changed line onward.
 
-### 11. Interrupts and Platform Verification
+### 10. Interrupts and Platform Verification
 
 Ctrl-C cancels the current edit, compiler invocation, executing program, or
 pending program-input read. Child process groups (Unix) or Job Objects
@@ -134,10 +94,8 @@ pending program-input read. Child process groups (Unix) or Job Objects
 The next input clears the interrupt flag and uses the same session.
 
 CI runs real compilers on Linux (GCC and Clang), macOS (Clang) and Windows
-(WinLibs GCC). Linux/macOS jobs require working ASan and UBSan. MinGW-w64 GCC
-ships no sanitizer runtime, so the Windows job does not require one and its
-`%check` tests skip. A required backend cannot silently skip tests. The Web
-PTY regression exercises edit, compile, run and input interruptions,
-recovery, descendant cleanup and terminal CRLF input on each native runner.
+(WinLibs GCC). The Web PTY regression exercises edit, compile, run and input
+interruptions, recovery, descendant cleanup and terminal CRLF input on each
+native runner.
 Windows validation belongs to the native WinLibs CI job; no local Windows
 cross-build is required.

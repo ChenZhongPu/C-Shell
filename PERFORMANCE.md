@@ -80,13 +80,12 @@ context, zero reparsing on cursor movement and suffix-only reparsing after
 an edit. Session tests compare incremental indexes with a fresh scan after
 replacement/shadowing and check clone/reset invalidation.
 
-Other end-to-end tests preserve ordinary stderr during runtime checks,
-escape value previews without rewriting explicit output, and mix
-`scanf`/character/line reads with buffering, pushback and EOF. File-stream
-reads remain native. A Web PTY test exercises Ctrl-C during editing,
+Other end-to-end tests escape value previews without rewriting explicit
+output and mix `scanf`/character/line reads with buffering, pushback and EOF.
+File-stream reads remain native. A Web PTY test exercises Ctrl-C during editing,
 compilation, execution and pending input, followed by continued evaluation,
 CRLF terminal input and compiler-descendant cleanup.
 
-CI requires working ASan and UBSan on Linux/macOS and ASan on native Windows
-CL. Missing required instrumentation fails the tests. Windows execution is
-verified by that CI job, without local Windows cross-compilation.
+CI runs real compilers on Linux (GCC and Clang), macOS (Clang) and Windows
+(WinLibs GCC). Windows execution is verified by that native CI job, without
+local Windows cross-compilation.

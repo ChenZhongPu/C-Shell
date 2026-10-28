@@ -97,7 +97,6 @@ magic-help =
       %Bits <expression> same as %bits, with uppercase hexadecimal
       %utf8/%utf16/%utf32 [-n N] <expression> decode Unicode code units
       %where <identifier> find an ISO C library identifier's standard header
-      %check [--address | --undefined] <code> run runtime checks
       %time <code...>    time the execution of a statement or expression once
       %timeit <code...>  benchmark a statement or expression over multiple loops
       %cc [path]         show or switch the C compiler

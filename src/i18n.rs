@@ -1,8 +1,7 @@
 //! Fluent-backed, process-wide UI language selection.
 //!
 //! Compiler diagnostics and evaluated program output are intentionally left
-//! untouched. UI text comes from `locales/`, except the deliberately English
-//! experimental `%check` messages.
+//! untouched. UI text comes from `locales/`.
 
 use clap::ValueEnum;
 use fluent_templates::{LanguageIdentifier, Loader, static_loader};

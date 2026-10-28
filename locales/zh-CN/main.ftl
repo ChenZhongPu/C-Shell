@@ -97,7 +97,6 @@ magic-help =
       %Bits <表达式>     与 %bits 相同，但使用大写十六进制
       %utf8/%utf16/%utf32 [-n N] <表达式> 解码 Unicode 代码单元
       %where <标识符>    查询 ISO C 标准库标识符所属的头文件
-      %check [--address | --undefined] <code> run runtime checks
       %time <代码...>    执行一次并测量语句或表达式
       %timeit <代码...>  多轮循环测量语句或表达式
       %cc [路径]         显示或切换 C 编译器

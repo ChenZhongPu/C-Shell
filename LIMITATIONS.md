@@ -14,13 +14,6 @@
 
 ## Semantics & Scope
 
-- **Runtime checks are optional and partial.** `%check` uses only sanitizer
-  backends that can compile, link, run and detect a test error with the current
-  toolchain. Available checks differ by target/runtime installation. Checks
-  cover executed paths, not all undefined behavior or logic errors; general
-  uninitialized-value detection is not included. Leak detection is disabled
-  for replayed session allocations. Checked input is never retained, but
-  replay and external effects still occur. Messages are currently English.
 - **Rebinding is C shadowing, not assignment.** A redeclared local lives in a nested block. Its declarator is already in scope during its initializer, so `int x = x + 1;` does not read the outer `x`. File-scope replacement also makes retained earlier calls use the new function when the session replays.
 - **The purity heuristic is conservative.** Any expression containing a function call or a reference to a macro defined in retained input is kept, even if it happens to be pure.
 - **Indeterminate values remain undefined C.** Address-only struct-member formatting prevents `c-shell` from adding a `%s` memory dereference, but it cannot make `struct P p; p` well-defined when members were never initialized; reading an indeterminate pointer or scalar is itself not portable. Initialize structs (for example with `{0}`) when the value matters.
@@ -38,7 +31,6 @@
 - **Declarations are one construct per input.** Mixing declarations and statements in one input is rejected, and variables of an anonymous struct/union/enum type are not supported.
 - **A crash, timeout or interrupt restarts the runner** and silently replays the journal of successful steps, so side effects of those steps can repeat in that case.
 - **Magic commands read the live state.** `%type`, `%bits`, `%utf8/16/32`, `%time` and `%timeit` run inside the resident runner and nothing is replayed. `%timeit` runs against the live session, like IPython, so `%timeit n++` really changes `n`.
-- **`%check` still replays.** It evaluates the committed session text in a fresh instrumented program, so its view of state can differ from the runner's and earlier side effects repeat.
 - **Only output is allowed.** Resident mode refuses (before compiling) calls that read input or change files, processes or the environment, such as `scanf`, `getchar`, `fopen`, `system`, `remove` or `setenv`; `printf`, `puts`, `fprintf`, `fputs`, `fflush` and `write` are fine. The check is lexical, so a call made through a function pointer is not seen. This keeps crash recovery safe: replaying the journal can only repeat output. Use replay mode (no `--resident`) for I/O.
 - **Not yet covered:** live output streaming.
 
@@ -47,4 +39,4 @@
 - **Process cleanup follows the launched process tree.** On Unix, the process group is killed when each run ends; a child that explicitly creates a new session with `setsid` can still escape. On Windows, each run is contained in a Job Object that is closed when the run ends.
 - **No session save/load.** The input history is bounded (up to 1000 lines) within the current process memory/file session, but session state cannot be saved to a file or loaded across launches.
 - **Windows uses WinLibs GCC; MSVC is not supported.** c-shell drives a MinGW-w64 GNU toolchain on Windows, and release binaries are built for `x86_64-pc-windows-gnu`. Put the toolchain's `bin` directory on `PATH`. The `clang` driver bundled with WinLibs also targets MinGW-w64 and accepts the same GNU command line, so `--cc clang` works, but CI exercises only GCC there. `cl.exe` and `clang-cl` are not supported.
-- **Windows verification uses native WinLibs CI.** The Windows job installs WinLibs GCC and runs the same end-to-end tests, including Web PTY input and Ctrl-C recovery, on the Windows runner. MinGW-w64 GCC ships no ASan/UBSan runtime, so `%check` tests are skipped there; Linux and macOS jobs still require working sanitizers. Other Windows compiler configurations are not verified by this CI matrix. Local Linux tests do not establish Windows behavior.
+- **Windows verification uses native WinLibs CI.** The Windows job installs WinLibs GCC and runs the same end-to-end tests, including Web PTY input and Ctrl-C recovery, on the Windows runner. Other Windows compiler configurations are not verified by this CI matrix. Local Linux tests do not establish Windows behavior.
