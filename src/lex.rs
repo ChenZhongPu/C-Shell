@@ -619,54 +619,78 @@ pub fn may_have_side_effects_with_pure_calls(
 /// input streams outside the generated program. This is intentionally a
 /// conservative lexical warning, not a claim that a call definitely executes.
 pub fn external_replay_calls(src: &str) -> Vec<String> {
-    const RISKY: &[&str] = &[
-        "fopen",
-        "freopen",
-        "fclose",
-        "fflush",
-        "fprintf",
-        "fscanf",
-        "fgetc",
-        "fgets",
-        "fputc",
-        "fputs",
-        "fread",
-        "fwrite",
-        "scanf",
-        "getchar",
-        "remove",
-        "rename",
-        "tmpfile",
-        "tmpnam",
-        "system",
-        "popen",
-        "pclose",
-        "open",
-        "creat",
-        "close",
-        "read",
-        "write",
-        "unlink",
-        "mkdir",
-        "rmdir",
-        "chdir",
-        "chmod",
-        "truncate",
-        "ftruncate",
-        "fsync",
-        "fork",
-        "execl",
-        "execle",
-        "execlp",
-        "execv",
-        "execve",
-        "execvp",
-        "kill",
-        "setenv",
-        "unsetenv",
-        "putenv",
-    ];
+    find_calls(src, RISKY)
+}
 
+/// Output functions: they also appear in `RISKY` because a replay repeats
+/// them, but resident mode runs every input once, so printing is harmless.
+#[cfg(unix)]
+const OUTPUT_ONLY: &[&str] = &["fprintf", "fputs", "fputc", "fflush", "fwrite", "write"];
+
+/// Calls resident mode refuses: everything that reads input or changes files,
+/// processes or the environment, i.e. `RISKY` minus plain output. Lexical and
+/// conservative, so a call hidden behind a function pointer is not seen.
+#[cfg(unix)]
+pub fn blocked_resident_calls(src: &str) -> Vec<String> {
+    const EXTRA: &[&str] = &["getc", "gets", "getline", "getdelim"];
+    let names: Vec<&str> = RISKY
+        .iter()
+        .copied()
+        .filter(|name| !OUTPUT_ONLY.contains(name))
+        .chain(EXTRA.iter().copied())
+        .collect();
+    find_calls(src, &names)
+}
+
+const RISKY: &[&str] = &[
+    "fopen",
+    "freopen",
+    "fclose",
+    "fflush",
+    "fprintf",
+    "fscanf",
+    "fgetc",
+    "fgets",
+    "fputc",
+    "fputs",
+    "fread",
+    "fwrite",
+    "scanf",
+    "getchar",
+    "remove",
+    "rename",
+    "tmpfile",
+    "tmpnam",
+    "system",
+    "popen",
+    "pclose",
+    "open",
+    "creat",
+    "close",
+    "read",
+    "write",
+    "unlink",
+    "mkdir",
+    "rmdir",
+    "chdir",
+    "chmod",
+    "truncate",
+    "ftruncate",
+    "fsync",
+    "fork",
+    "execl",
+    "execle",
+    "execlp",
+    "execv",
+    "execve",
+    "execvp",
+    "kill",
+    "setenv",
+    "unsetenv",
+    "putenv",
+];
+
+fn find_calls(src: &str, names: &[&str]) -> Vec<String> {
     let sc = scan(src);
     let b = src.as_bytes();
     let mut found = Vec::new();
@@ -682,7 +706,7 @@ pub fn external_replay_calls(src: &str) -> Vec<String> {
             i += 1;
         }
         let word = &src[start..i];
-        if !RISKY.contains(&word) || found.iter().any(|seen| seen == word) {
+        if !names.contains(&word) || found.iter().any(|seen| seen == word) {
             continue;
         }
         let mut next = i;
@@ -941,5 +965,24 @@ mod tests {
         assert!(may_have_side_effects("(int)(x)"));
         // A comment splitting `+ +` is two unary pluses, not an increment.
         assert!(!may_have_side_effects("x +/**/+ y"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resident_mode_blocks_input_and_effects_but_not_output() {
+        assert!(
+            blocked_resident_calls("fprintf(stderr, \"x\"); fflush(stdout); puts(\"a\");")
+                .is_empty()
+        );
+        assert_eq!(
+            blocked_resident_calls("FILE *f = fopen(p, \"w\"); fputs(\"a\", f);"),
+            vec!["fopen".to_string()]
+        );
+        assert_eq!(
+            blocked_resident_calls("int c = getc(stdin);"),
+            vec!["getc".to_string()]
+        );
+        // Words inside strings and comments are not calls.
+        assert!(blocked_resident_calls("puts(\"scanf(\"); /* system(1) */").is_empty());
     }
 }

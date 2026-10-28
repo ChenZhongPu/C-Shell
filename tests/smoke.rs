@@ -2902,45 +2902,37 @@ fn resident_declarations_without_initializers_are_zeroed_and_quiet() {
 
 #[cfg(unix)]
 #[test]
-fn resident_programs_read_piped_stdin_across_inputs() {
-    let output = run_evals_with_stdin_resident(
+fn resident_mode_only_allows_output() {
+    // Output is fine, including to stderr and through fflush.
+    let ok = resident_evals(
+        15,
         &[
-            "int v = -1, w = -1;",
-            "int r = scanf(\"%d\", &v);",
-            "scanf(\"%d\", &w);",
-            "v",
-            "w",
-            "r",
+            "int x = 1;",
+            "fprintf(stderr, \"note\\n\");",
+            "fflush(stdout);",
+            "x",
         ],
-        "42 7\n",
     );
     assert!(
-        output.status.success(),
+        ok.status.success(),
         "{}",
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&ok.stderr)
     );
-    // The second scanf is served from the buffer the first one filled.
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n7\n1\n");
-}
+    assert_eq!(String::from_utf8_lossy(&ok.stdout), "1\n");
 
-#[cfg(unix)]
-fn run_evals_with_stdin_resident(codes: &[&str], input: &str) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_c-shell"));
-    command.args(["--no-color", "--lang", "en", "--resident"]);
-    for code in codes {
-        command.args(["-e", code]);
+    for (code, call) in [
+        ("FILE *f = fopen(\"/tmp/cs-never\", \"w\");", "fopen()"),
+        ("int v; scanf(\"%d\", &v);", "scanf()"),
+        ("int get(void) { return getchar(); }", "getchar()"),
+        ("system(\"true\");", "system()"),
+        ("%bits getc(stdin)", "getc()"),
+    ] {
+        let output = resident_evals(15, &[code]);
+        assert!(!output.status.success(), "{code} was accepted");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("only allows output") && stderr.contains(call),
+            "{code}: {stderr}"
+        );
     }
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start c-shell --resident with program stdin");
-    child
-        .stdin
-        .take()
-        .expect("program stdin")
-        .write_all(input.as_bytes())
-        .expect("write program stdin");
-    child.wait_with_output().expect("wait for c-shell")
 }

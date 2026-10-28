@@ -243,3 +243,4 @@ resident-type-in-use = `{$name}` 仍被先前的定义使用；请先执行 %res
 resident-runner-error = 常驻进程出错：{$error}
 resident-slots-exhausted = 常驻模式的变量槽位已用尽；请执行 %reset
 timeit-state-warning-resident = “%timeit 输入”直接在当前会话状态上运行，可能被重复执行；它对 C 状态的修改会被保留
+resident-side-effects = 常驻模式只允许输出，不允许读取输入或修改文件、进程、环境的调用：{$calls}。需要时请不使用 --resident 运行。

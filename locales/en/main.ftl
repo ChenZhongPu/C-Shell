@@ -253,3 +253,4 @@ resident-type-in-use = `{$name}` is still used by earlier definitions; run %rese
 resident-runner-error = Resident runner failed: {$error}
 resident-slots-exhausted = Resident mode has no free variable slots left; run %reset
 timeit-state-warning-resident = "%timeit input" runs against the live session and may execute repeatedly; its C state changes are kept
+resident-side-effects = Resident mode only allows output; it refuses calls that read input or change files, processes or the environment: {$calls}. Run without --resident to use them.

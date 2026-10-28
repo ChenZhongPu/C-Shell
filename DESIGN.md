@@ -4,7 +4,7 @@ Settled architecture decisions, the one big open problem, and the traps buried
 in the code that you must know about before changing it. README is for users;
 this file is for whoever develops the tool next.
 
-Status: v0.4.0 working, English/Chinese UI. The default test run has 123 unit
+Status: v0.4.0 working, English/Chinese UI. The default test run has 124 unit
 tests and 90 end-to-end smoke tests; a real-compiler performance benchmark is
 ignored by default. Verified locally on Linux with GCC 16.2.1 and Clang
 22.1.8. Native CI covers Linux GCC/Clang, macOS Clang and Windows WinLibs GCC;
@@ -418,7 +418,10 @@ replacing that compiler.
 - `%type`, `%bits`, `%utf*`, `%time` and `%timeit` are steps too: probes run
   read-only against the live slots and nothing is journaled; `%timeit` passes
   its loop count through the reserved last slot and mutates live state.
-- Not done: Windows (`LoadLibrary` plus a shared CRT), stdin, and `%check`,
+- Only output is allowed (`lex::blocked_resident_calls`): input reads and
+  calls that change files, processes or the environment are refused before
+  compiling. That is what makes journal recovery safe without a stdin tape.
+- Not done: Windows (`LoadLibrary` plus a shared CRT) and `%check`,
   which still replays the committed session text in a fresh instrumented program.
 
 The key import is evcxr's move: share state by *parameter passing*, not

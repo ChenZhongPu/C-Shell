@@ -232,18 +232,14 @@ fn absorb(buffer: &mut Vec<u8>, chunk: &[u8], seen: &mut bool, truncated: &mut b
 }
 
 impl Runner {
-    fn spawn(inherit_stdin: bool) -> Result<Self> {
+    fn spawn() -> Result<Self> {
         let exe = std::env::current_exe().context("cannot locate the c-shell executable")?;
         let (commands_read, commands_write) = pipe()?;
         let (reply_read, reply_write) = pipe()?;
         let mut command = Command::new(exe);
         command
             .env("C_SHELL_RUNNER", "1")
-            .stdin(if inherit_stdin {
-                Stdio::inherit()
-            } else {
-                Stdio::null()
-            })
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
@@ -423,7 +419,6 @@ pub struct Resident {
     journal: Vec<Library>,
     /// `%time` is running: wrap the input in the single-input timer.
     timed: bool,
-    inherit_stdin: bool,
 }
 
 fn line_of(src: &str) -> usize {
@@ -711,7 +706,7 @@ impl Resident {
 
     fn ensure_runner(&mut self) -> Result<&mut Runner> {
         if self.runner.is_none() {
-            self.runner = Some(Runner::spawn(self.inherit_stdin)?);
+            self.runner = Some(Runner::spawn()?);
         }
         Ok(self.runner.as_mut().expect("runner was just created"))
     }
@@ -720,7 +715,7 @@ impl Resident {
     /// effects of those steps repeat; this is recovery, not the normal path.
     fn recover(&mut self, timeout: Duration) {
         self.runner = None;
-        let Ok(mut runner) = Runner::spawn(self.inherit_stdin) else {
+        let Ok(mut runner) = Runner::spawn() else {
             self.reset();
             return;
         };
@@ -870,6 +865,21 @@ impl Resident {
         }
     }
 
+    /// Resident mode only allows output: calls that read input or change
+    /// files, processes or the environment are refused before compiling, so
+    /// replaying the journal after a crash can only repeat (hidden) output.
+    fn forbidden(input: &str) -> Option<String> {
+        let calls = lex::blocked_resident_calls(input);
+        (!calls.is_empty()).then(|| {
+            let calls = calls
+                .iter()
+                .map(|name| format!("{name}()"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            i18n::text_with("resident-side-effects", &[("calls", calls)])
+        })
+    }
+
     fn empty_delta(&self) -> Delta {
         Delta {
             remove_items: Vec::new(),
@@ -890,6 +900,9 @@ impl Resident {
         probe: &codegen::Probe,
     ) -> Result<Eval> {
         let input = input.trim();
+        if let Some(message) = Self::forbidden(input) {
+            return Ok(Eval::CompileError(message));
+        }
         let (before, after) = codegen::probe_parts(session, input, probe);
         let body = Body::Wrapped {
             before: &before,
@@ -915,6 +928,9 @@ impl Resident {
     /// growing loop counts. Like IPython, it executes against the live state,
     /// so a statement such as `n++` really does change `n`.
     pub fn timeit(&mut self, ev: &Evaluator, _session: &Session, input: &str) -> Result<Eval> {
+        if let Some(message) = Self::forbidden(input) {
+            return Ok(Eval::CompileError(message));
+        }
         let loops = format!("(uint64_t)(uintptr_t)cs_slot[{}]", SLOT_CAP - 1);
         let mut text = input.trim().to_string();
         let mut repaired = false;
@@ -954,8 +970,10 @@ impl Resident {
     }
 
     pub fn eval(&mut self, ev: &Evaluator, session: &Session, input: &str) -> Result<Eval> {
-        self.inherit_stdin = ev.allow_program_stdin;
         let trimmed = input.trim();
+        if let Some(message) = Self::forbidden(trimmed) {
+            return Ok(Eval::CompileError(message));
+        }
         let mut plan_error = None;
         match decl::analyze(trimmed) {
             Analysis::Unsupported(reason) => {

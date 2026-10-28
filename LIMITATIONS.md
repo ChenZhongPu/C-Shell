@@ -39,7 +39,7 @@
 - **A crash, timeout or interrupt restarts the runner** and silently replays the journal of successful steps, so side effects of those steps can repeat in that case.
 - **Magic commands read the live state.** `%type`, `%bits`, `%utf8/16/32`, `%time` and `%timeit` run inside the resident runner and nothing is replayed. `%timeit` runs against the live session, like IPython, so `%timeit n++` really changes `n`.
 - **`%check` still replays.** It evaluates the committed session text in a fresh instrumented program, so its view of state can differ from the runner's and earlier side effects repeat.
-- **Stdin works only when it is piped or comes from `-e`.** The runner then inherits it. At an interactive terminal reads are not supported yet (no terminal handoff, no live prompts, and the timeout keeps running while waiting).
+- **Only output is allowed.** Resident mode refuses (before compiling) calls that read input or change files, processes or the environment, such as `scanf`, `getchar`, `fopen`, `system`, `remove` or `setenv`; `printf`, `puts`, `fprintf`, `fputs`, `fflush` and `write` are fine. The check is lexical, so a call made through a function pointer is not seen. This keeps crash recovery safe: replaying the journal can only repeat output. Use replay mode (no `--resident`) for I/O.
 - **Not yet covered:** live output streaming.
 
 ## Platform & Process Management
