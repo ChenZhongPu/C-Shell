@@ -102,7 +102,8 @@ Requires a Rust toolchain to build and, at runtime, GNU GCC, LLVM Clang, or
 Apple Clang. On Windows, use WinLibs GCC (or another MinGW-w64 GCC) and put
 its `bin` directory on `PATH`; MSVC is not supported. The `clang` bundled
 with WinLibs targets MinGW-w64 too and works through the same GNU command
-line. Windows CI exercises both GCC and Clang. `clang-cl` is not supported.
+line. Windows CI runs the suite with GCC and checks switching to Clang.
+`clang-cl` is not supported.
 Other compilers are not part of the supported or tested compatibility
 surface.
 

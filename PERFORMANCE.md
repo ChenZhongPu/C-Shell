@@ -87,5 +87,5 @@ compilation, execution and pending input, followed by continued evaluation,
 CRLF terminal input and compiler-descendant cleanup.
 
 CI runs real compilers on Linux (GCC and Clang), macOS (Clang) and Windows
-(WinLibs GCC and Clang). Windows execution is verified by those native CI jobs,
-without local Windows cross-compilation.
+(WinLibs GCC, with a Clang compiler-switch check). Windows execution is verified
+by that native CI job, without local Windows cross-compilation.

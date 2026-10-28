@@ -94,8 +94,8 @@ pending program-input read. Child process groups (Unix) or Job Objects
 The next input clears the interrupt flag and uses the same session.
 
 CI runs real compilers on Linux (GCC and Clang), macOS (Clang) and Windows
-(WinLibs GCC and Clang). The Web PTY regression exercises edit, compile, run
-and input interruptions, recovery, descendant cleanup and terminal CRLF input
-on each native runner.
+(WinLibs GCC, plus a Clang compiler-switch check). The Web PTY regression
+exercises edit, compile, run and input interruptions, recovery, descendant
+cleanup and terminal CRLF input on each native runner.
 Windows validation belongs to the native WinLibs CI job; no local Windows
 cross-build is required.

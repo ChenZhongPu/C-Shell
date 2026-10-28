@@ -40,4 +40,4 @@
 - **Process cleanup follows the launched process tree.** On Unix, the process group is killed when each run ends; a child that explicitly creates a new session with `setsid` can still escape. On Windows, each run is contained in a Job Object that is closed when the run ends.
 - **No session save/load.** The input history is bounded (up to 1000 lines) within the current process memory/file session, but session state cannot be saved to a file or loaded across launches.
 - **Windows uses WinLibs; MSVC is not supported.** c-shell drives MinGW-w64 GCC or Clang on Windows, and release binaries are built for `x86_64-pc-windows-gnu`. Put the toolchain's `bin` directory on `PATH`. `cl.exe` and `clang-cl` are not supported.
-- **Windows verification uses native WinLibs CI.** Separate Windows jobs run the end-to-end tests with GCC and Clang, including resident mode. Other Windows compiler configurations are not verified by this CI matrix.
+- **Windows verification uses native WinLibs CI.** The Windows job runs the end-to-end tests with GCC, including resident mode, and checks switching to Clang. Other Windows compiler configurations are not covered by the full suite.

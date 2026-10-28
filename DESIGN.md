@@ -7,8 +7,9 @@ this file is for whoever develops the tool next.
 Status: v0.4.0 working, English/Chinese UI. The default test run includes unit
 and end-to-end smoke tests; a real-compiler performance benchmark is ignored
 by default. Verified locally on Linux with GCC 16.2.1 and Clang
-22.1.8. Native CI covers Linux GCC/Clang, macOS Clang and Windows WinLibs
-GCC/Clang; see `.github/workflows/ci.yml` for the exact matrix.
+22.1.8. Native CI covers Linux GCC/Clang, macOS Clang and Windows WinLibs GCC;
+the Windows job also checks switching compilers. See `.github/workflows/ci.yml`
+for the exact matrix.
 
 ---
 
@@ -49,7 +50,7 @@ retained session names), process-local Up/Down recall and numbered-input
 `%help [--verbose] %quit %clear %reset %src %header %edit %type %bits %Bits
 %utf8 %utf16 %utf32 %where %time %timeit %cc %std`, deadlines and
 timeout-path tree cleanup for compiler/probe/user-program children, cached
-compiler capability probes, CI for 5 platform configs, and a tag-triggered release
+compiler capability probes, CI for 4 platform configs, and a tag-triggered release
 workflow.
 
 The `--web` mode binds only `127.0.0.1` on an OS-selected port and registers
