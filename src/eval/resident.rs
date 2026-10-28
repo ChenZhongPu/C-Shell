@@ -33,7 +33,8 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-/// Number of heap slots the runner can address.
+/// Number of heap slots the runner can address. The final slot is reserved
+/// for a per-run argument and never holds a variable.
 const SLOT_CAP: usize = 1 << 16;
 
 #[cfg(target_os = "macos")]
@@ -114,13 +115,18 @@ pub(crate) fn runner_main() -> std::process::ExitCode {
             Ok(0) | Err(_) => return std::process::ExitCode::SUCCESS,
             Ok(_) => {}
         }
-        let mut parts = line.trim_end_matches('\n').splitn(3, '\t');
+        let mut parts = line.trim_end_matches('\n').splitn(4, '\t');
         if parts.next() != Some("RUN") {
             continue;
         }
         let (Some(path), Some(symbol)) = (parts.next(), parts.next()) else {
             continue;
         };
+        // The last slot carries a per-run argument (the `%timeit` loop count).
+        slots[SLOT_CAP - 1] = parts
+            .next()
+            .and_then(|arg| arg.parse::<usize>().ok())
+            .unwrap_or(0) as *mut c_void;
         write_fd(1, M_NEW.as_bytes());
         write_fd(2, M_NEW.as_bytes());
         let status = unsafe { call_step(path, symbol, slots.as_mut_ptr()) };
@@ -269,7 +275,7 @@ impl Runner {
         let _ = self.child.wait();
     }
 
-    fn run(&mut self, library: &Path, symbol: &str, timeout: Duration) -> RunResult {
+    fn run(&mut self, library: &Path, symbol: &str, arg: u64, timeout: Duration) -> RunResult {
         proc::install_interrupt_handler();
         let mut result = RunResult {
             out: Vec::new(),
@@ -278,7 +284,7 @@ impl Runner {
             truncated: false,
             end: End::Done,
         };
-        let command = format!("RUN\t{}\t{symbol}\n", library.display());
+        let command = format!("RUN\t{}\t{symbol}\t{arg}\n", library.display());
         if self.commands.write_all(command.as_bytes()).is_err() {
             result.end = End::Exited(self.child.wait().ok());
             return result;
@@ -368,6 +374,11 @@ struct Library {
     symbol: String,
 }
 
+struct Compiled {
+    library: Library,
+    warnings: String,
+}
+
 enum Wrapper {
     Print,
     Lvalue,
@@ -377,6 +388,13 @@ enum Wrapper {
 
 enum Body<'a> {
     Empty,
+    /// A probe: `before`, the user's expression on its own line, `after`.
+    Wrapped {
+        before: &'a str,
+        input: &'a str,
+        after: &'a str,
+        bits: bool,
+    },
     Vars(&'a [VarDecl]),
     Stmt(&'a str),
     Expr(&'a str, Wrapper),
@@ -399,6 +417,8 @@ pub struct Resident {
     next_slot: usize,
     next_step: usize,
     journal: Vec<Library>,
+    /// `%time` is running: wrap the input in the single-input timer.
+    timed: bool,
 }
 
 fn line_of(src: &str) -> usize {
@@ -473,8 +493,18 @@ impl Resident {
         Ok(remove)
     }
 
+    /// Stop the single-input timer and report it, when `%time` is active.
+    fn timer_end(&self) -> String {
+        if self.timed {
+            "    cs_time_once_stop();\n    printf(\"%s%llu\\n\", CS_M_TIME, (unsigned long long)cs_time_once_elapsed_ns);\n".to_string()
+        } else {
+            String::new()
+        }
+    }
+
     fn assemble(&self, step: usize, delta: &Delta, body: &Body, redefined: &[&str]) -> Assembled {
-        let mut src = codegen::prelude(false, false);
+        let bits = matches!(body, Body::Wrapped { bits: true, .. });
+        let mut src = codegen::prelude(bits, self.timed);
         let mut ranges = Vec::new();
         let mut new_start_line = 1;
         let mut new_line_count = 1;
@@ -531,11 +561,28 @@ impl Resident {
         let mut wrapped = false;
         match body {
             Body::Empty => {}
+            Body::Wrapped {
+                before,
+                input,
+                after,
+                ..
+            } => {
+                src.push_str(before);
+                new_start_line = line_of(&src);
+                new_line_count = input.lines().count().max(1);
+                src.push_str(input);
+                src.push_str(after);
+                wrapped = true;
+            }
             Body::Stmt(input) => {
+                if self.timed {
+                    src.push_str("    cs_time_once_begin();\n");
+                }
                 new_start_line = line_of(&src);
                 new_line_count = input.lines().count().max(1);
                 src.push_str(input);
                 src.push('\n');
+                src.push_str(&self.timer_end());
             }
             Body::Expr(input, wrapper) => {
                 let open = match wrapper {
@@ -544,11 +591,15 @@ impl Resident {
                     Wrapper::Scalar => "CS_PRINT_SCALAR".to_string(),
                     Wrapper::Array(depth) => format!("CS_PRINT_ARRAY{depth}"),
                 };
+                if self.timed {
+                    src.push_str("    cs_time_once_begin();\n");
+                }
                 src.push_str(&format!("    {open}((\n"));
                 new_start_line = line_of(&src);
                 new_line_count = input.lines().count().max(1);
                 src.push_str(input);
                 src.push_str("\n    ));\n");
+                src.push_str(&self.timer_end());
                 wrapped = true;
             }
             Body::Vars(vars) => {
@@ -661,7 +712,7 @@ impl Resident {
             return;
         };
         for library in &self.journal {
-            let result = runner.run(&library.path, &library.symbol, timeout);
+            let result = runner.run(&library.path, &library.symbol, 0, timeout);
             if !matches!(result.end, End::Done) || !result.reply.starts_with("OK") {
                 self.runner = None;
                 self.reset();
@@ -671,28 +722,58 @@ impl Resident {
         self.runner = Some(runner);
     }
 
-    /// Compile one step, run it in the runner, and report the raw result.
-    fn step(&mut self, ev: &Evaluator, delta: &Delta, body: &Body, slot: Slot) -> Result<Attempt> {
+    /// Assemble and compile one step into a shared library.
+    fn compile_step(
+        &mut self,
+        ev: &Evaluator,
+        delta: &Delta,
+        body: &Body,
+    ) -> std::result::Result<Compiled, String> {
         let redefined: Vec<&str> = delta.funcs.iter().map(|(f, _)| f.name.as_str()).collect();
         let number = self.next_step;
         self.next_step += 1;
         let assembled = self.assemble(number, delta, body, &redefined);
-        let (path, warnings) = match self.compile(ev, number, &assembled) {
-            Ok(compiled) => compiled,
-            Err(diagnostics) => return Ok(Err(diagnostics)),
-        };
-        let symbol = format!("cs_step_{number}");
+        let (path, warnings) = self.compile(ev, number, &assembled)?;
+        Ok(Compiled {
+            library: Library {
+                path,
+                symbol: format!("cs_step_{number}"),
+            },
+            warnings,
+        })
+    }
+
+    /// Compile one step, run it in the runner, and report the raw result.
+    fn step(&mut self, ev: &Evaluator, delta: &Delta, body: &Body, slot: Slot) -> Result<Attempt> {
+        match self.compile_step(ev, delta, body) {
+            Ok(compiled) => Ok(Ok(self.execute(ev, compiled, slot, 0)?)),
+            Err(diagnostics) => Ok(Err(diagnostics)),
+        }
+    }
+
+    /// Run an already compiled step. `arg` reaches it through the reserved
+    /// last slot; the same library may be run repeatedly (`%timeit`).
+    fn execute(
+        &mut self,
+        ev: &Evaluator,
+        compiled: Compiled,
+        slot: Slot,
+        arg: u64,
+    ) -> Result<StepRun> {
+        let Compiled { library, warnings } = compiled;
         let started = Instant::now();
         let timeout = ev.timeout;
-        let result = self.ensure_runner()?.run(&path, &symbol, timeout);
+        let result = self
+            .ensure_runner()?
+            .run(&library.path, &library.symbol, arg, timeout);
         let duration = started.elapsed();
-        let library = Library { path, symbol };
 
         let out = String::from_utf8_lossy(&result.out).into_owned();
         let err = String::from_utf8_lossy(&result.err).into_owned();
         let out_parts = split_new(&out, true);
         let err_parts = split_new(&err, false);
         let (output, dims) = take_dims(&out_parts.output);
+        let timed_duration = out_parts.time_ns.map(Duration::from_nanos);
         let abnormal = match &result.end {
             End::Interrupted => Some(i18n::text("program-interrupted")),
             End::Timeout => Some(i18n::text_with(
@@ -735,14 +816,14 @@ impl Resident {
             scoped_rebind: false,
             file_replacement: None,
             unprintable: false,
-            duration,
-            timed_duration: None,
+            duration: timed_duration.unwrap_or(duration),
+            timed_duration,
         };
-        Ok(Ok(StepRun {
+        Ok(StepRun {
             outcome,
             library,
             dims,
-        }))
+        })
     }
 
     fn commit(&mut self, delta: Delta, run: &StepRun, journal: bool) {
@@ -774,6 +855,89 @@ impl Resident {
                 symbol: run.library.symbol.clone(),
             });
         }
+    }
+
+    fn empty_delta(&self) -> Delta {
+        Delta {
+            remove_items: Vec::new(),
+            items: Vec::new(),
+            funcs: Vec::new(),
+            vars: Vec::new(),
+            first_slot: self.next_slot,
+        }
+    }
+
+    /// `%type`, `%bits`, `%utf*`: evaluate a read-only probe against the live
+    /// state. Nothing is committed and nothing is replayed.
+    pub fn probe(
+        &mut self,
+        ev: &Evaluator,
+        session: &Session,
+        input: &str,
+        probe: &codegen::Probe,
+    ) -> Result<Eval> {
+        let input = input.trim();
+        let (before, after) = codegen::probe_parts(session, input, probe);
+        let body = Body::Wrapped {
+            before: &before,
+            input,
+            after: &after,
+            bits: matches!(probe, codegen::Probe::Bits(_)),
+        };
+        match self.attempt(ev, &body, Slot::Expr)? {
+            Ok(run) => Ok(Eval::Done(Box::new(run.outcome))),
+            Err(diagnostics) => Ok(Eval::CompileError(diagnostics)),
+        }
+    }
+
+    /// `%time`: an ordinary evaluation whose newest input is timed in-process.
+    pub fn time(&mut self, ev: &Evaluator, session: &Session, input: &str) -> Result<Eval> {
+        self.timed = true;
+        let result = self.eval(ev, session, input);
+        self.timed = false;
+        result
+    }
+
+    /// `%timeit`: compile the benchmark once and run it in the runner with
+    /// growing loop counts. Like IPython, it executes against the live state,
+    /// so a statement such as `n++` really does change `n`.
+    pub fn timeit(&mut self, ev: &Evaluator, _session: &Session, input: &str) -> Result<Eval> {
+        let loops = format!("(uint64_t)(uintptr_t)cs_slot[{}]", SLOT_CAP - 1);
+        let mut text = input.trim().to_string();
+        let mut repaired = false;
+        let compiled = loop {
+            let (before, after) = codegen::timeit_parts(&text, &loops);
+            let body = Body::Wrapped {
+                before: &before,
+                input: &text,
+                after: &after,
+                bits: false,
+            };
+            let delta = self.empty_delta();
+            match self.compile_step(ev, &delta, &body) {
+                Ok(compiled) => break compiled,
+                Err(_) if !repaired && !text.ends_with(';') => {
+                    text.push(';');
+                    repaired = true;
+                }
+                Err(diagnostics) => return Ok(Eval::CompileError(diagnostics)),
+            }
+        };
+        let library = Library {
+            path: compiled.library.path.clone(),
+            symbol: compiled.library.symbol.clone(),
+        };
+        let warnings = compiled.warnings.clone();
+        ev.timeit_report(|count| {
+            let compiled = Compiled {
+                library: Library {
+                    path: library.path.clone(),
+                    symbol: library.symbol.clone(),
+                },
+                warnings: warnings.clone(),
+            };
+            Ok(self.execute(ev, compiled, Slot::Expr, count)?.outcome)
+        })
     }
 
     pub fn eval(&mut self, ev: &Evaluator, session: &Session, input: &str) -> Result<Eval> {
@@ -818,7 +982,7 @@ impl Resident {
                 )));
             }
         };
-        if self.next_slot + plan.vars.len() >= SLOT_CAP {
+        if self.next_slot + plan.vars.len() >= SLOT_CAP - 1 {
             return Ok(Err(i18n::text("resident-slots-exhausted")));
         }
         let number = self.next_step;

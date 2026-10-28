@@ -1016,6 +1016,88 @@ pub(crate) fn prelude(bits: bool, timed: bool) -> String {
     src
 }
 
+/// A non-mutating query that wraps an expression without committing it.
+#[derive(Clone, Debug)]
+pub(crate) enum Probe {
+    Type,
+    Bits(bool),
+    Unicode {
+        expected_width: usize,
+        limit: usize,
+        exact: bool,
+    },
+}
+
+/// Text before and after the user's expression for `probe`. The expression
+/// sits on a line of its own between the two parts so a diagnostic inside it
+/// lands on text the user actually typed.
+pub(crate) fn probe_parts(session: &Session, input: &str, probe: &Probe) -> (String, String) {
+    match probe {
+        Probe::Type => {
+            let aggregates = aggregate_types(session, input);
+            if aggregates.is_empty() {
+                (
+                    "    CS_VAL();\n    puts(CS_TYPE_NAME((\n".to_string(),
+                    "\n    )));\n".to_string(),
+                )
+            } else {
+                let mut after = String::from("\n    ),\n        CS_TYPE_ASSOCIATIONS,\n");
+                for (ty, category) in aggregates {
+                    let name = ty
+                        .strip_prefix("struct ")
+                        .or_else(|| ty.strip_prefix("union "))
+                        .unwrap_or(&ty);
+                    after.push_str(&format!("        {ty}: \"{category} {name}\",\n"));
+                }
+                after.push_str("        default: \"<unrecognized type>\"));\n");
+                ("    CS_VAL();\n    puts(_Generic((\n".to_string(), after)
+            }
+        }
+        Probe::Bits(uppercase) => {
+            let macro_name = if *uppercase {
+                "CS_BITS_UPPER"
+            } else {
+                "CS_BITS"
+            };
+            (format!("    {macro_name}((\n"), "\n    ));\n".to_string())
+        }
+        Probe::Unicode {
+            expected_width,
+            limit,
+            exact,
+        } => (
+            "    CS_PRINT_UNICODE((\n".to_string(),
+            format!(
+                "\n    ), {expected_width}, {limit}, {});\n",
+                usize::from(*exact)
+            ),
+        ),
+    }
+}
+
+/// Text around the user's input in a `%timeit` loop. `loops` is a C
+/// expression giving the iteration count. The input is wrapped as an
+/// expression when that is plausible, otherwise as a block.
+pub(crate) fn timeit_parts(input: &str, loops: &str) -> (String, String) {
+    let mut before = String::from("    CS_VAL();\n    {\n");
+    before.push_str(&format!("        uint64_t _cs_loops = {loops};\n"));
+    before.push_str("        uint64_t _cs_start = cs_timeit_now_ns();\n");
+    before.push_str("        for (uint64_t _cs_i = 0; _cs_i < _cs_loops; ++_cs_i) {\n");
+    let mut after = String::new();
+    if crate::eval::should_try_expr(input) {
+        before.push_str("            (void)(\n");
+        after.push_str("\n            );\n");
+    } else {
+        before.push_str("            {\n");
+        after.push_str("\n            }\n");
+    }
+    after.push_str("        }\n");
+    after.push_str("        uint64_t _cs_end = cs_timeit_now_ns();\n");
+    after.push_str("        printf(\"%llu\\n\", (unsigned long long)(_cs_end - _cs_start));\n");
+    after.push_str("    }\n");
+    (before, after)
+}
+
 fn build_inner(session: &Session, input: &str, flavor: BuildFlavor, timed: bool) -> Program {
     let slot = flavor.slot();
     let silent_expr = matches!(flavor, BuildFlavor::SilentExpr);
@@ -1100,62 +1182,37 @@ fn build_inner(session: &Session, input: &str, flavor: BuildFlavor, timed: bool)
             // The input sits on a line of its own so a diagnostic inside it
             // lands on text the user actually typed, at the column they see.
             new_start_line = src.line_count() + if type_probe { 3 } else { 2 };
-            if type_probe {
-                let aggregates = aggregate_types(session, input);
-                src.push_str("    CS_VAL();\n");
-                if aggregates.is_empty() {
-                    src.push_str(&format!("    puts(CS_TYPE_NAME((\n{input}\n    )));\n"));
+            if type_probe || bits_uppercase.is_some() || unicode_probe.is_some() {
+                let probe = if type_probe {
+                    Probe::Type
+                } else if let Some(uppercase) = bits_uppercase {
+                    Probe::Bits(uppercase)
                 } else {
-                    src.push_str(&format!("    puts(_Generic((\n{input}\n    ),\n"));
-                    src.push_str("        CS_TYPE_ASSOCIATIONS,\n");
-                    for (ty, category) in aggregates {
-                        let name = ty
-                            .strip_prefix("struct ")
-                            .or_else(|| ty.strip_prefix("union "))
-                            .unwrap_or(&ty);
-                        src.push_str(&format!("        {ty}: \"{category} {name}\",\n"));
+                    let (expected_width, limit, exact) = unicode_probe.expect("unicode probe");
+                    Probe::Unicode {
+                        expected_width,
+                        limit,
+                        exact,
                     }
-                    src.push_str("        default: \"<unrecognized type>\"));\n");
-                }
-            } else if let Some(uppercase) = bits_uppercase {
-                let macro_name = if uppercase {
-                    "CS_BITS_UPPER"
-                } else {
-                    "CS_BITS"
                 };
-                src.push_str(&format!("    {macro_name}((\n{input}\n    ));\n"));
+                let (before, after) = probe_parts(session, input, &probe);
+                src.push_str(&before);
+                new_start_line = src.line_count() + 1;
+                src.push_str(input);
+                src.push_str(&after);
             } else if timeit {
-                src.push_str("    CS_VAL();\n");
-                src.push_str("    {\n");
-                src.push_str("        uint64_t _cs_loops = _cs_argc > 1 ? (uint64_t)strtoull(_cs_argv[1], NULL, 10) : 1;\n");
-                src.push_str("        uint64_t _cs_start = cs_timeit_now_ns();\n");
-                src.push_str("        for (uint64_t _cs_i = 0; _cs_i < _cs_loops; ++_cs_i) {\n");
-                if crate::eval::should_try_expr(input) {
-                    src.push_str("            (void)(\n");
-                    new_start_line = src.line_count() + 1;
-                    src.push_str(input);
-                    src.push_str("\n            );\n");
-                } else {
-                    src.push_str("            {\n");
-                    new_start_line = src.line_count() + 1;
-                    src.push_str(input);
-                    src.push_str("\n            }\n");
-                }
-                src.push_str("        }\n");
-                src.push_str("        uint64_t _cs_end = cs_timeit_now_ns();\n");
-                src.push_str(
-                    "        printf(\"%llu\\n\", (unsigned long long)(_cs_end - _cs_start));\n",
+                let (before, after) = timeit_parts(
+                    input,
+                    "_cs_argc > 1 ? (uint64_t)strtoull(_cs_argv[1], NULL, 10) : 1",
                 );
-                src.push_str("    }\n");
+                src.push_str(&before);
+                new_start_line = src.line_count() + 1;
+                src.push_str(input);
+                src.push_str(&after);
             } else if silent_expr {
                 src.push_str(&format!("    (void)(\n{input}\n    );\n"));
             } else if utf8_array {
                 src.push_str(&format!("    CS_PRINT_UTF8_ARRAY((\n{input}\n    ));\n"));
-            } else if let Some((expected_width, limit, exact)) = unicode_probe {
-                src.push_str(&format!(
-                    "    CS_PRINT_UNICODE((\n{input}\n    ), {expected_width}, {limit}, {});\n",
-                    usize::from(exact)
-                ));
             } else if let Some(depth) = array_depth {
                 src.push_str(&format!("    CS_PRINT_ARRAY{depth}((\n{input}\n    ));\n"));
             } else if matches!(flavor, BuildFlavor::LvalueExpr) {
@@ -1749,7 +1806,7 @@ enum TypeToken {
 /// Collect aggregate types that have a reusable spelling. `_Generic` has no
 /// wildcard for "any struct", so each complete named tag (plus the common
 /// anonymous-typedef form) is added to this query's association list.
-fn aggregate_types(session: &Session, input: &str) -> Vec<(String, &'static str)> {
+pub(crate) fn aggregate_types(session: &Session, input: &str) -> Vec<(String, &'static str)> {
     let mut found = BTreeSet::new();
     for src in session
         .file_items()

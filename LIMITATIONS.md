@@ -37,7 +37,9 @@
 - **A type that earlier definitions still use cannot be redefined** until `%reset`; functions and macros can.
 - **Declarations are one construct per input.** Mixing declarations and statements in one input is rejected, and variables of an anonymous struct/union/enum type are not supported.
 - **A crash, timeout or interrupt restarts the runner** and silently replays the journal of successful steps, so side effects of those steps can repeat in that case.
-- **Not yet covered:** stdin reads, `%check`, live output streaming; `%type`, `%bits`, `%time`, `%timeit` and `%src` still work by replaying the journal.
+- **Magic commands read the live state.** `%type`, `%bits`, `%utf8/16/32`, `%time` and `%timeit` run inside the resident runner and nothing is replayed. `%timeit` runs against the live session, like IPython, so `%timeit n++` really changes `n`.
+- **`%check` still replays.** It evaluates the committed session text in a fresh instrumented program, so its view of state can differ from the runner's and earlier side effects repeat.
+- **Not yet covered:** stdin reads and live output streaming.
 
 ## Platform & Process Management
 

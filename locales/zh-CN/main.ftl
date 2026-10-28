@@ -242,3 +242,4 @@ resident-platform = 此平台暂不支持 --resident
 resident-type-in-use = `{$name}` 仍被先前的定义使用；请先执行 %reset，再在常驻模式下重新定义
 resident-runner-error = 常驻进程出错：{$error}
 resident-slots-exhausted = 常驻模式的变量槽位已用尽；请执行 %reset
+timeit-state-warning-resident = “%timeit 输入”直接在当前会话状态上运行，可能被重复执行；它对 C 状态的修改会被保留

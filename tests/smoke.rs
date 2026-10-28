@@ -2809,3 +2809,70 @@ fn resident_reports_compile_errors_in_input_coordinates() {
     assert!(stderr.contains("missing"), "{stderr}");
     assert!(!stderr.contains("cs_step"), "{stderr}");
 }
+
+#[cfg(unix)]
+#[test]
+fn resident_probes_read_the_live_state_instead_of_replaying() {
+    // `a == getpid()` is only true when the probe runs in the process that
+    // executed `long a = getpid();`; a replayed program would be a new process.
+    let out = resident_stdout(&[
+        "#include <unistd.h>",
+        "long a = getpid();",
+        "int x = 7;",
+        "%type x",
+        "%bits (int)(a == getpid())",
+        "%utf8 \"hi\"",
+    ]);
+    assert!(out.starts_with("int\n"), "{out}");
+    assert!(
+        out.contains("value: 1\n"),
+        "probe did not see live state: {out}"
+    );
+    assert!(out.contains("code units: {0x68, 0x69, 0x00}"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn resident_time_and_timeit_use_the_live_session() {
+    let output = resident_evals(
+        15,
+        &["int n = 0;", "%time n = 5;", "n", "%timeit n++", "n > 100"],
+    );
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Timing notes are diagnostics, so `-e` sends them to stderr.
+    assert!(stderr.contains("Wall time:"), "{stderr}");
+    assert!(stdout.contains("per loop"), "{stdout}");
+    // %time commits the assignment; %timeit's iterations also persist.
+    assert!(stdout.lines().any(|line| line == "5"), "{stdout}");
+    assert!(stdout.trim_end().ends_with('1'), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn resident_probes_report_errors_and_survive_crashes() {
+    let output = resident_evals(
+        15,
+        &[
+            "int keep = 3;",
+            "%type missing",
+            "%bits *(int *)0",
+            "keep + 1",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("4"),
+        "state lost after a probe crash: {stdout}"
+    );
+    assert!(
+        stdout.contains("missing") || stderr.contains("missing"),
+        "{stdout}\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("cs_step") && !stderr.contains("cs_p"),
+        "{stderr}"
+    );
+}

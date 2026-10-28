@@ -252,3 +252,4 @@ resident-platform = --resident is not supported on this platform yet
 resident-type-in-use = `{$name}` is still used by earlier definitions; run %reset before redefining it in resident mode
 resident-runner-error = Resident runner failed: {$error}
 resident-slots-exhausted = Resident mode has no free variable slots left; run %reset
+timeit-state-warning-resident = "%timeit input" runs against the live session and may execute repeatedly; its C state changes are kept

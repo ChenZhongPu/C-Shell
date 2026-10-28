@@ -301,7 +301,27 @@ impl Evaluator {
     /// The controlling expression is not evaluated, and the result is never
     /// committed to the replay journal.
     pub fn type_of(&self, session: &Session, input: &str) -> Result<Eval> {
-        let prog = codegen::build_type_probe(session, input);
+        self.probe_eval(session, input, codegen::Probe::Type)
+    }
+
+    /// Run a non-mutating probe: against the live resident state when there is
+    /// one, otherwise by replaying the session in a fresh program.
+    fn probe_eval(&self, session: &Session, input: &str, probe: codegen::Probe) -> Result<Eval> {
+        #[cfg(unix)]
+        if let Some(resident) = &self.resident {
+            return resident.borrow_mut().probe(self, session, input, &probe);
+        }
+        let prog = match &probe {
+            codegen::Probe::Type => codegen::build_type_probe(session, input),
+            codegen::Probe::Bits(uppercase) => {
+                codegen::build_bits_probe(session, input, *uppercase)
+            }
+            codegen::Probe::Unicode {
+                expected_width,
+                limit,
+                exact,
+            } => codegen::build_unicode_probe(session, input, *expected_width, *limit, *exact),
+        };
         self.run_probe(session, prog)
     }
 
@@ -309,8 +329,7 @@ impl Evaluator {
     /// it in the replay journal. The generated `_Generic` dispatch evaluates
     /// the expression once, as the selected helper's function argument.
     pub fn bits_of(&self, session: &Session, input: &str, uppercase: bool) -> Result<Eval> {
-        let prog = codegen::build_bits_probe(session, input, uppercase);
-        let mut result = self.run_probe(session, prog)?;
+        let mut result = self.probe_eval(session, input, codegen::Probe::Bits(uppercase))?;
         if i18n::current().is_chinese()
             && let Eval::Done(outcome) = &mut result
             && let Some(value) = &mut outcome.value
@@ -333,14 +352,12 @@ impl Evaluator {
         const DEFAULT_LIMIT: usize = 100;
 
         let limit = count.unwrap_or(DEFAULT_LIMIT);
-        let prog = codegen::build_unicode_probe(
-            session,
-            input,
-            encoding.unit_width(),
+        let probe = codegen::Probe::Unicode {
+            expected_width: encoding.unit_width(),
             limit,
-            count.is_some(),
-        );
-        let mut result = self.run_probe(session, prog)?;
+            exact: count.is_some(),
+        };
+        let mut result = self.probe_eval(session, input, probe)?;
         if let Eval::Done(outcome) = &mut result
             && outcome.abnormal.is_none()
             && let Some(rendered) = outcome
@@ -401,6 +418,10 @@ impl Evaluator {
     /// process. Compiler work, process startup and retained-session replay are
     /// deliberately outside the measured interval.
     pub fn time(&self, session: &Session, input: &str) -> Result<Eval> {
+        #[cfg(unix)]
+        if let Some(resident) = &self.resident {
+            return resident.borrow_mut().time(self, session, input);
+        }
         self.eval_inner(session, input, true)
     }
 
@@ -1024,6 +1045,10 @@ impl Evaluator {
 
     /// Benchmark an expression or statement without committing it to the session.
     pub fn timeit(&self, session: &Session, input: &str) -> Result<Eval> {
+        #[cfg(unix)]
+        if let Some(resident) = &self.resident {
+            return resident.borrow_mut().timeit(self, session, input);
+        }
         let mut prog = codegen::build_timeit_probe(session, input);
         let (exe, warnings) = match self.compile_program(&prog) {
             Ok(compiled) => compiled,
@@ -1037,7 +1062,7 @@ impl Evaluator {
             }
             Err(diag) => return Ok(Eval::CompileError(diag)),
         };
-        let run = |loops: u64| {
+        self.timeit_report(|loops| {
             let mut command = Command::new(&exe);
             command.arg(loops.to_string());
             self.run_command(
@@ -1047,8 +1072,16 @@ impl Evaluator {
                 prog.uses_stdin_tape,
                 session.stdin_tape(),
             )
-        };
+        })
+    }
 
+    /// Calibrate a loop count against `run` (which executes the benchmark
+    /// that many times and reports elapsed nanoseconds as its value), sample
+    /// it repeatedly and render the statistics. Shared by replay and resident.
+    pub(crate) fn timeit_report(
+        &self,
+        mut run: impl FnMut(u64) -> Result<Outcome>,
+    ) -> Result<Eval> {
         // A single fast iteration may measure zero on a coarse host clock.
         // Reuse this executable and grow by at most 10x per calibration run,
         // rather than extrapolating zero nanoseconds into 100 million calls.

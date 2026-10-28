@@ -642,7 +642,12 @@ pub fn handle(
                 ok = fail(ui.text("timeit-usage"));
             } else {
                 if session.may_have_side_effects(tail) {
-                    style.diagnostic(&ui.warn(&ui.text("timeit-state-warning")));
+                    let key = if ev.is_resident() {
+                        "timeit-state-warning-resident"
+                    } else {
+                        "timeit-state-warning"
+                    };
+                    style.diagnostic(&ui.warn(&ui.text(key)));
                 }
                 ok = render_probe(
                     ev.timeit(session, tail)?,
