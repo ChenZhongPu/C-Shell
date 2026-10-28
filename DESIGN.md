@@ -7,11 +7,8 @@ this file is for whoever develops the tool next.
 Status: v0.4.0 working, English/Chinese UI. The default test run includes unit
 and end-to-end smoke tests; a real-compiler performance benchmark is ignored
 by default. Verified locally on Linux with GCC 16.2.1 and Clang
-22.1.8. Native CI covers Linux GCC/Clang, macOS Clang and Windows WinLibs GCC;
-see `.github/workflows/ci.yml` for the exact matrix. WinLibs' MinGW-targeting
-`clang` uses the same GNU-style driver interface and is supported but not part
-of the Windows CI matrix. Windows is validated in its native WinLibs CI job,
-without local cross-builds.
+22.1.8. Native CI covers Linux GCC/Clang, macOS Clang and Windows WinLibs
+GCC/Clang; see `.github/workflows/ci.yml` for the exact matrix.
 
 ---
 
@@ -52,7 +49,7 @@ retained session names), process-local Up/Down recall and numbered-input
 `%help [--verbose] %quit %clear %reset %src %header %edit %type %bits %Bits
 %utf8 %utf16 %utf32 %where %time %timeit %cc %std`, deadlines and
 timeout-path tree cleanup for compiler/probe/user-program children, cached
-compiler capability probes, CI for 4 platform configs, and a tag-triggered release
+compiler capability probes, CI for 5 platform configs, and a tag-triggered release
 workflow.
 
 The `--web` mode binds only `127.0.0.1` on an OS-selected port and registers
@@ -396,7 +393,7 @@ replacing that compiler.
 
 ### Chosen architecture: journaled resident runner
 
-**Status: implemented as the opt-in `--resident` backend (Unix).** See
+**Status: implemented as the opt-in `--resident` backend (Unix and Windows).** See
 `src/eval/resident.rs` (runner, step assembly, recovery) and `src/decl.rs`
 (tree-sitter-c declaration analysis). Deviations from the sketch below:
 
@@ -405,11 +402,13 @@ replacing that compiler.
   which declares a pointer to exactly that type (`int a[5]` becomes
   `int (*cs_pN)[5]`, `int (*fp)(double)` becomes `int (*(*cs_pN))(double)`).
   `int a[] = {…}` reports its element count back through `M_DIM`.
-- Functions are not called through function pointers: each definition gets a
-  unique symbol (`cs_fn_f_7`) and a macro maps `f` to it, with every step loaded
-  `RTLD_GLOBAL`. Redefinition is therefore just a new binding.
-- The runner is `c-shell` itself (`C_SHELL_RUNNER=1`), commands on fd 3 and
-  replies on fd 4; program output keeps the existing marker protocol.
+- Each function definition gets a unique symbol (`cs_fn_f_7`) and a macro maps
+  `f` to it. Unix loads steps with `RTLD_GLOBAL`; Windows exports those symbols
+  and links subsequent steps against the corresponding DLL import libraries.
+  Redefinition is therefore just a new binding.
+- The runner is `c-shell` itself (`C_SHELL_RUNNER=1`). Unix uses fd 3/4 for
+  commands and replies; Windows uses an stdin pipe and a separate named reply
+  pipe. Program output keeps the existing marker protocol.
 - Replay survives only as recovery: after a crash, timeout or interrupt the
   runner restarts and the journal of successful steps is loaded again.
 - Variable-length arrays are disabled (`-Werror=vla`); a type used by live
@@ -420,7 +419,9 @@ replacing that compiler.
 - Only output is allowed (`lex::blocked_resident_calls`): input reads and
   calls that change files, processes or the environment are refused before
   compiling. That is what makes journal recovery safe without a stdin tape.
-- Not done: Windows (`LoadLibrary` plus a shared CRT).
+- Changing `%cc` clears the resident session so one session uses one compiler
+  and, on Windows, one C runtime. Each Windows step exports a flush helper that
+  runs in the same C runtime as the step.
 
 The key import is evcxr's move: share state by *parameter passing*, not
 through the linker. In C it is stronger than in Rust, because slots can be
@@ -438,12 +439,11 @@ c-shell (Rust) ──pipe──> runner child (slot table + the user's heap/file
      └── journal (today's session.rs) = crash recovery + %save/%load
 ```
 
-- Each step library exports exactly one c-shell entry symbol (`cs_step` —
-  trivial in C) and imports no symbols from the Rust runner. Normal C
-  runtime/system-library imports still exist. Avoiding runner imports removes
-  the Windows import-library problem that once made this option expensive.
-- `&x` is stable across inputs; heap allocations and `FILE*` can survive in
-  the runner process, and `scanf` runs once on the normal hot path. Per-input
+- Each step exports a c-shell entry symbol and imports no symbols from the
+  Rust runner. Windows also exports a CRT flush helper and defined functions;
+  later steps link those functions through import libraries.
+- `&x` is stable across inputs, and heap allocations can survive in
+  the runner process. Per-input
   compilation no longer includes the accumulated statement journal. On
   Windows, every step DLL must share one C runtime; separate runtime
   instances would make allocation and `FILE*` ownership unsafe across DLL

@@ -99,7 +99,7 @@ c-shell 会把当前输入与会话状态重新组装成完整 C 程序，然后
 构建需要 Rust 工具链；运行时需要 GNU GCC、LLVM Clang 或 Apple Clang。
 Windows 上请使用 WinLibs GCC（或其他 MinGW-w64 GCC），并将其 `bin` 目录
 加入 `PATH`；不支持 MSVC。WinLibs 随附的 `clang` 同样以 MinGW-w64 为目标，
-可通过同一套 GNU 风格命令行使用，但 Windows CI 目前只覆盖 GCC；不支持
+可通过同一套 GNU 风格命令行使用，Windows CI 覆盖 GCC 和 Clang；不支持
 `clang-cl`。其他编译器不在当前支持和测试范围内。
 
 从 crates.io 安装：
@@ -131,6 +131,7 @@ c-shell --cc clang --std c23         # 指定编译器与语言标准
 c-shell --timeout 30                 # 每次编译或程序运行最多 30 秒
 c-shell --lang zh                    # 强制使用中文界面
 c-shell --lang en                    # 强制使用英文界面
+c-shell --resident                   # 使用常驻进程保存会话状态
 c-shell --web                        # 在本机打开浏览器终端
 c-shell --web --no-open              # 只显示本机网址，不自动打开
 c-shell -e 'sizeof(long)'            # 求值后退出
@@ -454,6 +455,15 @@ c-shell 会重新组装会话，并把完整 C 文件交给真实宿主编译器
 **[HOW_IT_WORKS.md](HOW_IT_WORKS.md)**。
 重复查询的编译次数、耗时测量与缓存规则见
 [PERFORMANCE.md](PERFORMANCE.md)。
+
+### 常驻模式（实验性）
+
+使用 `--resident` 时，变量保存在独立的常驻进程中，每次输入编译为动态库并
+加载执行。崩溃、超时或中断后，已完成的步骤会重放以恢复状态。Linux、macOS
+以及 Windows 上的 WinLibs GCC 和 Clang 均可使用此模式。
+
+常驻模式目前不支持变长数组和标准输入；使用 `%cc` 更换编译器会清空会话。
+更多限制请参阅 [LIMITATIONS.md](LIMITATIONS.md)。
 
 ## 已知限制
 

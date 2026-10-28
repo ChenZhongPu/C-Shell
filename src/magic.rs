@@ -626,6 +626,11 @@ pub fn handle(
                 };
                 match crate::toolchain::Toolchain::detect(Some(rest[0]), std_opt) {
                     Ok(tc) => {
+                        if ev.is_resident() && ev.tc.path != tc.path {
+                            session.reset();
+                            ev.reset_resident();
+                            style.diagnostic(&ui.dim(&ui.text("resident-compiler-reset")));
+                        }
                         ev.set_toolchain(tc);
                         println!("{}", ev.tc.describe());
                     }

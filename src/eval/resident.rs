@@ -2,8 +2,8 @@
 //!
 //! Instead of rebuilding and rerunning the whole session for every input, a
 //! long-lived runner process keeps the session's state. Each input becomes one
-//! small shared library exporting a single entry point, which the runner
-//! `dlopen`s and calls with a table of heap slots:
+//! small shared library exporting an entry point, which the runner loads and
+//! calls with a table of heap slots:
 //!
 //! * a variable lives in a slot; later steps reach it through
 //!   `#define x (*cs_pN)` where `cs_pN` is declared by [`VarDecl::pointer_decl`],
@@ -22,16 +22,22 @@ use crate::codegen::{self, M_DIM, M_DONE, M_NEW, Slot};
 use crate::decl::{self, Analysis, FileItem, FuncDef, Plan, VarDecl};
 use crate::session::Session;
 use crate::{errmap, i18n, lex, proc};
-use anyhow::{Context, Result};
-use std::ffi::{CStr, CString, c_void};
-use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::fd::{FromRawFd, RawFd};
-use std::os::unix::process::CommandExt;
+use anyhow::Result;
+use std::ffi::c_void;
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::process::{Child, Command, ExitStatus};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+use unix as platform;
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use windows as platform;
 
 /// Number of heap slots the runner can address. The final slot is reserved
 /// for a per-run argument and never holds a variable.
@@ -44,69 +50,31 @@ const SHARED_FLAGS: &[&str] = &[
     "-Werror=vla",
     "-Wl,-undefined,dynamic_lookup",
 ];
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 const SHARED_FLAGS: &[&str] = &["-shared", "-fPIC", "-Werror=vla"];
 
 #[cfg(target_os = "macos")]
 const LIB_EXT: &str = "dylib";
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 const LIB_EXT: &str = "so";
+
+#[cfg(windows)]
+const SHARED_FLAGS: &[&str] = &["-shared", "-Werror=vla", "-Wl,--exclude-all-symbols"];
+#[cfg(windows)]
+const LIB_EXT: &str = "dll";
 
 // ---------------------------------------------------------------------------
 // Runner process (server side)
 // ---------------------------------------------------------------------------
 
-fn write_fd(fd: i32, bytes: &[u8]) {
-    let mut rest = bytes;
-    while !rest.is_empty() {
-        let written = unsafe { libc::write(fd, rest.as_ptr().cast(), rest.len()) };
-        if written <= 0 {
-            return;
-        }
-        rest = &rest[written as usize..];
-    }
-}
-
-fn dl_error() -> String {
-    let message = unsafe { libc::dlerror() };
-    if message.is_null() {
-        "unknown dynamic loader error".to_string()
-    } else {
-        unsafe { CStr::from_ptr(message) }
-            .to_string_lossy()
-            .replace('\n', " ")
-    }
-}
-
-/// # Safety
-/// `slots` must point at `SLOT_CAP` writable pointers and the library must
-/// export `symbol` with the signature `void (void **)`.
-unsafe fn call_step(
-    path: &str,
-    symbol: &str,
-    slots: *mut *mut c_void,
-) -> std::result::Result<(), String> {
-    let path = CString::new(path).map_err(|e| e.to_string())?;
-    let symbol = CString::new(symbol).map_err(|e| e.to_string())?;
-    let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
-    if handle.is_null() {
-        return Err(dl_error());
-    }
-    let entry = unsafe { libc::dlsym(handle, symbol.as_ptr()) };
-    if entry.is_null() {
-        return Err(dl_error());
-    }
-    let step: extern "C" fn(*mut *mut c_void) = unsafe { std::mem::transmute(entry) };
-    step(slots);
-    Ok(())
-}
-
 /// Entry point of `c-shell` when started as a runner (`C_SHELL_RUNNER=1`).
-/// Commands arrive on fd 3 and replies leave on fd 4; the step's own output
-/// goes to the ordinary stdout/stderr pipes, bracketed by protocol markers.
+/// The platform transport keeps commands and replies separate from the step's
+/// stdout/stderr, which are bracketed by protocol markers.
 pub(crate) fn runner_main() -> std::process::ExitCode {
-    let mut commands = BufReader::new(unsafe { File::from_raw_fd(3) });
-    let mut reply = unsafe { File::from_raw_fd(4) };
+    platform::runner_main()
+}
+
+fn serve(mut commands: impl BufRead, mut reply: impl Write) -> std::process::ExitCode {
     let mut slots: Vec<*mut c_void> = vec![std::ptr::null_mut(); SLOT_CAP];
     let mut line = String::new();
     loop {
@@ -127,19 +95,16 @@ pub(crate) fn runner_main() -> std::process::ExitCode {
             .next()
             .and_then(|arg| arg.parse::<usize>().ok())
             .unwrap_or(0) as *mut c_void;
-        write_fd(1, M_NEW.as_bytes());
-        write_fd(2, M_NEW.as_bytes());
-        let status = unsafe { call_step(path, symbol, slots.as_mut_ptr()) };
-        unsafe {
-            libc::fflush(std::ptr::null_mut());
-        }
+        platform::write_output(1, M_NEW.as_bytes());
+        platform::write_output(2, M_NEW.as_bytes());
+        let status = unsafe { platform::call_step(path, symbol, slots.as_mut_ptr()) };
         let _ = match status {
             Ok(()) => writeln!(reply, "OK"),
             Err(message) => writeln!(reply, "ERR {}", message.replace('\n', " ")),
         };
         let _ = reply.flush();
-        write_fd(1, M_DONE.as_bytes());
-        write_fd(2, M_DONE.as_bytes());
+        platform::write_output(1, M_DONE.as_bytes());
+        platform::write_output(2, M_DONE.as_bytes());
     }
 }
 
@@ -171,28 +136,10 @@ struct RunResult {
 
 struct Runner {
     child: Child,
-    commands: File,
+    commands: platform::Commands,
+    #[cfg(windows)]
+    job: crate::proc::windows::Job,
     rx: Receiver<Msg>,
-}
-
-/// A pipe whose descriptors are close-on-exec and well above the stdio range,
-/// so duplicating them onto fixed numbers in the child cannot collide.
-fn pipe() -> io::Result<(RawFd, RawFd)> {
-    let mut fds = [0; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let mut moved = [0; 2];
-    for (index, fd) in fds.iter().enumerate() {
-        moved[index] = unsafe { libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, 10) };
-        if moved[index] < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        unsafe {
-            libc::close(*fd);
-        }
-    }
-    Ok((moved[0], moved[1]))
 }
 
 fn pump<R: Read + Send + 'static>(mut source: R, tx: Sender<Msg>, wrap: fn(Vec<u8>) -> Msg) {
@@ -232,47 +179,12 @@ fn absorb(buffer: &mut Vec<u8>, chunk: &[u8], seen: &mut bool, truncated: &mut b
 }
 
 impl Runner {
-    fn spawn() -> Result<Self> {
-        let exe = std::env::current_exe().context("cannot locate the c-shell executable")?;
-        let (commands_read, commands_write) = pipe()?;
-        let (reply_read, reply_write) = pipe()?;
-        let mut command = Command::new(exe);
-        command
-            .env("C_SHELL_RUNNER", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
-        unsafe {
-            command.pre_exec(move || {
-                if libc::dup2(commands_read, 3) < 0 || libc::dup2(reply_write, 4) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let spawned = command.spawn();
-        unsafe {
-            libc::close(commands_read);
-            libc::close(reply_write);
-        }
-        let mut child = spawned.context("cannot start the resident runner")?;
-        let (tx, rx) = mpsc::channel();
-        pump(child.stdout.take().expect("piped"), tx.clone(), Msg::Out);
-        pump(child.stderr.take().expect("piped"), tx.clone(), Msg::Err);
-        pump(unsafe { File::from_raw_fd(reply_read) }, tx, Msg::Reply);
-        Ok(Runner {
-            child,
-            commands: unsafe { File::from_raw_fd(commands_write) },
-            rx,
-        })
+    fn spawn(ev: &Evaluator) -> Result<Self> {
+        platform::spawn(&ev.tc, ev.timeout)
     }
 
     fn kill(&mut self) {
-        unsafe {
-            libc::killpg(self.child.id() as i32, libc::SIGKILL);
-        }
-        let _ = self.child.wait();
+        platform::kill(self);
     }
 
     fn run(&mut self, library: &Path, symbol: &str, arg: u64, timeout: Duration) -> RunResult {
@@ -367,6 +279,9 @@ struct Func {
     name: String,
     symbol: String,
     proto: String,
+    /// Import library for the DLL that owns this function version.
+    #[cfg(windows)]
+    import_library: PathBuf,
 }
 
 struct Library {
@@ -406,6 +321,10 @@ struct Assembled {
     new_line_count: usize,
     ranges: Vec<(usize, usize)>,
     wrapped: bool,
+    #[cfg(windows)]
+    exports: Vec<String>,
+    #[cfg(windows)]
+    imports: Vec<PathBuf>,
 }
 
 #[derive(Default)]
@@ -530,8 +449,14 @@ impl Resident {
             .iter()
             .filter(|f| !redefined.contains(&f.name.as_str()))
         {
+            #[cfg(unix)]
             src.push_str(&format!(
                 "#define {} {}\n{};\n",
+                func.name, func.symbol, func.proto
+            ));
+            #[cfg(windows)]
+            src.push_str(&format!(
+                "#define {} {}\n__declspec(dllimport) {};\n",
                 func.name, func.symbol, func.proto
             ));
         }
@@ -544,6 +469,10 @@ impl Resident {
         }
         let printers = codegen::build_aggregate_printers(&src);
         src.push_str(&printers);
+        #[cfg(windows)]
+        src.push_str(&format!(
+            "\nvoid cs_flush_{step}(void) {{ (fflush)(NULL); }}\n"
+        ));
         src.push_str(&format!("\nvoid cs_step_{step}(void **cs_slot)\n{{\n"));
         for var in self
             .vars
@@ -648,6 +577,21 @@ impl Resident {
             new_line_count,
             ranges,
             wrapped,
+            #[cfg(windows)]
+            exports: delta
+                .funcs
+                .iter()
+                .map(|(_, symbol)| symbol.clone())
+                .collect(),
+            #[cfg(windows)]
+            imports: self
+                .funcs
+                .iter()
+                .filter(|func| !redefined.contains(&func.name.as_str()))
+                .map(|func| func.import_library.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -670,6 +614,35 @@ impl Resident {
         }
         let mut args = ev.tc.compile_args(&source, &library);
         args.splice(0..0, SHARED_FLAGS.iter().map(|flag| flag.to_string()));
+        #[cfg(windows)]
+        {
+            // `compile_args` selects C with `-x c`; reset it before adding
+            // the definition file and import archives as linker inputs.
+            let definition = ev.dir.path().join(format!("step_{step}.def"));
+            let import_library = library.with_extension("dll.a");
+            let mut exports = format!("EXPORTS\n    cs_step_{step}\n    cs_flush_{step}\n");
+            for symbol in &assembled.exports {
+                exports.push_str(&format!("    {symbol}\n"));
+            }
+            std::fs::write(&definition, exports).map_err(|error| {
+                i18n::text_with("temp-source-write-error", &[("error", error.to_string())])
+            })?;
+            args.extend([
+                "-x".to_string(),
+                "none".to_string(),
+                definition.display().to_string(),
+                "-Xlinker".to_string(),
+                "--out-implib".to_string(),
+                "-Xlinker".to_string(),
+                import_library.display().to_string(),
+            ]);
+            args.extend(
+                assembled
+                    .imports
+                    .iter()
+                    .map(|path| path.display().to_string()),
+            );
+        }
         let mut command = Command::new(&ev.tc.path);
         command.current_dir(ev.dir.path()).args(&args);
         let captured = proc::run_captured(&mut command, ev.timeout, false).map_err(|error| {
@@ -704,23 +677,23 @@ impl Resident {
         }
     }
 
-    fn ensure_runner(&mut self) -> Result<&mut Runner> {
+    fn ensure_runner(&mut self, ev: &Evaluator) -> Result<&mut Runner> {
         if self.runner.is_none() {
-            self.runner = Some(Runner::spawn()?);
+            self.runner = Some(Runner::spawn(ev)?);
         }
         Ok(self.runner.as_mut().expect("runner was just created"))
     }
 
     /// Restart the runner and silently replay every journaled step. Side
     /// effects of those steps repeat; this is recovery, not the normal path.
-    fn recover(&mut self, timeout: Duration) {
+    fn recover(&mut self, ev: &Evaluator) {
         self.runner = None;
-        let Ok(mut runner) = Runner::spawn() else {
+        let Ok(mut runner) = Runner::spawn(ev) else {
             self.reset();
             return;
         };
         for library in &self.journal {
-            let result = runner.run(&library.path, &library.symbol, 0, timeout);
+            let result = runner.run(&library.path, &library.symbol, 0, ev.timeout);
             if !matches!(result.end, End::Done) || !result.reply.starts_with("OK") {
                 self.runner = None;
                 self.reset();
@@ -772,7 +745,7 @@ impl Resident {
         let started = Instant::now();
         let timeout = ev.timeout;
         let result = self
-            .ensure_runner()?
+            .ensure_runner(ev)?
             .run(&library.path, &library.symbol, arg, timeout);
         let duration = started.elapsed();
 
@@ -806,7 +779,7 @@ impl Resident {
             End::Done => None,
         };
         if !matches!(result.end, End::Done) {
-            self.recover(ev.timeout);
+            self.recover(ev);
         }
         let outcome = Outcome {
             slot,
@@ -844,6 +817,8 @@ impl Resident {
                 name: func.name,
                 symbol,
                 proto: func.proto,
+                #[cfg(windows)]
+                import_library: run.library.path.with_extension("dll.a"),
             });
         }
         for (offset, decl) in delta.vars.into_iter().enumerate() {

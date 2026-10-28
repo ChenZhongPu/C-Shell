@@ -624,13 +624,13 @@ pub fn external_replay_calls(src: &str) -> Vec<String> {
 
 /// Output functions: they also appear in `RISKY` because a replay repeats
 /// them, but resident mode runs every input once, so printing is harmless.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const OUTPUT_ONLY: &[&str] = &["fprintf", "fputs", "fputc", "fflush", "fwrite", "write"];
 
 /// Calls resident mode refuses: everything that reads input or changes files,
 /// processes or the environment, i.e. `RISKY` minus plain output. Lexical and
 /// conservative, so a call hidden behind a function pointer is not seen.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn blocked_resident_calls(src: &str) -> Vec<String> {
     const EXTRA: &[&str] = &["getc", "gets", "getline", "getdelim"];
     let names: Vec<&str> = RISKY
@@ -967,7 +967,7 @@ mod tests {
         assert!(!may_have_side_effects("x +/**/+ y"));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn resident_mode_blocks_input_and_effects_but_not_output() {
         assert!(

@@ -37,11 +37,13 @@ wait-timeout = "0.2"
 [dev-dependencies]
 tungstenite = "0.29"
 
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
+[target.'cfg(any(unix, windows))'.dependencies]
 # Declaration analysis for the resident (Step-DLL) backend.
 tree-sitter = "0.27.1"
 tree-sitter-c = "0.24.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
@@ -53,6 +55,8 @@ windows-sys = { version = "0.61", features = [
   "Win32_System_Pipes",
   "Win32_Storage_FileSystem",
   "Win32_System_IO",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Diagnostics_Debug",
 ] }
 
 [profile.release]

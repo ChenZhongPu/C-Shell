@@ -759,7 +759,7 @@ fn kill_tree(child: &Child) {
 }
 
 #[cfg(windows)]
-mod windows {
+pub(crate) mod windows {
     use std::io;
     use std::mem::size_of;
     use std::os::windows::io::AsRawHandle;
@@ -774,7 +774,7 @@ mod windows {
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject,
+        SetInformationJobObject, TerminateJobObject,
     };
     use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 
@@ -879,6 +879,12 @@ mod windows {
     }
 
     impl Job {
+        pub fn terminate(&self) {
+            unsafe {
+                TerminateJobObject(self.0, 1);
+            }
+        }
+
         pub fn attach(child: &Child) -> io::Result<Self> {
             unsafe {
                 let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());

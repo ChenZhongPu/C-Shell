@@ -5,7 +5,7 @@
 //! is to find out what *your* compiler does, not what an interpreter would.
 
 mod codegen;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod decl;
 mod editor;
 mod errmap;
@@ -219,7 +219,7 @@ fn parse_args(language: Language) -> Args {
 }
 
 fn main() -> Result<std::process::ExitCode> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if std::env::var_os("C_SHELL_RUNNER").is_some() {
         return Ok(eval::resident::runner_main());
     }

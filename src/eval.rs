@@ -20,7 +20,7 @@ use crate::lex;
 use crate::proc;
 use crate::session::Session;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) mod resident;
 
 pub struct Outcome {
@@ -122,14 +122,15 @@ pub struct Evaluator {
     #[cfg(test)]
     compile_count: std::cell::Cell<usize>,
     pub tc: crate::toolchain::Toolchain,
-    dir: tempfile::TempDir,
     pub timeout: Duration,
     stream_output: bool,
     allow_program_stdin: bool,
     expr_plans: std::cell::RefCell<ExprPlans>,
-    /// Step-DLL backend, when `--resident` is active (Unix only).
-    #[cfg(unix)]
+    /// Step-DLL backend, when `--resident` is active.
+    #[cfg(any(unix, windows))]
     resident: Option<std::cell::RefCell<resident::Resident>>,
+    // Drop the runner before deleting its directory: Windows locks loaded DLLs.
+    dir: tempfile::TempDir,
 }
 
 impl Evaluator {
@@ -144,29 +145,29 @@ impl Evaluator {
             stream_output: false,
             allow_program_stdin: false,
             expr_plans: std::cell::RefCell::new(ExprPlans::default()),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             resident: None,
         })
     }
 
     /// Keep session state in a long-lived runner instead of replaying it.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn enable_resident(&mut self) -> Result<()> {
         self.resident = Some(std::cell::RefCell::new(resident::Resident::new()?));
         Ok(())
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     pub fn enable_resident(&mut self) -> Result<()> {
         anyhow::bail!(i18n::text("resident-platform"))
     }
 
     pub fn is_resident(&self) -> bool {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             self.resident.is_some()
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             false
         }
@@ -174,7 +175,7 @@ impl Evaluator {
 
     /// Forget resident state (the runner is restarted lazily).
     pub fn reset_resident(&mut self) {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some(resident) = &mut self.resident {
             resident.get_mut().reset();
         }
@@ -274,7 +275,7 @@ impl Evaluator {
     /// Run a non-mutating probe: against the live resident state when there is
     /// one, otherwise by replaying the session in a fresh program.
     fn probe_eval(&self, session: &Session, input: &str, probe: codegen::Probe) -> Result<Eval> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some(resident) = &self.resident {
             return resident.borrow_mut().probe(self, session, input, &probe);
         }
@@ -374,7 +375,7 @@ impl Evaluator {
     }
 
     pub fn eval(&self, session: &Session, input: &str) -> Result<Eval> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some(resident) = &self.resident {
             return resident.borrow_mut().eval(self, session, input);
         }
@@ -385,7 +386,7 @@ impl Evaluator {
     /// process. Compiler work, process startup and retained-session replay are
     /// deliberately outside the measured interval.
     pub fn time(&self, session: &Session, input: &str) -> Result<Eval> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some(resident) = &self.resident {
             return resident.borrow_mut().time(self, session, input);
         }
@@ -924,7 +925,7 @@ impl Evaluator {
 
     /// Benchmark an expression or statement without committing it to the session.
     pub fn timeit(&self, session: &Session, input: &str) -> Result<Eval> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some(resident) = &self.resident {
             return resident.borrow_mut().timeit(self, session, input);
         }

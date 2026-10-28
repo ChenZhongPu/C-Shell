@@ -2246,7 +2246,7 @@ fn buffered_character_reads_do_not_wait_for_another_input_line() {
 }
 
 /// Evaluate `codes` with `-e` in resident (Step-DLL) mode.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn resident_evals(timeout: u32, codes: &[&str]) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_c-shell"));
     command.args(["--no-color", "--lang", "en", "--resident"]);
@@ -2257,7 +2257,7 @@ fn resident_evals(timeout: u32, codes: &[&str]) -> std::process::Output {
     command.output().expect("run c-shell --resident")
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn resident_stdout(codes: &[&str]) -> String {
     let output = resident_evals(15, codes);
     assert!(
@@ -2266,22 +2266,30 @@ fn resident_stdout(codes: &[&str]) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    String::from_utf8_lossy(&output.stdout).into_owned()
+    String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n")
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn resident_state_lives_in_one_process_instead_of_being_replayed() {
-    let out = resident_stdout(&[
-        "#include <unistd.h>",
-        "long first = getpid();",
-        "int unrelated = 1;",
-        "first == getpid()",
-    ]);
+    let (header, first, query) = if cfg!(windows) {
+        (
+            "#include <windows.h>",
+            "long first = GetCurrentProcessId();",
+            "first == GetCurrentProcessId()",
+        )
+    } else {
+        (
+            "#include <unistd.h>",
+            "long first = getpid();",
+            "first == getpid()",
+        )
+    };
+    let out = resident_stdout(&[header, first, "int unrelated = 1;", query]);
     assert_eq!(out, "1\n", "later inputs ran in a different process");
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn resident_variables_arrays_and_structs_survive_between_inputs() {
     let out = resident_stdout(&[
@@ -2304,7 +2312,7 @@ fn resident_variables_arrays_and_structs_survive_between_inputs() {
     assert_eq!(out, "43\n12\n{1, 9, 3}\n{ .x = 1, .y = 7 }\n\"hi\"\n5\n");
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn resident_function_redefinition_rebinds_the_name() {
     let out = resident_stdout(&[
@@ -2318,7 +2326,111 @@ fn resident_function_redefinition_rebinds_the_name() {
     assert_eq!(out, "101\n20\n");
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+#[test]
+fn resident_function_addresses_and_heap_objects_survive_across_steps() {
+    let out = resident_stdout(&[
+        "int value = 5;",
+        "int *address = &value;",
+        "int next(int n) { static int calls = 0; return n + ++calls; }",
+        "int (*fp)(int) = next;",
+        "fp(10)",
+        "next(10)",
+        "fp == next",
+        "int *heap = malloc(sizeof *heap);",
+        "*heap = 7;",
+        "*heap",
+        "*address == 5",
+        "free(heap);",
+        "address == &value",
+    ]);
+    assert_eq!(out, "11\n12\n1\n7\n1\n1\n");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn resident_recovers_cross_step_functions_and_allocations() {
+    let output = resident_evals(
+        15,
+        &[
+            "int next(int n) { static int calls = 0; return n + ++calls; }",
+            "int *heap = malloc(sizeof *heap);",
+            "*heap = next(10);",
+            "int *bad = 0;",
+            "*bad = 1;",
+            "next(10)",
+            "*heap",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let crash = if cfg!(windows) {
+        "access violation"
+    } else {
+        "segmentation fault"
+    };
+    assert!(stderr.contains(crash), "{stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n"),
+        "12\n11\n"
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn resident_compiler_change_clears_session() {
+    for compiler in ["gcc", "clang"] {
+        if !Command::new(compiler)
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            return;
+        }
+    }
+    let output = resident_evals(
+        15,
+        &["%cc clang", "int stale = 7;", "%cc gcc", "stale", "42"],
+    );
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("compiler changed"), "{stderr}");
+    assert!(stderr.contains("stale"), "{stderr}");
+    assert!(stdout.trim_end().ends_with("42"), "{stdout}");
+}
+
+#[cfg(windows)]
+#[test]
+fn resident_closes_dlls_before_removing_the_session_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let temp = root.path().join("session with spaces");
+    std::fs::create_dir(&temp).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_c-shell"))
+        .env("TMP", &temp)
+        .env("TEMP", &temp)
+        .args([
+            "--no-color",
+            "--lang",
+            "en",
+            "--resident",
+            "-e",
+            "int n = 7;",
+            "-e",
+            "n",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "7\n");
+    let remaining = std::fs::read_dir(&temp).unwrap().count();
+    assert_eq!(remaining, 0, "resident session left temporary files behind");
+}
+
+#[cfg(any(unix, windows))]
 #[test]
 fn resident_rejects_variable_length_arrays_and_busy_type_redefinition() {
     let output = resident_evals(15, &["int n = 3;", "int v[n];"]);
@@ -2346,11 +2458,13 @@ fn resident_rejects_variable_length_arrays_and_busy_type_redefinition() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn resident_restores_state_after_a_crash_or_timeout() {
+    // Windows process startup and compiler invocations can take longer on CI.
+    let timeout = if cfg!(windows) { 8 } else { 2 };
     let output = resident_evals(
-        2,
+        timeout,
         &[
             "int keep = 11;",
             "int *p = 0;",
@@ -2362,12 +2476,20 @@ fn resident_restores_state_after_a_crash_or_timeout() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("segmentation fault"), "{stderr}");
-    assert!(stderr.contains("killed after 2s"), "{stderr}");
+    let crash = if cfg!(windows) {
+        "access violation"
+    } else {
+        "segmentation fault"
+    };
+    assert!(stderr.contains(crash), "{stderr}");
+    assert!(
+        stderr.contains(&format!("killed after {timeout}s")),
+        "{stderr}"
+    );
     assert_eq!(stdout, "11\n12\n");
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn resident_reports_compile_errors_in_input_coordinates() {
     let output = resident_evals(15, &["int ok = 1;", "ok + missing"]);
@@ -2378,17 +2500,30 @@ fn resident_reports_compile_errors_in_input_coordinates() {
     assert!(!stderr.contains("cs_step"), "{stderr}");
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn resident_probes_read_the_live_state_instead_of_replaying() {
     // `a == getpid()` is only true when the probe runs in the process that
     // executed `long a = getpid();`; a replayed program would be a new process.
+    let (header, first, query) = if cfg!(windows) {
+        (
+            "#include <windows.h>",
+            "long a = GetCurrentProcessId();",
+            "%bits (int)(a == GetCurrentProcessId())",
+        )
+    } else {
+        (
+            "#include <unistd.h>",
+            "long a = getpid();",
+            "%bits (int)(a == getpid())",
+        )
+    };
     let out = resident_stdout(&[
-        "#include <unistd.h>",
-        "long a = getpid();",
+        header,
+        first,
         "int x = 7;",
         "%type x",
-        "%bits (int)(a == getpid())",
+        query,
         "%utf8 \"hi\"",
     ]);
     assert!(out.starts_with("int\n"), "{out}");
@@ -2399,7 +2534,7 @@ fn resident_probes_read_the_live_state_instead_of_replaying() {
     assert!(out.contains("code units: {0x68, 0x69, 0x00}"), "{out}");
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn resident_time_and_timeit_use_the_live_session() {
     let output = resident_evals(
@@ -2417,7 +2552,7 @@ fn resident_time_and_timeit_use_the_live_session() {
     assert!(stdout.trim_end().ends_with('1'), "{stdout}");
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn resident_probes_report_errors_and_survive_crashes() {
     let output = resident_evals(
@@ -2445,7 +2580,7 @@ fn resident_probes_report_errors_and_survive_crashes() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn resident_declarations_without_initializers_are_zeroed_and_quiet() {
     let output = resident_evals(
@@ -2468,7 +2603,7 @@ fn resident_declarations_without_initializers_are_zeroed_and_quiet() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn resident_mode_only_allows_output() {
     // Output is fine, including to stderr and through fflush.

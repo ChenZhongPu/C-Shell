@@ -102,7 +102,7 @@ Requires a Rust toolchain to build and, at runtime, GNU GCC, LLVM Clang, or
 Apple Clang. On Windows, use WinLibs GCC (or another MinGW-w64 GCC) and put
 its `bin` directory on `PATH`; MSVC is not supported. The `clang` bundled
 with WinLibs targets MinGW-w64 too and works through the same GNU command
-line, but CI exercises only GCC on Windows. `clang-cl` is not supported.
+line. Windows CI exercises both GCC and Clang. `clang-cl` is not supported.
 Other compilers are not part of the supported or tested compatibility
 surface.
 
@@ -133,7 +133,7 @@ c-shell                              # auto-detect a compiler
 c-shell --cc clang --std c23         # request compiler and mode; verify the banner
 c-shell --timeout 30                 # deadline for each compilation and program run
 c-shell --lang zh                    # force the Chinese UI (use en for English)
-c-shell --resident                   # keep state in a resident runner (Linux/macOS)
+c-shell --resident                   # keep state in a resident runner
 c-shell --web                        # open a browser terminal on this machine
 c-shell --web --no-open              # print its local URL without opening it
 c-shell -e 'sizeof(long)'            # evaluate and exit: bare value on stdout,
@@ -513,15 +513,16 @@ For full technical details on accumulation and replay, the stdin tape,
 Repeated-query compilation measurements and cache rules are in
 [PERFORMANCE.md](PERFORMANCE.md).
 
-### Resident mode (experimental, Linux/macOS)
+### Resident mode (experimental)
 
 By default every input rebuilds and reruns the whole session. With
 `--resident` a long-lived runner process keeps your variables instead: each
-input is compiled into one small shared library and `dlopen`ed, so earlier
-code is never executed again and per-input work stays constant as a session
-grows. Variables, arrays, structs, function pointers, functions (including
-redefinition), types and macros work; variable-length arrays are rejected, and
-stdin reads and Windows are not supported yet. See
+input is compiled into a shared library and loaded into the runner. Earlier
+steps execute again only when recovering from a crash, timeout or interrupt.
+Variables, arrays, structs, function pointers, functions (including
+redefinition), types and macros work; variable-length arrays and stdin reads
+are not supported. Changing the compiler with `%cc` clears the resident
+session. Windows supports WinLibs GCC and Clang. See
 [DESIGN.md](DESIGN.md) for the design and its limits.
 
 ## Known limitations
