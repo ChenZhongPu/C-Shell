@@ -46,6 +46,9 @@ pub struct Outcome {
     /// The normal block-scope assembly failed, but entering a nested block
     /// made the compiler accept this declaration as a shadowing rebind.
     pub scoped_rebind: bool,
+    /// A resident variable was rebound; represent it with a new scope in the
+    /// accumulated source view without claiming the runner opened one.
+    pub source_scoped_rebind: bool,
     /// Existing file-scope item replaced in place, selected by successful
     /// whole-program compilation rather than by parsing a declaration name.
     pub file_replacement: Option<usize>,
@@ -916,6 +919,7 @@ impl Evaluator {
             abnormal,
             rewritten: None,
             scoped_rebind: false,
+            source_scoped_rebind: false,
             file_replacement: None,
             unprintable: false,
             duration,
@@ -1057,6 +1061,7 @@ impl Evaluator {
             abnormal: None,
             rewritten: None,
             scoped_rebind: false,
+            source_scoped_rebind: false,
             file_replacement: None,
             unprintable: false,
             duration: last_outcome.duration,

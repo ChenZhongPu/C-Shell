@@ -2313,6 +2313,75 @@ fn resident_variables_arrays_and_structs_survive_between_inputs() {
 }
 
 #[cfg(any(unix, windows))]
+fn assert_source_compiles_and_runs(source: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("session.c");
+    let executable = dir
+        .path()
+        .join(format!("session{}", std::env::consts::EXE_SUFFIX));
+    std::fs::write(&file, source).unwrap();
+    let compiler =
+        std::env::var_os("CC").unwrap_or_else(|| if cfg!(windows) { "gcc" } else { "cc" }.into());
+    let compiled = Command::new(compiler)
+        .args(["-std=c11", "-Wall", "-Werror", "-Wno-unused"])
+        .arg(&file)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .expect("compile %src");
+    assert!(
+        compiled.status.success(),
+        "source does not compile:\n{source}\n{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let result = Command::new(executable).output().expect("run %src");
+    assert!(
+        result.status.success(),
+        "source changed the variable bindings: {source}"
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn resident_source_preserves_rebinding_scopes_and_old_pointers() {
+    let source = resident_stdout(&[
+        "#include <stdlib.h>",
+        "int i = 0;",
+        "int *old = &i;",
+        "double i = 1.5;",
+        "int saved = (int)i + 10;",
+        "int i = 2;",
+        "if (*old != 0 || i != 2 || saved != 11) abort();",
+        "%src",
+    ]);
+    assert_source_compiles_and_runs(&source);
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn resident_raw_source_preserves_rebinding_scopes() {
+    let source = resident_stdout(&[
+        "int i = 0;",
+        "int *old = &i;",
+        "int i = 1;",
+        "if (*old != 0 || i != 1) abort();",
+        "%src --raw",
+    ]);
+    assert_source_compiles_and_runs(&source);
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn failed_resident_rebinding_does_not_change_the_source_view() {
+    let output = resident_evals(15, &["int i = 0;", "int i = missing;", "%src"]);
+    assert!(!output.status.success());
+    let source = String::from_utf8_lossy(&output.stdout);
+    assert!(source.contains("int i = 0;"), "{source}");
+    assert!(!source.contains("missing"), "{source}");
+    assert_source_compiles_and_runs(&source);
+}
+
+#[cfg(any(unix, windows))]
 #[test]
 fn resident_function_redefinition_rebinds_the_name() {
     let out = resident_stdout(&[

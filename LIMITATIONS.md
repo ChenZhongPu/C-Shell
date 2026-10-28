@@ -32,6 +32,7 @@
 - **Declarations are one construct per input.** Mixing declarations and statements in one input is rejected, and variables of an anonymous struct/union/enum type are not supported.
 - **A crash, timeout or interrupt restarts the runner** and silently replays the journal of successful steps, so side effects of those steps can repeat in that case.
 - **Magic commands read the live state.** `%type`, `%bits`, `%utf8/16/32`, `%time` and `%timeit` run inside the resident runner and nothing is replayed. `%timeit` runs against the live session, like IPython, so `%timeit n++` really changes `n`.
+- **Source views are reconstructions.** In resident mode, `%src` uses nested scopes for variable rebindings, but function or type redefinitions may still appear multiple times and yield invalid C. Live changes from probes or `%timeit` are not captured. `%src --raw` shows replay-backend scaffolding rather than resident step source.
 - **Only output is allowed.** Resident mode refuses (before compiling) calls that read input or change files, processes or the environment, such as `scanf`, `getchar`, `fopen`, `system`, `remove` or `setenv`; `printf`, `puts`, `fprintf`, `fputs`, `fflush` and `write` are fine. The check is lexical, so a call made through a function pointer is not seen. This keeps crash recovery safe: replaying the journal can only repeat output. Use replay mode (no `--resident`) for I/O.
 - **Not yet covered:** live output streaming.
 

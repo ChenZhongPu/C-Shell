@@ -603,7 +603,7 @@ pub(crate) fn finish_input(
             if let Some(index) = o.file_replacement {
                 session.replace_file(index, &committed);
                 session.attach_stdin_events(o.stdin_events.clone());
-            } else if o.scoped_rebind {
+            } else if o.scoped_rebind || o.source_scoped_rebind {
                 session.commit_scoped(&committed);
                 session.attach_stdin_events(o.stdin_events.clone());
             } else {

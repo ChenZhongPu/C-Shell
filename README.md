@@ -360,6 +360,12 @@ formatted with `clang-format` when available; formatting is presentation only,
 has a three-second deadline, and evaluation still compiles the unformatted
 generated source.
 
+In resident mode, these views reconstruct retained inputs rather than the
+loaded step libraries or a snapshot of live memory. Variable rebindings are
+shown as nested scopes. Redefined functions or types may still appear more
+than once, and changes made by `%timeit` are not represented. `--raw` shows
+the replay backend's generated program, not the resident step source.
+
 `%edit` copies the most recent C input into the terminal prompt; `%edit 12`
 retrieves `In[12]`. Numbered C inputs—including failed compilations and
 forgotten pure queries—remain addressable until `%reset`. The command itself

@@ -794,6 +794,7 @@ impl Resident {
             abnormal,
             rewritten: None,
             scoped_rebind: false,
+            source_scoped_rebind: false,
             file_replacement: None,
             unprintable: false,
             duration: timed_duration.unwrap_or(duration),
@@ -978,6 +979,13 @@ impl Resident {
         input: &str,
         plan: Plan,
     ) -> Result<std::result::Result<Outcome, String>> {
+        // Resident rebindings allocate a fresh slot. In the source view,
+        // a nested C scope represents that new binding and preserves pointers
+        // to earlier objects.
+        let source_scoped_rebind = plan
+            .vars
+            .iter()
+            .any(|new| self.vars.iter().any(|old| old.decl.name == new.name));
         let remove_items = match self.replaced_items(&plan.items) {
             Ok(indices) => indices,
             Err(tag) => {
@@ -1021,6 +1029,7 @@ impl Resident {
         if run.outcome.abnormal.is_none() {
             self.next_slot += plan.vars.len();
             self.commit(delta, &run, true);
+            run.outcome.source_scoped_rebind = source_scoped_rebind;
             if plan.rewritten {
                 run.outcome.rewritten = Some(format!("{input};"));
             }
