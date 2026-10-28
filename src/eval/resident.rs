@@ -5,8 +5,8 @@
 //! small shared library exporting an entry point, which the runner loads and
 //! calls with a table of heap slots:
 //!
-//! * a variable lives in a slot; later steps reach it through
-//!   `#define x (*cs_pN)` where `cs_pN` is declared by [`VarDecl::pointer_decl`],
+//! * a variable lives in a slot; later steps reach it through `(*cs_pN)`.
+//!   References are bound after preprocessing, respecting C scopes and members,
 //!   so `&x`, `sizeof x` and assignment keep their C meaning;
 //! * a function is compiled once under a unique symbol (`cs_fn_f_7`) that a
 //!   macro maps `f` to, so redefining it simply binds the name to a new symbol;
@@ -29,6 +29,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
+
+mod bindings;
 
 #[cfg(unix)]
 mod unix;
@@ -164,17 +166,21 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 /// Append `chunk`, keeping at most `MAX_CAPTURE_BYTES`, and report whether the
 /// done marker has now been seen. The marker is looked for across the seam.
-fn absorb(buffer: &mut Vec<u8>, chunk: &[u8], seen: &mut bool, truncated: &mut bool) {
-    let seam = buffer.len().saturating_sub(M_DONE.len());
-    if buffer.len() < proc::MAX_CAPTURE_BYTES {
-        buffer.extend_from_slice(chunk);
-    } else {
-        *truncated = true;
-    }
+fn absorb(
+    buffer: &mut Vec<u8>,
+    chunk: &[u8],
+    seen: &mut bool,
+    truncated: &mut bool,
+    tail: &mut Vec<u8>,
+) {
+    let left = proc::MAX_CAPTURE_BYTES.saturating_sub(buffer.len());
+    buffer.extend_from_slice(&chunk[..chunk.len().min(left)]);
+    *truncated |= chunk.len() > left;
     if !*seen {
-        let tail_start = seam.min(buffer.len());
-        *seen = contains(&buffer[tail_start..], M_DONE.as_bytes())
-            || contains(chunk, M_DONE.as_bytes());
+        tail.extend_from_slice(chunk);
+        *seen = contains(tail, M_DONE.as_bytes());
+        let keep = tail.len().saturating_sub(M_DONE.len() - 1);
+        tail.drain(..keep);
     }
 }
 
@@ -202,6 +208,7 @@ impl Runner {
             return result;
         }
         let (mut out_done, mut err_done) = (false, false);
+        let (mut out_tail, mut err_tail) = (Vec::new(), Vec::new());
         let start = Instant::now();
         loop {
             if proc::interrupted() {
@@ -220,12 +227,14 @@ impl Runner {
                     &chunk,
                     &mut out_done,
                     &mut result.truncated,
+                    &mut out_tail,
                 ),
                 Ok(Msg::Err(chunk)) => absorb(
                     &mut result.err,
                     &chunk,
                     &mut err_done,
                     &mut result.truncated,
+                    &mut err_tail,
                 ),
                 Ok(Msg::Reply(chunk)) => result.reply.push_str(&String::from_utf8_lossy(&chunk)),
                 Err(RecvTimeoutError::Timeout) => {
@@ -248,10 +257,24 @@ impl Runner {
 
     /// Collect whatever a dead runner had already written.
     fn drain(&mut self, result: &mut RunResult) {
+        let mut done = false;
+        let mut tail = Vec::new();
         while let Ok(message) = self.rx.recv_timeout(Duration::from_millis(50)) {
             match message {
-                Msg::Out(chunk) => result.out.extend_from_slice(&chunk),
-                Msg::Err(chunk) => result.err.extend_from_slice(&chunk),
+                Msg::Out(chunk) => absorb(
+                    &mut result.out,
+                    &chunk,
+                    &mut done,
+                    &mut result.truncated,
+                    &mut tail,
+                ),
+                Msg::Err(chunk) => absorb(
+                    &mut result.err,
+                    &chunk,
+                    &mut done,
+                    &mut result.truncated,
+                    &mut tail,
+                ),
                 Msg::Reply(chunk) => result.reply.push_str(&String::from_utf8_lossy(&chunk)),
             }
         }
@@ -321,6 +344,7 @@ struct Assembled {
     new_line_count: usize,
     ranges: Vec<(usize, usize)>,
     wrapped: bool,
+    bindings: Vec<(String, String)>,
     #[cfg(windows)]
     exports: Vec<String>,
     #[cfg(windows)]
@@ -427,6 +451,7 @@ impl Resident {
         let mut ranges = Vec::new();
         let mut new_start_line = 1;
         let mut new_line_count = 1;
+        let mut bindings = Vec::new();
         let kept = self
             .items
             .iter()
@@ -474,18 +499,14 @@ impl Resident {
             "\nvoid cs_flush_{step}(void) {{ (fflush)(NULL); }}\n"
         ));
         src.push_str(&format!("\nvoid cs_step_{step}(void **cs_slot)\n{{\n"));
-        for var in self
-            .vars
-            .iter()
-            .filter(|v| !delta.vars.iter().any(|d| d.name == v.decl.name))
-        {
+        for var in &self.vars {
             let pointer = format!("cs_p{}", var.slot);
             src.push_str(&format!(
-                "    {} = cs_slot[{}];\n#define {} (*{pointer})\n",
+                "    {} = cs_slot[{}];\n",
                 var.decl.pointer_decl(&pointer, var.dim),
                 var.slot,
-                var.decl.name
             ));
+            bindings.push((pointer, var.decl.name.clone()));
         }
         let mut wrapped = false;
         match body {
@@ -532,42 +553,39 @@ impl Resident {
                 wrapped = true;
             }
             Body::Vars(vars) => {
-                for var in vars.iter() {
-                    src.push_str(&format!("#undef {}\n", var.name));
-                }
                 new_start_line = line_of(&src);
-                // Declarations come first and contiguously: they are the only
-                // lines that hold user text. Earlier declarators stay in scope
-                // as locals for later ones, so no block is needed.
-                for var in vars.iter() {
-                    src.push_str(&format!("{} {};\n", var.declspec, var.init));
+                if self.timed {
+                    src.push_str("    cs_time_once_begin();\n");
                 }
-                new_line_count = (line_of(&src) - new_start_line).max(1);
                 for (offset, var) in vars.iter().enumerate() {
                     let slot = delta.first_slot + offset;
-                    let name = &var.name;
-                    // Without an initializer the compiler would warn about
-                    // copying an uninitialized object, and the session would
-                    // hold stack garbage. Zero it, like static storage.
-                    if var.init == var.declarator {
+                    let pointer = format!("cs_p{slot}");
+                    // Allocate before evaluating the initializer: references
+                    // to this object (including &self) must use its final address.
+                    src.push_str(&format!(
+                        "    {};\n    cs_slot[{slot}] = malloc(sizeof(*{pointer}));\n    if (!cs_slot[{slot}]) abort();\n    {pointer} = cs_slot[{slot}];\n",
+                        var.storage_pointer_decl(&pointer)
+                    ));
+                    bindings.push((pointer.clone(), var.name.clone()));
+                    if var.initializer().is_some() {
+                        let init = format!("cs_init{slot}");
                         src.push_str(&format!(
-                            "    memset((void *)&{name}, 0, sizeof({name}));\n"
+                            "    {};\n    memcpy((void *){pointer}, &{init}, sizeof({init}));\n",
+                            var.init_decl(&init)
+                        ));
+                    } else {
+                        src.push_str(&format!(
+                            "    memset((void *){pointer}, 0, sizeof(*{pointer}));\n"
                         ));
                     }
-                    src.push_str(&format!(
-                        "    cs_slot[{slot}] = malloc(sizeof({name}));\n    if (!cs_slot[{slot}]) abort();\n    memcpy(cs_slot[{slot}], &{name}, sizeof({name}));\n"
-                    ));
                     if var.dim_insert.is_some() {
                         src.push_str(&format!(
-                            "    fputs(CS_M_DIM, stdout); printf(\"{slot}:%zu\\n\", sizeof({name}) / sizeof(({name})[0]));\n"
+                            "    fputs(CS_M_DIM, stdout); printf(\"{slot}:%zu\\n\", sizeof(*{pointer}) / sizeof((*{pointer})[0]));\n"
                         ));
                     }
-                    let pointer = format!("cs_p{slot}");
-                    src.push_str(&format!(
-                        "    {} = cs_slot[{slot}];\n#define {name} (*{pointer})\n",
-                        var.pointer_decl(&pointer, None)
-                    ));
                 }
+                new_line_count = (line_of(&src) - new_start_line).max(1);
+                src.push_str(&self.timer_end());
             }
         }
         src.push_str("}\n");
@@ -577,6 +595,7 @@ impl Resident {
             new_line_count,
             ranges,
             wrapped,
+            bindings,
             #[cfg(windows)]
             exports: delta
                 .funcs
@@ -605,6 +624,7 @@ impl Resident {
             return Err(i18n::text("program-interrupted"));
         }
         let source = ev.dir.path().join(format!("step_{step}.c"));
+        let preprocessed = ev.dir.path().join(format!("step_{step}.i"));
         let library = ev.dir.path().join(format!("step_{step}.{LIB_EXT}"));
         if let Err(error) = std::fs::write(&source, &assembled.src) {
             return Err(i18n::text_with(
@@ -612,7 +632,82 @@ impl Resident {
                 &[("error", error.to_string())],
             ));
         }
-        let mut args = ev.tc.compile_args(&source, &library);
+        // Bind after the real preprocessor has expanded user/header macros.
+        // Preserve line directives so compiler diagnostics still map to input.
+        let mut pp_args = ev.tc.compile_args(&source, &preprocessed);
+        pp_args.retain(|arg| arg != "-lm");
+        pp_args.insert(0, "-E".to_string());
+        #[cfg(unix)]
+        pp_args.insert(0, "-fPIC".to_string());
+        let mut command = Command::new(&ev.tc.path);
+        command.current_dir(ev.dir.path()).args(&pp_args);
+        let pp = proc::run_captured(&mut command, ev.timeout, false).map_err(|error| {
+            i18n::text_with("compiler-run-error", &[("error", error.to_string())])
+        })?;
+        let pp_diagnostics = String::from_utf8_lossy(&pp.stderr).into_owned();
+        let path = source.display().to_string();
+        let remap = |text: &str| {
+            let text = errmap::remap(
+                text,
+                &path,
+                &assembled.src,
+                assembled.new_start_line,
+                assembled.new_line_count,
+                &assembled.ranges,
+                assembled.wrapped,
+            );
+            // Pointer and initializer temporaries are implementation details.
+            let aliases: std::collections::HashMap<_, _> = assembled
+                .bindings
+                .iter()
+                .flat_map(|(pointer, name)| {
+                    [
+                        (pointer.clone(), name.as_str()),
+                        (pointer.replacen("cs_p", "cs_init", 1), name.as_str()),
+                    ]
+                })
+                .collect();
+            text.split_inclusive(|c: char| !c.is_alphanumeric() && c != '_')
+                .map(|part| {
+                    let end = part
+                        .trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_')
+                        .len();
+                    let (word, punctuation) = part.split_at(end);
+                    format!(
+                        "{}{punctuation}",
+                        aliases.get(word).copied().unwrap_or(word)
+                    )
+                })
+                .collect::<String>()
+        };
+        if pp.interrupted {
+            return Err(i18n::text("program-interrupted"));
+        }
+        match pp.status {
+            Some(status) if status.success() => {}
+            Some(_) => return Err(demangle(&remap(&pp_diagnostics))),
+            None => {
+                return Err(i18n::text_with(
+                    "compiler-timeout",
+                    &[("seconds", ev.timeout.as_secs().to_string())],
+                ));
+            }
+        }
+        let prepared = std::fs::read_to_string(&preprocessed).and_then(|src| {
+            std::fs::write(
+                &preprocessed,
+                bindings::rewrite(&src, step, &assembled.bindings),
+            )
+        });
+        prepared.map_err(|error| {
+            i18n::text_with("temp-source-write-error", &[("error", error.to_string())])
+        })?;
+        let mut args = ev.tc.compile_args(&preprocessed, &library);
+        let language = args
+            .iter()
+            .position(|arg| arg == "-x")
+            .expect("language flag");
+        args[language + 1] = "cpp-output".to_string();
         args.splice(0..0, SHARED_FLAGS.iter().map(|flag| flag.to_string()));
         #[cfg(windows)]
         {
@@ -648,23 +743,12 @@ impl Resident {
         let captured = proc::run_captured(&mut command, ev.timeout, false).map_err(|error| {
             i18n::text_with("compiler-run-error", &[("error", error.to_string())])
         })?;
-        let mut diagnostics = String::from_utf8_lossy(&captured.stderr).into_owned();
+        let mut diagnostics = pp_diagnostics;
+        diagnostics.push_str(&String::from_utf8_lossy(&captured.stderr));
         diagnostics.push_str(&String::from_utf8_lossy(&captured.stdout));
         if captured.interrupted {
             return Err(i18n::text("program-interrupted"));
         }
-        let path = source.display().to_string();
-        let remap = |text: &str| {
-            errmap::remap(
-                text,
-                &path,
-                &assembled.src,
-                assembled.new_start_line,
-                assembled.new_line_count,
-                &assembled.ranges,
-                assembled.wrapped,
-            )
-        };
         match captured.status {
             Some(status) if status.success() => {
                 Ok((library, demangle(&errmap::only_new(&remap(&diagnostics)))))
@@ -778,7 +862,7 @@ impl Resident {
             )),
             End::Done => None,
         };
-        if !matches!(result.end, End::Done) {
+        if abnormal.is_some() {
             self.recover(ev);
         }
         let outcome = Outcome {
@@ -949,7 +1033,6 @@ impl Resident {
         if let Some(message) = Self::forbidden(trimmed) {
             return Ok(Eval::CompileError(message));
         }
-        let mut plan_error = None;
         match decl::analyze(trimmed) {
             Analysis::Unsupported(reason) => {
                 return Ok(Eval::CompileError(i18n::text_with(
@@ -958,18 +1041,25 @@ impl Resident {
                 )));
             }
             Analysis::Plan(plan) => {
-                let has_vars = !plan.vars.is_empty();
-                match self.eval_plan(ev, trimmed, plan)? {
-                    Ok(outcome) => return Ok(Eval::Done(Box::new(outcome))),
-                    Err(diagnostics) if has_vars => plan_error = Some(diagnostics),
-                    Err(diagnostics) => return Ok(Eval::CompileError(diagnostics)),
+                // The syntax parser has no typedef table: `x * y;` can look
+                // like a declaration when x is actually a live variable.
+                let expression = !plan.vars.is_empty()
+                    && plan
+                        .vars
+                        .iter()
+                        .all(|v| self.vars.iter().any(|old| old.decl.name == v.declspec));
+                if !expression {
+                    return match self.eval_plan(ev, trimmed, plan)? {
+                        Ok(outcome) => Ok(Eval::Done(Box::new(outcome))),
+                        Err(diagnostics) => Ok(Eval::CompileError(diagnostics)),
+                    };
                 }
             }
             Analysis::Statement => {}
         }
         match self.eval_text(ev, session, trimmed)? {
             Ok(outcome) => Ok(Eval::Done(Box::new(outcome))),
-            Err(diagnostics) => Ok(Eval::CompileError(plan_error.unwrap_or(diagnostics))),
+            Err(diagnostics) => Ok(Eval::CompileError(diagnostics)),
         }
     }
 
@@ -1250,5 +1340,26 @@ mod tests {
         let (clean, dims) = take_dims(&text);
         assert_eq!(clean, "before\nafter ");
         assert_eq!(dims, vec![(3, 12), (7, 2)]);
+    }
+
+    #[test]
+    fn output_limit_still_detects_a_split_completion_marker() {
+        let mut bytes = vec![b'x'; proc::MAX_CAPTURE_BYTES - 2];
+        let (mut done, mut truncated) = (false, false);
+        let mut tail = Vec::new();
+        let mut chunk = vec![b'x'; 16];
+        chunk.extend_from_slice(&M_DONE.as_bytes()[..5]);
+        absorb(&mut bytes, &chunk, &mut done, &mut truncated, &mut tail);
+        assert!(truncated);
+        assert!(!done);
+        absorb(
+            &mut bytes,
+            &M_DONE.as_bytes()[5..],
+            &mut done,
+            &mut truncated,
+            &mut tail,
+        );
+        assert!(done);
+        assert_eq!(bytes.len(), proc::MAX_CAPTURE_BYTES);
     }
 }

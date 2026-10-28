@@ -532,6 +532,11 @@ are not supported. Changing the compiler with `%cc` clears the resident
 session. Windows supports WinLibs GCC and Clang. See
 [DESIGN.md](DESIGN.md) for the design and its limits.
 
+Variable references are resolved after preprocessing, so struct members and
+local declarations retain their C meaning. This adds a compiler invocation per
+step; resident mode preserves live state but does not guarantee lower latency.
+Output overflow rejects the input and restores the journaled state.
+
 ## Known limitations
 
 For a complete breakdown of design boundaries, non-sandboxed execution, stdin

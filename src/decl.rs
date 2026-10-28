@@ -1,7 +1,7 @@
 //! Declaration analysis for the resident (Step-DLL) backend.
 //!
 //! The resident runner keeps every session variable in a heap slot and reaches
-//! it from later steps through a macro such as `#define x (*cs_p3)`. To declare
+//! it from later steps through a pointer such as `(*cs_p3)`. To declare
 //! `cs_p3` with the right type without ever reconstructing that type, the
 //! declarator is reused: replacing its identifier with `(*cs_p3)` turns
 //! `int a[5]` into `int (*cs_p3)[5]` and `int (*fp)(double)` into
@@ -28,6 +28,48 @@ pub struct VarDecl {
 }
 
 impl VarDecl {
+    pub fn initializer(&self) -> Option<&str> {
+        self.init
+            .strip_prefix(&self.declarator)?
+            .trim()
+            .strip_prefix('=')
+            .map(str::trim)
+    }
+
+    /// The original declaration with only its declared name changed.
+    pub fn init_decl(&self, name: &str) -> String {
+        let mut init = self.init.clone();
+        init.replace_range(self.name_range.0..self.name_range.1, name);
+        format!("{} {init}", self.declspec)
+    }
+
+    /// A complete pointer type even for an array whose bound is inferred.
+    /// `sizeof` does not evaluate a non-VLA compound literal's initializer.
+    pub fn storage_pointer_decl(&self, pointer: &str) -> String {
+        if self.dim_insert.is_none() {
+            return self.pointer_decl(pointer, None);
+        }
+        let mut abstract_decl = self.declarator.clone();
+        abstract_decl.replace_range(self.name_range.0..self.name_range.1, "");
+        let init = self.initializer().unwrap_or("");
+        let init = if init.starts_with('{') {
+            init.to_string()
+        } else {
+            format!("{{{init}}}")
+        };
+        let literal = format!("({} {abstract_decl}){init}", self.declspec);
+        let mut declarator = self.declarator.clone();
+        declarator.insert_str(
+            self.dim_insert.expect("inferred dimension"),
+            &format!("sizeof({literal}) / sizeof(({literal})[0])"),
+        );
+        declarator.replace_range(
+            self.name_range.0..self.name_range.1,
+            &format!("(*{pointer})"),
+        );
+        format!("{} {declarator}", self.declspec)
+    }
+
     /// Declaration text that makes `pointer` point at an object of this
     /// variable's type. `dim` completes an unsized outermost array dimension.
     pub fn pointer_decl(&self, pointer: &str, dim: Option<usize>) -> String {

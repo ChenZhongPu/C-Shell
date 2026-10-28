@@ -2397,6 +2397,133 @@ fn resident_function_redefinition_rebinds_the_name() {
 
 #[cfg(any(unix, windows))]
 #[test]
+fn resident_initializers_use_persistent_addresses() {
+    let output = resident_evals(
+        15,
+        &[
+            "int i = 42, *p = &i;",
+            "int a[] = {1, 2}, *element = &a[1];",
+            "struct Node { struct Node *next; int value; } node = {&node, 7};",
+            "const int k = 3, *pk = &k;",
+            "p == &i && element == &a[1] && node.next == &node",
+            "int i = 99;",
+            "*p = 43;",
+            "*element = 8;",
+            "*p == 43 && i == 99 && a[1] == 8 && node.next == &node && node.next->value == 7 && pk == &k",
+            "abort();",
+            "*p == 43 && i == 99 && a[1] == 8 && node.next == &node && pk == &k",
+        ],
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n"),
+        "1\n1\n1\n"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("error:"), "{stderr}");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn resident_bindings_respect_members_scopes_and_expanded_macros() {
+    let out = resident_stdout(&[
+        "struct P { int x; };",
+        "struct P p = {42};",
+        "int x = 3;",
+        "#define MEMBER(v) ((v).x)",
+        "#define INCREMENT() (++x)",
+        "p.x",
+        "MEMBER(p)",
+        "INCREMENT()",
+        "{ int x = 9; printf(\"%d\\n\", INCREMENT()); }",
+        "for (int x = 0; x < 2; ++x) printf(\"%d\\n\", x);",
+        "{ struct P q = {.x = x}; printf(\"%d\\n\", q.x); }",
+        "x",
+        "x * 2",
+        "%bits p.x",
+    ]);
+    assert!(out.starts_with("42\n42\n4\n10\n0\n1\n4\n4\n8\n"), "{out}");
+    assert!(out.contains("value: 42\n"), "{out}");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn resident_rejected_declaration_is_not_executed_or_retained() {
+    let output = resident_evals(
+        15,
+        &[
+            "struct P { int x; };",
+            "struct P p = {1};",
+            "struct P { double x; } q = {2};",
+            "p.x",
+            "%src",
+        ],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("`P` is still used"), "{stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("1\n"), "{stdout}");
+    assert!(
+        !stdout.contains("q =") && !stdout.contains("double x"),
+        "{stdout}"
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn resident_output_overflow_rolls_back_mutations_before_continuing() {
+    let output = resident_evals(
+        15,
+        &[
+            "int n = 0;",
+            "{ n = 7; for (int k = 0; k < 8400000; k++) putchar('x'); }",
+            "n",
+            "abort();",
+            "n",
+        ],
+    );
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.ends_with("\n0\n0\n"),
+        "unexpected output tail: {:?}",
+        &stdout[stdout.len().saturating_sub(30)..]
+    );
+    assert!(
+        stdout.len() <= 8 * 1024 * 1024 + 5,
+        "capture limit exceeded"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("was truncated"));
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn resident_time_measures_initializers_once_and_commits_variables() {
+    let output = resident_evals(
+        15,
+        &[
+            "int n = 0;",
+            "%time int value = ++n;",
+            "%time int a[] = {++n, ++n};",
+            "value == 1 && n == 3 && a[0] == 2 && a[1] == 3",
+            "abort();",
+            "value == 1 && n == 3 && a[1] == 3",
+        ],
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n"),
+        "1\n1\n"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("Wall time:").count(), 2, "{stderr}");
+    assert!(
+        !stderr.contains("unavailable") && !stderr.contains("error:"),
+        "{stderr}"
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[test]
 fn resident_function_addresses_and_heap_objects_survive_across_steps() {
     let out = resident_stdout(&[
         "int value = 5;",

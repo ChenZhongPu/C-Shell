@@ -398,11 +398,18 @@ replacing that compiler.
 `src/eval/resident.rs` (runner, step assembly, recovery) and `src/decl.rs`
 (tree-sitter-c declaration analysis). Deviations from the sketch below:
 
-- tree-sitter is used only to find declarators and classify inputs. A variable's
+- tree-sitter finds declarators, classifies inputs and resolves variable references
+  in the compiler's preprocessed step source, respecting local scopes and struct
+  members. Preprocessing before binding also handles references inside macros.
+  This requires a separate compiler invocation before compilation/linking. A variable's
   type is never rebuilt: the declarator's identifier is replaced by `(*cs_pN)`,
   which declares a pointer to exactly that type (`int a[5]` becomes
   `int (*cs_pN)[5]`, `int (*fp)(double)` becomes `int (*(*cs_pN))(double)`).
   `int a[] = {…}` reports its element count back through `M_DIM`.
+- Storage is allocated before each initializer runs. References to the declared
+  object and earlier declarators use their persistent addresses; the initialized
+  value is then copied into that storage. Inferred array bounds use unevaluated
+  `sizeof` compound literals, so initializer side effects run only once.
 - Each function definition gets a unique symbol (`cs_fn_f_7`) and a macro maps
   `f` to it. Unix loads steps with `RTLD_GLOBAL`; Windows exports those symbols
   and links subsequent steps against the corresponding DLL import libraries.
@@ -412,6 +419,7 @@ replacing that compiler.
   pipe. Program output keeps the existing marker protocol.
 - Replay survives only as recovery: after a crash, timeout or interrupt the
   runner restarts and the journal of successful steps is loaded again.
+  Output overflow also rejects the input and restores the journaled state.
 - Variable-length arrays are disabled (`-Werror=vla`); a type used by live
   variables or functions cannot be redefined until `%reset`.
 - `%type`, `%bits`, `%utf*`, `%time` and `%timeit` are steps too: probes run
@@ -425,13 +433,16 @@ replacing that compiler.
   runs in the same C runtime as the step.
 
 The key import is evcxr's move: share state by *parameter passing*, not
-through the linker. In C it is stronger than in Rust, because slots can be
-addressed through lvalue macros:
+through the linker. Slots are accessed through typed pointers, with user variable
+references rewritten to lvalue dereferences:
 
 ```c
-#define x   (*(int *)cs_slot[0])       /* lvalue: &x stable, sizeof right */
-#define arr (*(int (*)[5])cs_slot[1])
-CS_EXPORT void cs_step(void **cs_slot) { /* user input appears verbatim */ }
+CS_EXPORT void cs_step(void **cs_slot) {
+    int *cs_p0 = cs_slot[0];
+    int (*cs_p1)[5] = cs_slot[1];
+    /* Input: x += arr[0]; */
+    (*cs_p0) += (*cs_p1)[0];
+}
 ```
 
 ```
