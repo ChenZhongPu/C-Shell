@@ -14,6 +14,7 @@ mod i18n;
 mod lex;
 mod magic;
 mod proc;
+mod runtime_checks;
 mod session;
 mod std_index;
 mod toolchain;

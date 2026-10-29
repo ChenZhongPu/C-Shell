@@ -97,6 +97,7 @@ magic-help =
       %Bits <expression> same as %bits, with uppercase hexadecimal
       %utf8/%utf16/%utf32 [-n N] <expression> decode Unicode code units
       %where <identifier> find an ISO C library identifier's standard header
+      %check [--address | --undefined] <code> run runtime checks (replay only)
       %time <code...>    time the execution of a statement or expression once
       %timeit <code...>  benchmark a statement or expression over multiple loops
       %cc [path]         show or switch the C compiler
@@ -252,5 +253,6 @@ resident-type-in-use = `{$name}` is still used by earlier definitions; run %rese
 resident-runner-error = Resident runner failed: {$error}
 resident-slots-exhausted = Resident mode has no free variable slots left; run %reset
 resident-compiler-reset = Resident session cleared because the compiler changed
+check-resident-unavailable = %check is unavailable in resident mode; restart without --resident to use runtime checks.
 timeit-state-warning-resident = "%timeit input" runs against the live session and may execute repeatedly; its C state changes are kept
 resident-side-effects = Resident mode only allows output; it refuses calls that read input or change files, processes or the environment: {$calls}. Run without --resident to use them.

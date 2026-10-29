@@ -14,6 +14,14 @@
 
 ## Semantics & Scope
 
+- **Runtime checks are optional and partial.** `%check` uses only sanitizer
+  backends that can compile, link, run and detect a test error with the current
+  toolchain. Available checks differ by target/runtime installation. Checks
+  cover executed paths, not all undefined behavior or logic errors; general
+  uninitialized-value detection is not included. Leak detection is disabled
+  for replayed session allocations. Checked input is never retained, but
+  replay and external effects still occur. Messages are currently English.
+  This command is available only in replay mode.
 - **Rebinding is C shadowing, not assignment.** A redeclared local lives in a nested block. Its declarator is already in scope during its initializer, so `int x = x + 1;` does not read the outer `x`. File-scope replacement also makes retained earlier calls use the new function when the session replays.
 - **The purity heuristic is conservative.** Any expression containing a function call or a reference to a macro defined in retained input is kept, even if it happens to be pure.
 - **Indeterminate values remain undefined C.** Address-only struct-member formatting prevents `c-shell` from adding a `%s` memory dereference, but it cannot make `struct P p; p` well-defined when members were never initialized; reading an indeterminate pointer or scalar is itself not portable. Initialize structs (for example with `{0}`) when the value matters.
@@ -26,6 +34,7 @@
 ## Resident mode (`--resident`)
 
 - **Experimental.** Windows requires a MinGW-w64 compiler such as WinLibs GCC or Clang; `cl.exe` and `clang-cl` are not supported.
+- **`%check` is unavailable.** Resident mode rejects runtime checks before probing or executing code; restart without `--resident` to use them.
 - **Changing compilers clears the resident session.** `%cc` resets the state when the selected compiler changes; `%std` keeps it.
 - **No variable-length arrays.** Their size cannot be recovered from a declaration, so steps compile with `-Werror=vla`.
 - **A type that earlier definitions still use cannot be redefined** until `%reset`; functions and macros can.
@@ -44,3 +53,6 @@
 - **No session save/load.** The input history is bounded (up to 1000 lines) within the current process memory/file session, but session state cannot be saved to a file or loaded across launches.
 - **Windows uses WinLibs; MSVC is not supported.** c-shell drives MinGW-w64 GCC or Clang on Windows, and release binaries are built for `x86_64-pc-windows-gnu`. Put the toolchain's `bin` directory on `PATH`. `cl.exe` and `clang-cl` are not supported.
 - **Windows verification uses native WinLibs CI.** The Windows job runs the end-to-end tests with GCC, including resident mode, and checks switching to Clang. Other Windows compiler configurations are not covered by the full suite.
+  Runtime-check execution tests skip when sanitizer runtimes are unavailable;
+  Linux/macOS jobs require both ASan and UBSan. Resident `%check` rejection is
+  tested on all supported platforms.

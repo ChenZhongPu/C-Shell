@@ -97,6 +97,7 @@ magic-help =
       %Bits <表达式>     与 %bits 相同，但使用大写十六进制
       %utf8/%utf16/%utf32 [-n N] <表达式> 解码 Unicode 代码单元
       %where <标识符>    查询 ISO C 标准库标识符所属的头文件
+      %check [--address | --undefined] <代码> 运行时检查（仅重放模式）
       %time <代码...>    执行一次并测量语句或表达式
       %timeit <代码...>  多轮循环测量语句或表达式
       %cc [路径]         显示或切换 C 编译器
@@ -242,5 +243,6 @@ resident-type-in-use = `{$name}` 仍被先前的定义使用；请先执行 %res
 resident-runner-error = 常驻进程出错：{$error}
 resident-slots-exhausted = 常驻模式的变量槽位已用尽；请执行 %reset
 resident-compiler-reset = 编译器已更换，常驻会话已清空
+check-resident-unavailable = 常驻模式下无法使用 %check；请不带 --resident 重新启动后使用运行时检查。
 timeit-state-warning-resident = “%timeit 输入”直接在当前会话状态上运行，可能被重复执行；它对 C 状态的修改会被保留
 resident-side-effects = 常驻模式只允许输出，不允许读取输入或修改文件、进程、环境的调用：{$calls}。需要时请不使用 --resident 运行。

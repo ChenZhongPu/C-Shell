@@ -872,6 +872,7 @@ impl Resident {
                 .value
                 .filter(|_| abnormal.is_none() && slot == Slot::Expr),
             errors: err_parts.output,
+            runtime_report: None,
             streamed_output_needs_newline: false,
             stdin_events: Vec::new(),
             warnings,

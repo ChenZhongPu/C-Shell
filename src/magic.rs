@@ -568,6 +568,51 @@ pub fn handle(
             _ => ok = fail(ui.text("where-usage")),
         },
 
+        "check" if ev.is_resident() => ok = fail(ui.text("check-resident-unavailable")),
+        "check" => match crate::runtime_checks::parse(tail) {
+            Err(usage) => ok = fail(usage.to_string()),
+            Ok((request, input)) => match ev.check(session, input, request) {
+                Err(error) => ok = fail(format!("Unable to run runtime checks: {error}")),
+                Ok(Eval::CompileError(diag)) => ok = fail(diag.trim_end().to_string()),
+                Ok(Eval::Done(outcome)) => {
+                    if outcome.streamed_output_needs_newline {
+                        println!("{}", ui.inserted_newline_marker());
+                    }
+                    if !outcome.warnings.trim().is_empty() {
+                        style.diagnostic(&ui.warn(outcome.warnings.trim_end()));
+                    }
+                    print!("{}", outcome.output);
+                    if !outcome.output.is_empty() && !outcome.output.ends_with('\n') {
+                        println!();
+                    }
+                    if !outcome.errors.is_empty() {
+                        if style == Style::Bare {
+                            eprint!("{}", outcome.errors);
+                        } else {
+                            print!("{}", ui.err(&outcome.errors));
+                        }
+                    }
+                    if let Some(report) = outcome.runtime_report {
+                        for (index, line) in crate::runtime_checks::summarize(&report)
+                            .lines()
+                            .enumerate()
+                        {
+                            if index == 0 {
+                                style.diagnostic(&ui.warn(line));
+                            } else {
+                                style.diagnostic(line);
+                            }
+                        }
+                        ok = false;
+                    } else if let Some(message) = outcome.abnormal {
+                        ok = fail(message);
+                    } else if let Some(value) = outcome.value {
+                        println!("{value}");
+                    }
+                }
+            },
+        },
+
         "time" => {
             if tail.is_empty() {
                 ok = fail(ui.text("time-usage"));

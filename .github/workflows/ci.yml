@@ -30,19 +30,25 @@ jobs:
           - os: ubuntu-latest
             name: linux-gcc
             cc: gcc
+            sanitizers: all
           - os: ubuntu-latest
             name: linux-clang
             cc: clang
+            sanitizers: all
           - os: macos-latest
             name: macos-clang
             cc: clang
+            sanitizers: all
           - os: windows-latest
             name: windows-gnu
             cc: gcc
             target: x86_64-pc-windows-gnu
+            # Runtime-check execution tests skip without MinGW sanitizer runtimes.
+            sanitizers: none
     runs-on: ${{ matrix.os }}
     env:
       CC: ${{ matrix.cc }}
+      C_SHELL_TEST_REQUIRE_SANITIZERS: ${{ matrix.sanitizers }}
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -54,9 +60,9 @@ jobs:
           # The GCC job also tests resident compiler switching.
           with_clang: true
 
-      - name: Install Linux compilers
+      - name: Install Linux compilers and sanitizer runtimes
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y gcc clang
+        run: sudo apt-get update && sudo apt-get install -y gcc clang libclang-rt-dev
 
       - name: Add the GNU Windows Rust target
         if: runner.os == 'Windows'

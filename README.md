@@ -153,7 +153,9 @@ The c-shell interface defaults to English and automatically selects Chinese
 when the system UI locale is Chinese. Use `--lang en` or `--lang zh` to
 override detection. This affects only text written by c-shell: compiler
 diagnostics, compiler version strings, and evaluated program output pass
-through unchanged.
+through unchanged. Runtime-check results and usage messages (`%check`) currently
+remain English in both interface languages; its resident-mode rejection follows
+the selected UI language.
 
 ### Local browser terminal
 
@@ -273,7 +275,7 @@ differently. `%reset` clears the complete session.
 %help      %quit      %clear     %reset     %edit [n]
 %src       %header    %where     %type      %bits/%Bits
 %utf8      %utf16     %utf32     %time      %timeit
-%cc        %std
+%cc        %std       %check
 ```
 
 `%help` lists the commands and nothing else, so it stays a one-screen
@@ -288,6 +290,42 @@ selects a loop count and reports statistics from multiple runs.
 
 `%clear` erases the terminal display and returns the cursor to the top without
 changing variables, retained C code or the input counter.
+
+#### Runtime checks
+
+`%check` is available only in the default replay mode. In `--resident` mode,
+the command is rejected before probing sanitizers or executing any code.
+
+`%check <code>` temporarily compiles and runs an input with the current
+toolchain's available AddressSanitizer and/or UndefinedBehaviorSanitizer.
+Checks are probed only on request; ordinary evaluation and startup are unchanged.
+Use `--address` or `--undefined` to require a particular checker:
+
+```text
+In [1]: int x = INT_MAX;
+In [2]: %check --undefined x + 1
+Runtime check: signed integer overflow.
+2147483647 + 1 cannot be represented in type 'int'
+In [2]: %check 1 + 2
+3
+```
+
+Both successful and failed checked inputs are discarded, without consuming an
+input number. Existing session code is replayed in the checked process, so a
+report may refer to an earlier input rather than the checked expression.
+Output is a short explanation without line numbers, temporary paths,
+addresses or native stack traces.
+Use `%check -- --x` when code starts with `--`.
+Check status messages and native sanitizer reports are English-only apart
+from the toolchain's own diagnostic language. An unavailable requested
+checker produces an error rather than silently running unchecked. Support
+depends on the compiler, target and installed runtime; no Clang dependency is
+required. Failed checks set a nonzero exit status in batch mode.
+
+Runtime checks cover only executed paths and supported error classes, and do
+not prove that the code is correct. They execute real C code and can cause
+external side effects. Leak detection is disabled because allocations in a
+replayed learning session are often intentionally still live at process exit.
 
 #### UTF-8 literal previews
 
@@ -528,8 +566,8 @@ input is compiled into a shared library and loaded into the runner. Earlier
 steps execute again only when recovering from a crash, timeout or interrupt.
 Variables, arrays, structs, function pointers, functions (including
 redefinition), types and macros work; variable-length arrays and stdin reads
-are not supported. Changing the compiler with `%cc` clears the resident
-session. Windows supports WinLibs GCC and Clang. See
+are not supported. `%check` is unavailable in resident mode. Changing the compiler
+with `%cc` clears the resident session. Windows supports WinLibs GCC and Clang. See
 [DESIGN.md](DESIGN.md) for the design and its limits.
 
 Variable references are resolved after preprocessing, so struct members and

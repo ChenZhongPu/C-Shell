@@ -80,7 +80,8 @@ context, zero reparsing on cursor movement and suffix-only reparsing after
 an edit. Session tests compare incremental indexes with a fresh scan after
 replacement/shadowing and check clone/reset invalidation.
 
-Other end-to-end tests escape value previews without rewriting explicit
+Other end-to-end tests preserve ordinary stderr during runtime checks,
+reject `%check` in resident mode, escape value previews without rewriting explicit
 output and mix `scanf`/character/line reads with buffering, pushback and EOF.
 File-stream reads remain native. A Web PTY test exercises Ctrl-C during editing,
 compilation, execution and pending input, followed by continued evaluation,
@@ -89,3 +90,5 @@ CRLF terminal input and compiler-descendant cleanup.
 CI runs real compilers on Linux (GCC and Clang), macOS (Clang) and Windows
 (WinLibs GCC, with a Clang compiler-switch check). Windows execution is verified
 by that native CI job, without local Windows cross-compilation.
+Linux/macOS jobs require working ASan and UBSan; Windows runtime-check execution
+tests skip if the selected MinGW installation lacks sanitizer runtimes.

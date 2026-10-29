@@ -10,6 +10,7 @@ by default. Verified locally on Linux with GCC 16.2.1 and Clang
 22.1.8. Native CI covers Linux GCC/Clang, macOS Clang and Windows WinLibs GCC;
 the Windows job also checks switching compilers. See `.github/workflows/ci.yml`
 for the exact matrix.
+Linux/macOS test jobs require working ASan and UBSan runtimes.
 
 ---
 
@@ -26,6 +27,7 @@ for the exact matrix.
 | `errmap.rs` | diagnostic provenance/remapping, scaffolding removal, stale-warning filtering |
 | `tests/smoke.rs` | end-to-end tests driving the real binary and compiler |
 | `proc.rs` | child deadlines, output capture, request-driven stdin tape transport and timeout-path process-tree cleanup |
+| `runtime_checks.rs` | on-demand sanitizer probing, compiler flags and temporary checked execution configuration |
 | `magic.rs` | `%` commands, numbered-input lookup and optional `clang-format` presentation |
 | `std_index.rs` | curated ISO C89–C23 identifier-to-header and availability metadata for `%where` |
 | `codegen.rs` | program assembly, shadowing/replacement variants, `_Generic` runtimes |
@@ -48,7 +50,7 @@ control/do-while/preprocessor continuation, tab completion (magics, C keywords,
 retained session names), process-local Up/Down recall and numbered-input
 `%edit [n]`, `-e`/redirected/piped-input batch modes,
 `%help [--verbose] %quit %clear %reset %src %header %edit %type %bits %Bits
-%utf8 %utf16 %utf32 %where %time %timeit %cc %std`, deadlines and
+%utf8 %utf16 %utf32 %where %check %time %timeit %cc %std`, deadlines and
 timeout-path tree cleanup for compiler/probe/user-program children, cached
 compiler capability probes, CI for 4 platform configs, and a tag-triggered release
 workflow.
@@ -431,6 +433,9 @@ replacing that compiler.
 - Changing `%cc` clears the resident session so one session uses one compiler
   and, on Windows, one C runtime. Each Windows step exports a flush helper that
   runs in the same C runtime as the step.
+- `%check` is unavailable in resident mode. It is rejected before backend
+  detection, because the replay-based instrumented evaluator cannot inspect
+  the resident runner's live state.
 
 The key import is evcxr's move: share state by *parameter passing*, not
 through the linker. Slots are accessed through typed pointers, with user variable
